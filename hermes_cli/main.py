@@ -259,11 +259,12 @@ def _has_any_provider_configured() -> bool:
         except Exception:
             pass
 
-    # Check provider-specific auth fallbacks (for example, Copilot via gh auth).
+    # Check provider auth status directly. This covers API-key providers,
+    # provider-specific fallbacks (for example, Copilot via gh auth), and
+    # OAuth-backed providers whose usable credentials live in Hermes auth
+    # storage / credential pools even when they are not the active provider.
     try:
         for provider_id, pconfig in PROVIDER_REGISTRY.items():
-            if pconfig.auth_type != "api_key":
-                continue
             status = get_auth_status(provider_id)
             if status.get("logged_in"):
                 return True
