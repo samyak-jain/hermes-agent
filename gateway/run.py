@@ -2474,6 +2474,8 @@ class GatewayRunner:
         return True
 
     async def _send_startup_continuations(self) -> None:
+        self._claim_startup_continue_for_recent_session()
+
         path = _hermes_home / self._STARTUP_CONTINUE_QUEUE_FILE
         if not path.exists():
             return
