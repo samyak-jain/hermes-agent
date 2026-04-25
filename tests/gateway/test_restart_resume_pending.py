@@ -274,6 +274,43 @@ class TestStartupContinuation:
         assert queue[0]["session_key"] == entry.session_key
         assert queue[0]["text"] == "Continue after restart."
         assert queue[0]["source"]["chat_id"] == source.chat_id
+        assert not request_path.exists()
+
+    def test_preserves_request_when_no_active_session(self, tmp_path):
+        runner, _adapter = make_restart_runner()
+        runner.session_store = _make_store(tmp_path / "sessions")
+        request_path = tmp_path / GatewayRunner._STARTUP_CONTINUE_REQUEST_FILE
+        request_path.write_text(json.dumps({"text": "Continue later."}), encoding="utf-8")
+
+        with patch.object(gateway_run, "_hermes_home", tmp_path):
+            assert runner._claim_startup_continue_for_active_sessions({}) is False
+
+        assert request_path.exists()
+
+    def test_claims_recent_session_on_startup(self, tmp_path):
+        runner, _adapter = make_restart_runner()
+        store = _make_store(tmp_path / "sessions")
+        older = store.get_or_create_session(_make_source(chat_id="111"))
+        newer = store.get_or_create_session(_make_source(chat_id="222"))
+        store._entries[older.session_key].updated_at = datetime(2026, 4, 25, 1, 0, 0)
+        store._entries[newer.session_key].updated_at = datetime(2026, 4, 25, 2, 0, 0)
+        store._save()
+        runner.session_store = store
+        request_path = tmp_path / GatewayRunner._STARTUP_CONTINUE_REQUEST_FILE
+        request_path.write_text(json.dumps({"text": "Continue on startup."}), encoding="utf-8")
+
+        with patch.object(gateway_run, "_hermes_home", tmp_path):
+            assert runner._claim_startup_continue_for_recent_session() is True
+
+        refreshed = store._entries[newer.session_key]
+        assert refreshed.resume_pending is True
+        assert refreshed.resume_reason == "restart_continue"
+        queue = json.loads(
+            (tmp_path / GatewayRunner._STARTUP_CONTINUE_QUEUE_FILE).read_text(encoding="utf-8")
+        )
+        assert queue[0]["session_key"] == newer.session_key
+        assert queue[0]["source"]["chat_id"] == "222"
+        assert not request_path.exists()
 
     @pytest.mark.asyncio
     async def test_startup_continuation_injects_internal_event(self, tmp_path):
