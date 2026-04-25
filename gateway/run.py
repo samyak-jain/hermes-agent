@@ -2346,7 +2346,7 @@ class GatewayRunner:
         except Exception:
             pass
 
-    def _read_startup_continue_request(self) -> dict | None:
+    def _read_startup_continue_request(self, *, consume: bool = False) -> dict | None:
         path = _hermes_home / self._STARTUP_CONTINUE_REQUEST_FILE
         if not path.exists():
             return None
@@ -2355,7 +2355,7 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Invalid startup continuation request ignored: %s", e)
             data = None
-        finally:
+        if consume or not isinstance(data, dict):
             try:
                 path.unlink(missing_ok=True)
             except Exception:
@@ -2382,6 +2382,63 @@ class GatewayRunner:
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(path)
 
+    def _consume_startup_continue_request(self) -> None:
+        try:
+            (_hermes_home / self._STARTUP_CONTINUE_REQUEST_FILE).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _queue_startup_continue_for_entry(self, session_key: str, entry: Any, text: str) -> bool:
+        source = getattr(entry, "origin", None) if entry else None
+        if source is None:
+            return False
+        try:
+            entry.suspended = False
+        except Exception:
+            pass
+        try:
+            self.session_store.mark_resume_pending(session_key, "restart_continue")
+        except Exception as e:
+            logger.debug("mark_resume_pending failed for startup continuation %s: %s", session_key[:20], e)
+        self._write_startup_continue_queue(
+            [
+                {
+                    "session_key": session_key,
+                    "source": source.to_dict(),
+                    "text": text,
+                    "created_at": datetime.now().isoformat(),
+                }
+            ]
+        )
+        return True
+
+    def _claim_startup_continue_for_recent_session(self) -> bool:
+        request = self._read_startup_continue_request()
+        if not request:
+            return False
+        try:
+            self.session_store._ensure_loaded()
+        except Exception:
+            pass
+        entries = getattr(self.session_store, "_entries", {}) or {}
+        candidates = [
+            (key, entry)
+            for key, entry in entries.items()
+            if getattr(entry, "origin", None) is not None
+        ]
+        if not candidates:
+            logger.info("Startup continuation request had no persisted session to resume")
+            return False
+        session_key, entry = max(
+            candidates,
+            key=lambda item: getattr(item[1], "updated_at", datetime.min),
+        )
+        if not self._queue_startup_continue_for_entry(session_key, entry, request["text"]):
+            return False
+        self._consume_startup_continue_request()
+        logger.info("Queued startup continuation for recent session %s", session_key[:20])
+        return True
+
     def _claim_startup_continue_for_active_sessions(self, active_agents: Dict[str, Any]) -> bool:
         request = self._read_startup_continue_request()
         if not request:
@@ -2400,31 +2457,19 @@ class GatewayRunner:
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             entry = getattr(self.session_store, "_entries", {}).get(session_key)
-            source = getattr(entry, "origin", None) if entry else None
-            if source is None:
+            if not self._queue_startup_continue_for_entry(session_key, entry, request["text"]):
                 logger.debug(
                     "Skipping startup continuation for %s: no persisted origin",
                     session_key[:20],
                 )
                 continue
-            try:
-                self.session_store.mark_resume_pending(session_key, "restart_continue")
-            except Exception as e:
-                logger.debug("mark_resume_pending failed for startup continuation %s: %s", session_key[:20], e)
-            entries.append(
-                {
-                    "session_key": session_key,
-                    "source": source.to_dict(),
-                    "text": request["text"],
-                    "created_at": datetime.now().isoformat(),
-                }
-            )
+            entries.append({"session_key": session_key})
 
         if not entries:
             logger.info("Startup continuation request did not match any resumable active sessions")
             return False
 
-        self._write_startup_continue_queue(entries)
+        self._consume_startup_continue_request()
         logger.info("Queued %d startup continuation event(s)", len(entries))
         return True
 
@@ -2665,13 +2710,16 @@ class GatewayRunner:
         # This prevents stuck sessions from being blindly resumed on restart,
         # which can create an unrecoverable loop (#7536).  Suspended sessions
         # auto-reset on the next incoming message, giving the user a clean start.
+        startup_continue_claimed = self._claim_startup_continue_for_recent_session()
         #
         # SKIP suspension after a clean (graceful) shutdown — the previous
         # process already drained active agents, so sessions aren't stuck.
         # This prevents unwanted auto-resets after `hermes update`,
         # `hermes gateway restart`, or `/restart`.
         _clean_marker = _hermes_home / ".clean_shutdown"
-        if _clean_marker.exists():
+        if startup_continue_claimed:
+            logger.info("Startup continuation queued — skipping session suspension")
+        elif _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
             try:
                 _clean_marker.unlink()
