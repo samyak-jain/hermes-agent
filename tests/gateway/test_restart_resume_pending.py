@@ -26,13 +26,16 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore
+import gateway.run as gateway_run
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -242,6 +245,65 @@ class TestClearResumePending:
         store = _make_store(tmp_path)
         assert store.clear_resume_pending("no-such-key") is False
 
+
+class TestStartupContinuation:
+    def test_claims_active_session_and_marks_resume_pending(self, tmp_path):
+        runner, _adapter = make_restart_runner()
+        store = _make_store(tmp_path / "sessions")
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        runner.session_store = store
+        runner._running_agents = {entry.session_key: object()}
+
+        request_path = tmp_path / GatewayRunner._STARTUP_CONTINUE_REQUEST_FILE
+        request_path.write_text(
+            json.dumps({"text": "Continue after restart."}),
+            encoding="utf-8",
+        )
+
+        with patch.object(gateway_run, "_hermes_home", tmp_path):
+            assert runner._claim_startup_continue_for_active_sessions(runner._running_agents) is True
+
+        refreshed = store._entries[entry.session_key]
+        assert refreshed.resume_pending is True
+        assert refreshed.resume_reason == "restart_continue"
+
+        queue = json.loads(
+            (tmp_path / GatewayRunner._STARTUP_CONTINUE_QUEUE_FILE).read_text(encoding="utf-8")
+        )
+        assert queue[0]["session_key"] == entry.session_key
+        assert queue[0]["text"] == "Continue after restart."
+        assert queue[0]["source"]["chat_id"] == source.chat_id
+
+    @pytest.mark.asyncio
+    async def test_startup_continuation_injects_internal_event(self, tmp_path):
+        runner, adapter = make_restart_runner()
+        source = _make_source(chat_id="456")
+        queue_path = tmp_path / GatewayRunner._STARTUP_CONTINUE_QUEUE_FILE
+        queue_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "session_key": "agent:main:telegram:dm:456",
+                        "source": source.to_dict(),
+                        "text": "Resume the interrupted work.",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(gateway_run, "_hermes_home", tmp_path):
+            await runner._send_startup_continuations()
+            await asyncio.sleep(0)
+
+        handler = adapter._message_handler
+        assert handler.await_count == 1
+        event = handler.await_args.args[0]
+        assert event.internal is True
+        assert event.text == "Resume the interrupted work."
+        assert event.source.chat_id == "456"
+        assert not queue_path.exists()
 
 # ---------------------------------------------------------------------------
 # SessionStore.get_or_create_session resume_pending behaviour

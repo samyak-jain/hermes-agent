@@ -612,6 +612,8 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _STARTUP_CONTINUE_REQUEST_FILE = ".startup_continue_request.json"
+    _STARTUP_CONTINUE_QUEUE_FILE = ".startup_continue_queue.json"
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -1853,6 +1855,142 @@ class GatewayRunner:
         except Exception:
             pass
 
+    def _read_startup_continue_request(self) -> dict | None:
+        path = _hermes_home / self._STARTUP_CONTINUE_REQUEST_FILE
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Invalid startup continuation request ignored: %s", e)
+            data = None
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not isinstance(data, dict):
+            return None
+        text = str(data.get("text") or data.get("message") or "").strip()
+        if not text:
+            return None
+        return {**data, "text": text}
+
+    def _write_startup_continue_queue(self, entries: list[dict]) -> None:
+        path = _hermes_home / self._STARTUP_CONTINUE_QUEUE_FILE
+        existing: list[dict] = []
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    existing = [item for item in loaded if isinstance(item, dict)]
+        except Exception as e:
+            logger.warning("Replacing invalid startup continuation queue: %s", e)
+        payload = existing + entries
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _claim_startup_continue_for_active_sessions(self, active_agents: Dict[str, Any]) -> bool:
+        request = self._read_startup_continue_request()
+        if not request:
+            return False
+        if not active_agents:
+            logger.info("Startup continuation request had no active sessions to resume")
+            return False
+
+        try:
+            self.session_store._ensure_loaded()
+        except Exception:
+            pass
+
+        entries: list[dict] = []
+        for session_key, agent in active_agents.items():
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            entry = getattr(self.session_store, "_entries", {}).get(session_key)
+            source = getattr(entry, "origin", None) if entry else None
+            if source is None:
+                logger.debug(
+                    "Skipping startup continuation for %s: no persisted origin",
+                    session_key[:20],
+                )
+                continue
+            try:
+                self.session_store.mark_resume_pending(session_key, "restart_continue")
+            except Exception as e:
+                logger.debug("mark_resume_pending failed for startup continuation %s: %s", session_key[:20], e)
+            entries.append(
+                {
+                    "session_key": session_key,
+                    "source": source.to_dict(),
+                    "text": request["text"],
+                    "created_at": datetime.now().isoformat(),
+                }
+            )
+
+        if not entries:
+            logger.info("Startup continuation request did not match any resumable active sessions")
+            return False
+
+        self._write_startup_continue_queue(entries)
+        logger.info("Queued %d startup continuation event(s)", len(entries))
+        return True
+
+    async def _send_startup_continuations(self) -> None:
+        path = _hermes_home / self._STARTUP_CONTINUE_QUEUE_FILE
+        if not path.exists():
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Dropping invalid startup continuation queue: %s", e)
+            path.unlink(missing_ok=True)
+            return
+        if not isinstance(loaded, list):
+            path.unlink(missing_ok=True)
+            return
+
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        remaining: list[dict] = []
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            try:
+                source_data = item.get("source")
+                text = str(item.get("text") or "").strip()
+                if not isinstance(source_data, dict) or not text:
+                    continue
+                source = SessionSource.from_dict(source_data)
+                adapter = self.adapters.get(source.platform)
+                if not adapter:
+                    remaining.append(item)
+                    continue
+                event = MessageEvent(
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                )
+                logger.info(
+                    "Injecting startup continuation for %s chat=%s thread=%s",
+                    source.platform.value,
+                    source.chat_id,
+                    source.thread_id,
+                )
+                await adapter.handle_message(event)
+            except Exception as e:
+                logger.warning("Startup continuation injection failed: %s", e)
+                remaining.append(item)
+
+        if remaining:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(remaining, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        else:
+            path.unlink(missing_ok=True)
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
@@ -2182,6 +2320,10 @@ class GatewayRunner:
 
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
+
+        # Resume self-requested restart continuations without requiring the
+        # user to send a follow-up message.
+        await self._send_startup_continuations()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -2517,7 +2659,11 @@ class GatewayRunner:
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
 
-            timeout = self._restart_drain_timeout
+            startup_continue_claimed = self._claim_startup_continue_for_active_sessions(
+                self._snapshot_running_agents()
+            )
+
+            timeout = 0 if startup_continue_claimed else self._restart_drain_timeout
             active_agents, timed_out = await self._drain_active_agents(timeout)
             if timed_out:
                 logger.warning(
@@ -2547,7 +2693,11 @@ class GatewayRunner:
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
                 _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                    "restart_continue"
+                    if startup_continue_claimed
+                    else "restart_timeout"
+                    if self._restart_requested
+                    else "shutdown_timeout"
                 )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
@@ -9904,7 +10054,9 @@ class GatewayRunner:
             if _is_resume_pending:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 _reason_phrase = (
-                    "a gateway restart"
+                    "a self-requested gateway restart"
+                    if _reason == "restart_continue"
+                    else "a gateway restart"
                     if _reason == "restart_timeout"
                     else "a gateway shutdown"
                     if _reason == "shutdown_timeout"
