@@ -342,6 +342,29 @@ class TestStartupContinuation:
         assert event.source.chat_id == "456"
         assert not queue_path.exists()
 
+    @pytest.mark.asyncio
+    async def test_startup_continuation_claims_late_request_before_injection(self, tmp_path):
+        runner, adapter = make_restart_runner()
+        store = _make_store(tmp_path / "sessions")
+        entry = store.get_or_create_session(_make_source(chat_id="789"))
+        runner.session_store = store
+        request_path = tmp_path / GatewayRunner._STARTUP_CONTINUE_REQUEST_FILE
+        request_path.write_text(json.dumps({"text": "Resume from late request."}), encoding="utf-8")
+
+        with patch.object(gateway_run, "_hermes_home", tmp_path):
+            await runner._send_startup_continuations()
+            await asyncio.sleep(0)
+
+        handler = adapter._message_handler
+        assert handler.await_count == 1
+        event = handler.await_args.args[0]
+        assert event.internal is True
+        assert event.text == "Resume from late request."
+        assert event.source.chat_id == "789"
+        assert store._entries[entry.session_key].resume_pending is True
+        assert not request_path.exists()
+        assert not (tmp_path / GatewayRunner._STARTUP_CONTINUE_QUEUE_FILE).exists()
+
 # ---------------------------------------------------------------------------
 # SessionStore.get_or_create_session resume_pending behaviour
 # ---------------------------------------------------------------------------
