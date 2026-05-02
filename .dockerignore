@@ -8,10 +8,20 @@ node_modules
 **/node_modules
 .venv
 **/.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+hermes_agent.egg-info
 
-# Built artifacts that are regenerated inside the image.  Excluded so local
-# rebuilds on the developer's machine don't invalidate the npm-install layer
-# that now depends on the full ui-tui/packages/hermes-ink/ tree being present.
+# Trees not needed by the production gateway image.
+docs/
+tests/
+website/
+web/
+ui-tui/
+
+# Built frontend artifacts are intentionally excluded; the cloud gateway image
+# does not serve the local dashboard or terminal UI.
 ui-tui/dist/
 ui-tui/packages/hermes-ink/dist/
 
