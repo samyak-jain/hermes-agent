@@ -24,6 +24,12 @@ Optional feature knobs::
 
     BROWSERBASE_BASE_URL=...      # default https://api.browserbase.com
     BROWSERBASE_PROXIES=true      # default true
+    BROWSERBASE_PROXY_COUNTRY=... # ISO country code, e.g. US
+    BROWSERBASE_PROXY_STATE=...   # optional state code, e.g. NY
+    BROWSERBASE_PROXY_CITY=...    # optional city, e.g. NEW_YORK
+    BROWSERBASE_REGION=...        # e.g. eu-central-1
+    BROWSERBASE_CONTEXT_ID=...    # reuse an existing Browserbase context
+    BROWSERBASE_CONTEXT_PERSIST=true  # create/reuse a project context when true
     BROWSERBASE_ADVANCED_STEALTH=false
     BROWSERBASE_KEEP_ALIVE=true   # default true
     BROWSERBASE_SESSION_TIMEOUT=... (seconds, integer, max 21600 = 6h)
@@ -31,16 +37,24 @@ Optional feature knobs::
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
 import requests
 
 from agent.browser_provider import BrowserProvider
+from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_CACHE_LOCKS_GUARD = threading.Lock()
+_CONTEXT_CACHE_LOCKS: Dict[str, threading.Lock] = {}
+_CONTEXT_CACHE_FILENAME = "browserbase_contexts.json"
 
 
 class BrowserbaseBrowserProvider(BrowserProvider):
@@ -91,6 +105,98 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # Session lifecycle
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _context_cache_path():
+        return get_hermes_home() / "state" / _CONTEXT_CACHE_FILENAME
+
+    def _load_cached_context_id(self, project_id: str) -> Optional[str]:
+        path = self._context_cache_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Could not read Browserbase context cache %s: %s", path, exc)
+            return None
+
+        if not isinstance(data, dict):
+            return None
+        contexts = data.get("contexts")
+        if not isinstance(contexts, dict):
+            return None
+        context_id = contexts.get(project_id)
+        return str(context_id).strip() if context_id else None
+
+    def _cache_context_id(self, project_id: str, context_id: str) -> None:
+        path = self._context_cache_path()
+        try:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            contexts = data.get("contexts")
+            if not isinstance(contexts, dict):
+                contexts = {}
+            contexts[project_id] = context_id
+            atomic_json_write(path, {"contexts": contexts}, mode=0o600, sort_keys=True)
+        except OSError as exc:
+            logger.warning("Could not persist Browserbase context cache %s: %s", path, exc)
+
+    @staticmethod
+    def _context_cache_lock(project_id: str) -> threading.Lock:
+        """Return a per-project single-flight lock for context creation.
+
+        The cache write is atomic, so separate processes cannot corrupt the
+        JSON file, but this in-process lock cannot prevent two gateway
+        processes from creating one context each before either writes. Shared
+        multi-process deployments should set ``BROWSERBASE_CONTEXT_ID``
+        explicitly to avoid that harmless orphan-context race.
+        """
+        with _CONTEXT_CACHE_LOCKS_GUARD:
+            return _CONTEXT_CACHE_LOCKS.setdefault(project_id, threading.Lock())
+
+    def _resolve_context_id(
+        self,
+        config: Dict[str, Any],
+        headers: Dict[str, str],
+        persist: bool,
+        explicit_id: str,
+    ) -> Optional[str]:
+        if explicit_id:
+            return explicit_id
+        if not persist:
+            return None
+
+        project_id = str(config["project_id"])
+        # Context creation must remain single-flight per project when several
+        # delegated browser tasks start at the same time. Other projects no
+        # longer wait behind this 30-second network boundary.
+        with self._context_cache_lock(project_id):
+            cached_id = self._load_cached_context_id(project_id)
+            if cached_id:
+                return cached_id
+            try:
+                response = requests.post(
+                    f"{config['base_url']}/v1/contexts",
+                    headers=headers,
+                    json={"projectId": project_id},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Browserbase context API connection failed: {exc}"
+                ) from exc
+            if not response.ok:
+                raise RuntimeError(
+                    "Failed to create Browserbase context: "
+                    f"{response.status_code} {response.text}"
+                )
+            context_id = str(response.json()["id"])
+            self._cache_context_id(project_id, context_id)
+            return context_id
+
     def create_session(self, task_id: str) -> Dict[str, object]:
         config = self._get_config()
 
@@ -103,6 +209,18 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             os.environ.get("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
         )
         custom_timeout_ms = os.environ.get("BROWSERBASE_SESSION_TIMEOUT")
+        proxy_country = os.environ.get("BROWSERBASE_PROXY_COUNTRY", "").strip()
+        proxy_state = os.environ.get("BROWSERBASE_PROXY_STATE", "").strip()
+        proxy_city = os.environ.get("BROWSERBASE_PROXY_CITY", "").strip()
+        region = os.environ.get("BROWSERBASE_REGION", "").strip()
+        context_id_from_env = os.environ.get("BROWSERBASE_CONTEXT_ID", "").strip()
+        context_persist_raw = os.environ.get("BROWSERBASE_CONTEXT_PERSIST")
+        context_persist = (
+            context_persist_raw.lower() != "false"
+            if context_persist_raw is not None
+            else bool(context_id_from_env)
+        )
+        context_requested = bool(context_id_from_env) or context_persist
 
         features_enabled = {
             "basic_stealth": True,
@@ -110,6 +228,9 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "advanced_stealth": False,
             "keep_alive": False,
             "custom_timeout": False,
+            "persistent_context": False,
+            "regional_proxy": False,
+            "region": False,
         }
 
         session_config: Dict[str, object] = {"projectId": config["project_id"]}
@@ -127,17 +248,51 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                     "Invalid BROWSERBASE_SESSION_TIMEOUT value: %s", custom_timeout_ms
                 )
 
-        if enable_proxies:
-            session_config["proxies"] = True
-
-        if enable_advanced_stealth:
-            session_config["browserSettings"] = {"advancedStealth": True}
-
-        # --- Create session via API ---
         headers = {
             "Content-Type": "application/json",
             "X-BB-API-Key": config["api_key"],
         }
+
+        if enable_proxies:
+            if proxy_country:
+                geolocation = {"country": proxy_country}
+                if proxy_state:
+                    geolocation["state"] = proxy_state
+                if proxy_city:
+                    geolocation["city"] = proxy_city
+                session_config["proxies"] = [
+                    {"type": "browserbase", "geolocation": geolocation}
+                ]
+            else:
+                if proxy_state or proxy_city:
+                    logger.warning(
+                        "BROWSERBASE_PROXY_STATE/CITY require "
+                        "BROWSERBASE_PROXY_COUNTRY; using the default proxy"
+                    )
+                session_config["proxies"] = True
+
+        if region:
+            session_config["region"] = region
+
+        browser_settings: Dict[str, object] = {}
+        if enable_advanced_stealth:
+            browser_settings["advancedStealth"] = True
+        if context_requested:
+            context_id = self._resolve_context_id(
+                config,
+                headers,
+                context_persist,
+                context_id_from_env,
+            )
+            if context_id:
+                browser_settings["context"] = {
+                    "id": context_id,
+                    "persist": context_persist,
+                }
+        if browser_settings:
+            session_config["browserSettings"] = browser_settings
+
+        # --- Create session via API ---
 
         try:
             response = requests.post(
@@ -201,6 +356,12 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             features_enabled["keep_alive"] = True
         if custom_timeout_ms and "timeout" in session_config:
             features_enabled["custom_timeout"] = True
+        if context_requested and "context" in browser_settings:
+            features_enabled["persistent_context"] = context_persist
+        if proxy_country and enable_proxies and not proxies_fallback:
+            features_enabled["regional_proxy"] = True
+        if region:
+            features_enabled["region"] = True
 
         feature_str = ", ".join(k for k, v in features_enabled.items() if v)
         logger.info(
