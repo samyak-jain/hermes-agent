@@ -5581,6 +5581,7 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            tool_policy=getattr(agent, "tool_policy", None),
         )
         or []
     )
@@ -5595,6 +5596,32 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    try:
+        from agent.tool_policy import filter_tool_definitions
+        new_defs = filter_tool_definitions(new_defs, agent.tool_policy)
+        new_names = {t["function"]["name"] for t in new_defs}
+        staged_engine_names.intersection_update(new_names)
+        if (
+            agent.tool_policy.mode == "allowlist"
+            and not agent.tool_policy.allowed_names.issubset(new_names)
+        ):
+            logger.error(
+                "MCP refresh could not satisfy exact tool allowlist; denying refreshed surface"
+            )
+            new_defs = []
+            new_names = set()
+            staged_engine_names.clear()
+    except Exception:
+        # Refresh is a mutation of an already-authorized agent. If policy
+        # evaluation itself fails, publish no tools rather than retaining an
+        # unfiltered staged registry snapshot.
+        logger.exception(
+            "Tool policy evaluation failed during MCP refresh; "
+            "denying refreshed surface"
+        )
+        new_defs = []
+        new_names = set()
+        staged_engine_names.clear()
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

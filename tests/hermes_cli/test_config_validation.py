@@ -192,6 +192,50 @@ class TestMissingModelSection:
         assert not any("no 'model' section" in i.message for i in issues)
 
 
+class TestExactToolPolicyValidation:
+    def test_valid_global_and_channel_policies(self):
+        issues = validate_config_structure({
+            "agent": {"tool_policy": {
+                "mode": "allowlist",
+                "tools": ["memory"],
+                "gateway_override_authority": "managed_only",
+            }},
+            "platforms": {"discord": {"channel_overrides": {
+                "123": {"tool_policy": {"mode": "unrestricted"}},
+            }}},
+        })
+        assert not [issue for issue in issues if "tool policy" in issue.message]
+
+    def test_malformed_channel_policy_is_an_error(self):
+        issues = validate_config_structure({
+            "platforms": {"discord": {"channel_overrides": {
+                "123": {"tool_policy": {"mode": "unrestricted", "tools": ["terminal"]}},
+            }}},
+        })
+        assert any(
+            issue.severity == "error" and "only valid" in issue.message
+            for issue in issues
+        )
+
+    def test_legacy_discord_layout_uses_same_channel_policy_validation(self):
+        issues = validate_config_structure({
+            "discord": {"channel_overrides": {
+                "123": {
+                    "tool_policy": {
+                        "mode": "unrestricted",
+                        "tools": ["terminal"],
+                    }
+                },
+            }},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "discord.channel_overrides.123.tool_policy" in issue.message
+            for issue in issues
+        )
+
+
 class TestConfigIssueDataclass:
     """ConfigIssue should be a proper dataclass."""
 
