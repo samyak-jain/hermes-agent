@@ -2344,6 +2344,15 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Toolsets granted to every child independently of the parent's loaded
+        # schemas. Pair with agent.disabled_toolsets to keep an expensive or
+        # specialized capability (for example browser) child-only. The normal
+        # subagent security blocklist is still enforced after these are added.
+        "subagent_grant_toolsets": [],
+        # legacy preserves parent/toolset inheritance. all_configured uses the
+        # parent's pre-exact-policy configured universe, then subtracts the
+        # child blocklist by individual tool name.
+        "child_tool_policy": {"mode": "legacy"},
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -5579,6 +5588,28 @@ class ConfigIssue:
     hint: str
 
 
+def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
+    """Yield ``(source_path, raw_policy)`` across supported Discord layouts."""
+    discord_maps = []
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict) and isinstance(platforms.get("discord"), dict):
+        discord_maps.append(("platforms.discord", platforms["discord"]))
+    if isinstance(config.get("discord"), dict):
+        discord_maps.append(("discord", config["discord"]))
+
+    for prefix, discord_config in discord_maps:
+        overrides = discord_config.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        for channel_id, override in overrides.items():
+            if not isinstance(override, dict) or "tool_policy" not in override:
+                continue
+            yield (
+                f"{prefix}.channel_overrides.{channel_id}.tool_policy",
+                override.get("tool_policy"),
+            )
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
@@ -5594,6 +5625,40 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # Exact-name tool policy. Invalid explicit policy is a security error: the
+    # runtime denies all tools rather than silently reverting to legacy scope.
+    from agent.tool_policy import parse_tool_policy
+
+    _agent_policy = (config.get("agent") or {}).get("tool_policy") if isinstance(config.get("agent"), dict) else None
+    if _agent_policy is not None:
+        _parsed_policy = parse_tool_policy(_agent_policy, source="agent.tool_policy")
+        if not _parsed_policy.valid:
+            issues.append(ConfigIssue(
+                "error", _parsed_policy.error,
+                "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
+            ))
+    # Discord channel exceptions use the same parser. Validate both the
+    # canonical nested layout and the legacy top-level platform layout.
+    for _source, _raw_channel_policy in _iter_discord_channel_tool_policies(config):
+        _parsed_channel_policy = parse_tool_policy(
+            _raw_channel_policy,
+            source=_source,
+        )
+        if not _parsed_channel_policy.valid:
+            issues.append(ConfigIssue(
+                "error", _parsed_channel_policy.error,
+                "Use mode: unrestricted or an exact individual-name allowlist; invalid channel policies fall back to the global policy",
+            ))
+    _child_policy = (config.get("delegation") or {}).get("child_tool_policy") if isinstance(config.get("delegation"), dict) else None
+    if _child_policy is not None:
+        _child_mode = _child_policy.get("mode") if isinstance(_child_policy, dict) else _child_policy
+        if str(_child_mode or "").strip().lower() not in {"legacy", "all_configured"}:
+            issues.append(ConfigIssue(
+                "error",
+                f"delegation.child_tool_policy has invalid mode {_child_mode!r}",
+                "Use mode: legacy or mode: all_configured",
+            ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

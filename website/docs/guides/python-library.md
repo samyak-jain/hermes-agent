@@ -113,10 +113,19 @@ agent = AIAgent(
     disabled_toolsets=["terminal"],
     quiet_mode=True,
 )
+
+# Security boundary: exactly these individual tools, at schema and runtime
+agent = AIAgent(
+    model="anthropic/claude-sonnet-4.6",
+    tool_policy={"mode": "allowlist", "tools": ["memory", "skills_list"]},
+    quiet_mode=True,
+)
 ```
 
 :::tip
-Use `enabled_toolsets` when you want a minimal, locked-down agent (e.g., only web search for a research bot). Use `disabled_toolsets` when you want most capabilities but need to restrict specific ones (e.g., no terminal access in a shared environment).
+Use toolsets to select capability bundles. Use an exact `tool_policy` when the
+selection is a security boundary that future or dynamically registered tools
+must not cross.
 :::
 
 ---
@@ -315,6 +324,7 @@ print(review)
 | `quiet_mode` | `bool` | `False` | Suppress CLI output |
 | `enabled_toolsets` | `List[str]` | `None` | Whitelist specific toolsets |
 | `disabled_toolsets` | `List[str]` | `None` | Blacklist specific toolsets |
+| `tool_policy` | `dict` or `ToolAccessPolicy` | Config-derived | Exact-name schema and runtime authorization policy |
 | `save_trajectories` | `bool` | `False` | Save conversations to JSONL |
 | `ephemeral_system_prompt` | `str` | `None` | Custom system prompt (not saved to trajectories) |
 | `max_iterations` | `int` | `90` | Max tool-calling iterations per conversation |

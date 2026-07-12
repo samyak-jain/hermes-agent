@@ -81,11 +81,21 @@ def test_load_managed_config_absent_is_empty(tmp_path, monkeypatch):
     assert managed_scope.load_managed_config() == {}
 
 
-def test_load_managed_config_malformed_fails_open(tmp_path, monkeypatch):
+def test_load_managed_config_malformed_fails_closed(tmp_path, monkeypatch):
     from hermes_cli import managed_scope
 
     _write_managed(tmp_path, monkeypatch, config="model: : : not yaml :")
-    assert managed_scope.load_managed_config() == {}  # fail-open, no raise
+    with pytest.raises(managed_scope.ManagedConfigError):
+        managed_scope.load_managed_config()
+
+
+def test_malformed_edit_retains_last_known_good(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+
+    managed = _write_managed(tmp_path, monkeypatch, config="agent:\n  tool_policy:\n    mode: allowlist\n    tools: [memory]\n")
+    good = managed_scope.load_managed_config()
+    (managed / "config.yaml").write_text("agent: : broken", encoding="utf-8")
+    assert managed_scope.load_managed_config() == good
 
 
 def test_managed_config_keys_are_dotted_leaves(tmp_path, monkeypatch):

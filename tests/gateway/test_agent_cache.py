@@ -27,6 +27,21 @@ def _make_runner():
 
 
 class TestAgentConfigSignature:
+    def test_tool_policy_change_busts_signature(self):
+        from agent.tool_policy import ToolAccessPolicy
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "provider": "p", "base_url": "u", "api_mode": "chat_completions"}
+        restricted = ToolAccessPolicy(mode="allowlist", allowed_names=frozenset({"memory"}))
+        unrestricted = ToolAccessPolicy(mode="unrestricted", source="trusted-channel")
+        sig1 = GatewayRunner._agent_config_signature(
+            "m", runtime, ["hermes-discord"], "", tool_policy=restricted
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "m", runtime, ["hermes-discord"], "", tool_policy=unrestricted
+        )
+        assert sig1 != sig2
+
     """Config signature produces stable, distinct keys."""
 
     def test_same_config_same_signature(self):
