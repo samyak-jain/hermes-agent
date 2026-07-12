@@ -111,6 +111,36 @@ def _get_subagent_approval_callback():
         return _subagent_auto_approve
     return _subagent_auto_deny
 
+
+def _get_subagent_grant_toolsets(cfg: Optional[dict] = None) -> List[str]:
+    """Return operator-granted toolsets that children may gain independently.
+
+    ``delegation.subagent_grant_toolsets`` is intentionally config-only. It is
+    applied after parent/child intersection, then passed through the same
+    blocked-toolset filter as inherited tools so it cannot grant delegation,
+    memory, or other child-forbidden capabilities.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    value = cfg.get("subagent_grant_toolsets", [])
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        logger.warning(
+            "delegation.subagent_grant_toolsets=%r must be a list of toolset names",
+            value,
+        )
+        return []
+
+    grants: List[str] = []
+    for item in value:
+        name = str(item).strip() if item is not None else ""
+        if name and name not in grants:
+            grants.append(name)
+    return grants
+
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
@@ -1135,6 +1165,14 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+
+    # Operator-granted toolsets are independent of parent visibility. This is
+    # what permits a main agent with disabled_toolsets: [browser] to delegate
+    # browser work while keeping browser schemas out of its own API calls.
+    for granted_toolset in _get_subagent_grant_toolsets(delegation_cfg):
+        if granted_toolset not in child_toolsets:
+            child_toolsets.append(granted_toolset)
+    child_toolsets = _strip_blocked_tools(child_toolsets)
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -3217,6 +3255,10 @@ def _build_top_level_description() -> str:
         orchestrator_on = _get_orchestrator_enabled()
     except Exception:
         orchestrator_on = True
+    try:
+        granted_toolsets = _get_subagent_grant_toolsets()
+    except Exception:
+        granted_toolsets = []
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -3240,11 +3282,19 @@ def _build_top_level_description() -> str:
             f"config.yaml to enable nesting."
         )
 
+    grant_clause = ""
+    if granted_toolsets:
+        grant_clause = (
+            " Operator-granted child-only toolsets are available even when "
+            "the parent does not have them: "
+            f"{', '.join(granted_toolsets)}."
+        )
+
     return (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
         "Each subagent gets its own conversation, terminal session, and toolset. "
         "Only the final summary is returned -- intermediate tool results "
-        "never enter your context window.\n\n"
+        f"never enter your context window.{grant_clause}\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
         "1. Single task: provide 'goal' (+ optional context, toolsets).\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
@@ -3305,10 +3355,21 @@ def _build_tasks_param_description() -> str:
         max_children = _get_max_concurrent_children()
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
+    try:
+        granted_toolsets = _get_subagent_grant_toolsets()
+    except Exception:
+        granted_toolsets = []
+    grant_clause = ""
+    if granted_toolsets:
+        grant_clause = (
+            " Operator-granted child-only toolsets available to every child: "
+            f"{', '.join(granted_toolsets)}."
+        )
     return (
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
-        "its own subagent with isolated context and terminal session. "
+        "its own subagent with isolated context and terminal session."
+        f"{grant_clause} "
         "When provided, top-level goal/context/toolsets are ignored."
     )
 
