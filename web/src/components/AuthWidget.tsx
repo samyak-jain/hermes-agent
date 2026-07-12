@@ -104,6 +104,10 @@ export function AuthWidget({ className }: AuthWidgetProps) {
   }
 
   const handleLogout = () => {
+    if (me.logout_url) {
+      window.location.assign(me.logout_url);
+      return;
+    }
     void api.logout();
   };
 

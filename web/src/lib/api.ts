@@ -1267,6 +1267,8 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+  /** Edge-controlled logout target. Empty for Hermes-managed sessions. */
+  logout_url: string;
 }
 
 export interface ActionResponse {
