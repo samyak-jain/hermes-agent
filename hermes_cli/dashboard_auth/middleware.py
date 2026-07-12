@@ -22,9 +22,13 @@ from typing import Awaitable, Callable
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from hermes_cli.dashboard_auth import list_session_providers
+from hermes_cli.dashboard_auth import (
+    list_request_auth_providers,
+    list_session_providers,
+)
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
     read_session_cookies,
@@ -74,13 +78,6 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _unauth_response(request: Request, *, reason: str) -> Response:
@@ -272,7 +269,42 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     path = request.url.path
+    request_providers = list_request_auth_providers()
+
+    # /login is public for cookie-session providers, but edge authentication
+    # has no local login page. Verify its assertion and send authenticated
+    # users back to the dashboard instead of rendering the misleading
+    # "no providers installed" page.
+    if path == "/login" and request_providers:
+        request_session, unavailable = _verify_request_auth(
+            request, request_providers
+        )
+        if request_session is not None:
+            from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+            return RedirectResponse(
+                url=f"{prefix_from_request(request)}/", status_code=302
+            )
+        return _request_auth_failure(request, request_providers, unavailable)
+
     if _path_is_public(path):
+        return await call_next(request)
+
+    # Edge-auth providers (Cloudflare Access, etc.) are authoritative when
+    # configured.  They run before Hermes cookie auth because the assertion is
+    # attached to every request that passed the edge, and there is no local
+    # login or refresh flow to fall back to.  A request that reached the origin
+    # without a valid assertion indicates a proxy/origin-routing mistake, so
+    # fail closed with JSON for both API and document requests.
+    if request_providers:
+        request_session, unavailable = _verify_request_auth(
+            request, request_providers
+        )
+        if request_session is None:
+            return _request_auth_failure(
+                request, request_providers, unavailable
+            )
+        request.state.session = request_session
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)
@@ -406,6 +438,50 @@ async def gated_auth_middleware(
 
     request.state.session = session
     return await call_next(request)
+
+
+def _verify_request_auth(request: Request, providers):
+    """Return ``(session, unavailable_provider_name)`` for request auth."""
+    unavailable: str | None = None
+    for provider in providers:
+        try:
+            session = provider.verify_request(headers=request.headers)
+        except ProviderError as exc:
+            _log.warning(
+                "dashboard-auth: request provider %r unavailable: %s",
+                provider.name,
+                exc,
+            )
+            if unavailable is None:
+                unavailable = provider.name
+            continue
+        if session is not None:
+            return session, None
+    return None, unavailable
+
+
+def _request_auth_failure(
+    request: Request, providers, unavailable: str | None
+) -> Response:
+    audit_log(
+        AuditEvent.SESSION_VERIFY_FAILURE,
+        provider=unavailable or providers[0].name,
+        reason=("provider_unreachable" if unavailable else "invalid_request_assertion"),
+        ip=_client_ip(request),
+    )
+    if unavailable:
+        return JSONResponse(
+            {"detail": f"Auth provider {unavailable!r} unreachable"},
+            status_code=503,
+        )
+    return JSONResponse(
+        {
+            "error": "unauthenticated",
+            "detail": "Missing or invalid upstream identity assertion",
+            "reason": "invalid_request_assertion",
+        },
+        status_code=401,
+    )
 
 
 def _expires_in_seconds(session) -> int:

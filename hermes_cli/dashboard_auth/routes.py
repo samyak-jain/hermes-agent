@@ -36,6 +36,7 @@ from hermes_cli.dashboard_auth.base import (
     InvalidCredentialsError,
     ProviderError,
 )
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
 from hermes_cli.dashboard_auth.cookies import (
     clear_pkce_cookie,
     clear_session_cookies,
@@ -103,13 +104,6 @@ def _redirect_uri(request: Request) -> str:
         return base
     parsed = urlparse(base)
     return urlunparse(parsed._replace(path=f"{prefix}{parsed.path}"))
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _prefix(request: Request) -> str:
@@ -595,6 +589,8 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    provider = get_provider(sess.provider)
+    logout_url = str(getattr(provider, "logout_url", "") or "")
     return {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -602,6 +598,7 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "logout_url": logout_url,
     }
 
 

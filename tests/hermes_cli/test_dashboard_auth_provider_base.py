@@ -101,6 +101,14 @@ def test_assert_protocol_compliance_accepts_full_impl():
     assert assert_protocol_compliance(_CompliantProvider) is None
 
 
+def test_request_auth_capability_requires_verify_request_override():
+    class MissingRequestVerifier(_CompliantProvider):
+        supports_request_auth = True
+
+    with pytest.raises(TypeError, match="override verify_request"):
+        assert_protocol_compliance(MissingRequestVerifier)
+
+
 def test_assert_protocol_compliance_rejects_missing_name_attr():
     class NoName(_CompliantProvider):
         name = ""  # empty is treated as missing

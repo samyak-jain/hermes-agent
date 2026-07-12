@@ -557,11 +557,12 @@ same auth gate as the rest of `/api/`.
 
 ## Authentication (gated mode)
 
-When the dashboard is bound to a public or non-loopback address — anything other than `127.0.0.1` / `localhost` — Hermes Agent engages an auth gate. Every request must carry a verified session cookie or it's bounced to the login page. Three providers ship in the box:
+When the dashboard is bound to a public or non-loopback address — anything other than `127.0.0.1` / `localhost` — Hermes Agent engages an auth gate. Every protected request must carry either a verified Hermes session cookie or a signed upstream identity assertion. Four providers ship in the box:
 
 - **[Username/password](#usernamepassword-provider-no-oauth-idp)** — the simplest way to put auth on a self-hosted / on-prem / homelab dashboard. No external identity provider. **Use it only on a trusted network or behind a VPN — not for public-internet exposure.**
 - **[OAuth (Nous Portal)](#default-provider-nous-research)** — for hosted deployments and any dashboard reachable over the public internet, and the recommended path for a [remote Hermes Desktop connection](#connecting-hermes-desktop-to-a-remote-backend). Every login is verified against your Nous account, so this is the provider suitable for internet-facing use.
 - **[Self-hosted OIDC](#self-hosted-oidc-provider)** — for bringing your own identity provider via standard OpenID Connect (Keycloak, Auth0, Okta, Google, GitHub via an OIDC bridge, etc.). No Nous Portal involved; suitable for public-internet exposure when fronted by a conformant OIDC server.
+- **[Cloudflare Access](#cloudflare-access-provider)** — for dashboards published through a Cloudflare Tunnel or Cloudflare-proxied hostname. Access performs login and policy enforcement at the edge; Hermes independently validates the signed application JWT at the origin.
 
 Operator-owned dashboards bound to loopback are unaffected — no auth, no login page.
 
@@ -572,13 +573,14 @@ Operator-owned dashboards bound to loopback are unaffected — no auth, no login
 | `hermes dashboard` (default — binds to `127.0.0.1`) | OFF | Local development |
 | `hermes dashboard --host 0.0.0.0` | **ON** | Remote / production — protect with the username/password provider or OAuth |
 
-The gate is on if and only if:
+The gate is on for every non-loopback bind, including `0.0.0.0`. The legacy
+`--insecure` flag no longer disables authentication; Hermes logs a warning and
+still requires a provider.
 
-1. The bind host is not `127.0.0.1`, `::1`, `localhost`, or `0.0.0.0` AND
-2. The `--insecure` flag is **not** set.
-
-:::danger `--insecure` disables auth entirely
-`--insecure` skips the gate and serves an unauthenticated dashboard that reads/writes your `.env` (API keys, secrets) and can run agent commands. **Do not use it for a remote connection.** To expose the dashboard to another machine, configure the [username/password provider](#usernamepassword-provider-no-oauth-idp) (or OAuth) and leave `--insecure` off. The flag exists only as a last-resort escape hatch on a fully trusted, firewalled single-host network.
+:::danger Do not rely on `--insecure` behind a reverse proxy
+First-class proxy authentication must still be verified at the origin. Running
+an unauthenticated origin and assuming the proxy will always remain in the path
+fails open if a tunnel, firewall, or DNS rule is changed later.
 :::
 
 ### Fail-closed semantics
@@ -675,6 +677,72 @@ curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'
 ```
 
 `GET /api/auth/me` then returns the verified session (`provider: nous`). For an internet-facing host, register with `--redirect-uri https://hermes.example.com/auth/callback` and set `HERMES_DASHBOARD_PUBLIC_URL` so the OAuth callback resolves to your public URL (see [Public URL override](#public-url-override)).
+
+### Cloudflare Access provider
+
+Use the bundled `plugins/dashboard_auth/cloudflare_access` provider when a
+[Cloudflare Access self-hosted application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/)
+protects the dashboard. Cloudflare authenticates users and service tokens at
+the edge, then forwards an application JWT in `Cf-Access-Jwt-Assertion`.
+Hermes validates its RS256 signature against the team's rotating JWKS and pins
+both the issuer and application AUD on every request. It never trusts the
+unsigned `Cf-Access-Authenticated-User-Email` convenience header.
+
+#### Configuration
+
+Copy the application's **Audience (AUD) tag** from Zero Trust, then add these
+non-secret settings to `~/.hermes/config.yaml`:
+
+```yaml
+dashboard:
+  cloudflare_access:
+    team_domain: https://my-team.cloudflareaccess.com
+    aud: 32eafc7626e974616deaf0dc3ce63d7bcbed58a2731e84d06bc3cdf1b53c4228
+```
+
+Start Hermes on the address reached by your tunnel:
+
+```bash
+hermes dashboard --host 0.0.0.0 --port 9119 --no-open
+```
+
+The status endpoint should now report `"cloudflare-access"` in
+`auth_providers`. There is no Hermes login screen, refresh token, or session
+duration setting in this mode: Access owns those controls. `/api/auth/me`
+reports the verified `sub` and `email`; the dashboard logout button navigates
+to `/cdn-cgi/access/logout`, which Cloudflare intercepts and uses to end the
+Access session.
+
+When configured, Cloudflare Access is authoritative for protected requests.
+Do not also configure `basic`, Nous OAuth, or self-hosted OIDC behind it; those
+would create a redundant second login and their Hermes session cookies are not
+used while the signed Access-assertion provider is active.
+
+Cloudflare Access service-token requests work through the same path. Configure
+a **Service Auth** policy and send `CF-Access-Client-Id` plus
+`CF-Access-Client-Secret` to the public application. After Cloudflare accepts
+them, Hermes validates the resulting application JWT and uses its
+`common_name` claim as the machine identity. Hermes never receives or stores
+the client secret.
+
+:::warning Keep the origin private
+Prefer a Cloudflare Tunnel, which requires no inbound dashboard port. If you
+publish the origin directly, restrict it to Cloudflare IPs and use
+Authenticated Origin Pulls. JWT validation still prevents forged identities
+when the origin is reached directly, but origin lockdown preserves rate-limit
+and denial-of-service protection. Do not configure a Cloudflare **Bypass**
+policy for protected dashboard paths.
+:::
+
+The signing keys are cached for five minutes and refreshed automatically on an
+unknown `kid`. A missing or invalid assertion returns `401` without redirecting
+to Hermes' `/login`; an unavailable JWKS endpoint with no usable cached key
+returns `503`. Both cases fail closed.
+
+See Cloudflare's documentation for
+[validating Access JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/),
+[service tokens](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/),
+and [session logout](https://developers.cloudflare.com/cloudflare-one/access-controls/access-settings/session-management/).
 
 ### Username/password provider (no OAuth IDP)
 

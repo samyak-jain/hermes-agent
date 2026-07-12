@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,20 @@ class DashboardAuthProvider(ABC):
     # supports_token.
     supports_session: bool = True
 
+    # When True, this provider authenticates the complete inbound HTTP
+    # request rather than a Hermes-minted session cookie.  Reverse-proxy
+    # identity systems such as Cloudflare Access use this shape: the edge
+    # authenticates the caller and forwards a signed assertion to the origin.
+    # Request-auth providers are intentionally non-interactive
+    # (``supports_session = False``), so they never appear on /login.
+    supports_request_auth: bool = False
+
+    # Optional audit-IP header owned and sanitized by the upstream request-auth
+    # edge. It is ignored unless this provider is registered with
+    # supports_request_auth=True, preventing arbitrary clients from activating
+    # proxy-specific headers in ordinary cookie-session deployments.
+    trusted_client_ip_header: str = ""
+
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
 
@@ -263,6 +277,20 @@ class DashboardAuthProvider(ABC):
             "(set supports_token = True and override verify_token)"
         )
 
+    def verify_request(self, *, headers: Mapping[str, str]) -> Optional[Session]:
+        """Verify an identity assertion carried by an inbound request.
+
+        Only consulted when ``supports_request_auth`` is true. Return a
+        :class:`Session` when the request is authenticated, ``None`` for a
+        missing/invalid assertion, and raise :class:`ProviderError` only when
+        verification cannot be completed (for example, a cold JWKS cache while
+        the signing-key endpoint is unavailable).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support request auth "
+            "(set supports_request_auth = True and override verify_request)"
+        )
+
 
 def assert_protocol_compliance(cls: type) -> None:
     """Raise ``TypeError`` if ``cls`` doesn't fully implement the provider protocol.
@@ -292,6 +320,14 @@ def assert_protocol_compliance(cls: type) -> None:
     for method in required_methods:
         if not callable(getattr(cls, method, None)):
             raise TypeError(f"{cls.__name__} missing method: {method}")
+    if (
+        getattr(cls, "supports_request_auth", False)
+        and cls.verify_request is DashboardAuthProvider.verify_request
+    ):
+        raise TypeError(
+            f"{cls.__name__} sets supports_request_auth=True but does not "
+            "override verify_request"
+        )
     # Also catch the ABC-not-overridden case.
     if getattr(cls, "__abstractmethods__", None):
         raise TypeError(

@@ -1986,6 +1986,15 @@ DEFAULT_CONFIG = {
             "client_id": "",  # agent:{instance_id} — Portal provisions this
             "portal_url": "",  # blank → use plugin default (production Portal)
         },
+        # Cloudflare Access authenticates at the edge and forwards a signed
+        # application JWT to Hermes. Both values are non-secret deployment
+        # settings and therefore live in config.yaml (not .env).
+        "cloudflare_access": {
+            # Team issuer, e.g. https://my-team.cloudflareaccess.com
+            "team_domain": "",
+            # Access application's Audience (AUD) tag.
+            "aud": "",
+        },
         # Username/password gate configuration — read by the bundled
         # ``dashboard_auth/basic`` plugin (a self-hosted "just put a
         # password on my dashboard" provider that needs no OAuth IDP).

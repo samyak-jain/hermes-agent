@@ -17026,6 +17026,15 @@ def start_server(
                     )
             except Exception:
                 pass
+            try:
+                from plugins.dashboard_auth import cloudflare_access as _cf_plugin
+
+                if _cf_plugin.LAST_SKIP_REASON:
+                    skip_reasons.append(
+                        f"  • cloudflare-access: {_cf_plugin.LAST_SKIP_REASON}"
+                    )
+            except Exception:
+                pass
 
             _fix_hint = (
                 "Configure an auth provider before exposing the dashboard:\n"
@@ -17036,6 +17045,8 @@ def start_server(
                 "print(hash_password('your-password'))\")\n"
                 "  • OAuth: run `hermes dashboard register` (Nous Portal) or "
                 "install a DashboardAuthProvider plugin.\n"
+                "  • Cloudflare Access: set dashboard.cloudflare_access."
+                "team_domain + aud in config.yaml.\n"
                 "There is no unauthenticated public-bind option — to keep it "
                 "local, bind 127.0.0.1 and tunnel in (SSH / Tailscale)."
             )
