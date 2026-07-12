@@ -54,3 +54,24 @@ def test_managed_dir_env_scrubbed_by_default():
     import os
 
     assert "HERMES_MANAGED_DIR" not in os.environ
+
+
+def test_load_managed_config_malformed_fails_closed(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+
+    _write_managed(tmp_path, monkeypatch, config="model: : : not yaml :")
+    with pytest.raises(managed_scope.ManagedConfigError):
+        managed_scope.load_managed_config()
+
+
+def test_malformed_edit_retains_last_known_good(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+
+    managed = _write_managed(
+        tmp_path,
+        monkeypatch,
+        config="agent:\n  tool_policy:\n    mode: allowlist\n    tools: [memory]\n",
+    )
+    good = managed_scope.load_managed_config()
+    (managed / "config.yaml").write_text("agent: : broken", encoding="utf-8")
+    assert managed_scope.load_managed_config() == good

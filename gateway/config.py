@@ -597,6 +597,7 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    tool_policy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -606,6 +607,8 @@ class ChannelOverride:
             out["provider"] = self.provider
         if self.system_prompt is not None:
             out["system_prompt"] = self.system_prompt
+        if self.tool_policy is not None:
+            out["tool_policy"] = self.tool_policy
         return out
 
     @classmethod
@@ -616,6 +619,7 @@ class ChannelOverride:
             model=data.get("model"),
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
+            tool_policy=data.get("tool_policy"),
         )
 
 

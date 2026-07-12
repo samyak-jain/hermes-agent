@@ -32,6 +32,9 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.tool_policy import (
+    allowed_tool_names_for_dispatch as _allowed_tool_names_for_dispatch,
+)
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -1180,6 +1183,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            parsed_calls.append(
+                (tool_call, function_name, function_args, [], _policy_block, False)
+            )
+            continue
+
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
@@ -2039,6 +2050,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            messages.append(make_tool_result_message(
+                function_name, _policy_block, tool_call.id,
+            ))
+            _flush_session_db_after_tool_progress(
+                agent, messages, stage=f"policy-blocked tool {function_name}",
+            )
+            agent._apply_pending_steer_to_tool_results(messages, 1)
+            continue
+
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
         _execution_dispatched = False
@@ -2470,6 +2493,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                         )
 
                 (
@@ -2552,6 +2576,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                         )
 
                 (

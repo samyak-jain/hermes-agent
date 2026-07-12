@@ -1949,5 +1949,75 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIn("missing-acp-binary", str(ctx.exception))
 
 
+class TestConfiguredChildToolPolicy(unittest.TestCase):
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_grant_toolsets": ["browser"]},
+    )
+    def test_schema_description_advertises_child_only_grants(self, _mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        tasks_desc = overrides["parameters"]["properties"]["tasks"]["description"]
+
+        # Upstream keeps the top-level description byte-stable and places
+        # dynamic limits/grants on parameter descriptions.
+        self.assertIn("child-only toolsets", tasks_desc)
+        self.assertIn("browser", tasks_desc)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_grant_toolsets": ["browser"]},
+    )
+    def test_child_adds_operator_grant_outside_parent_scope(self, _mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Browse without exposing browser to the parent",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"], ["terminal", "browser"]
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "subagent_grant_toolsets": ["delegation", "memory", "browser"]
+        },
+    )
+    def test_child_filters_security_blocked_operator_grants(self, _mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Keep blocked grants blocked",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        enabled = MockAgent.call_args[1]["enabled_toolsets"]
+        self.assertIn("browser", enabled)
+        self.assertNotIn("delegation", enabled)
+        self.assertNotIn("memory", enabled)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_policy=None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -374,6 +375,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                getattr(tool_policy, "fingerprint", "legacy"),
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -387,7 +389,8 @@ def get_tool_definitions(
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       tool_policy=tool_policy)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -419,6 +422,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_policy=None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -500,6 +504,12 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
 
+    # An exact allowlist is authoritative positive selection by individual
+    # name. This guarantees the same named baseline across CLI, ACP, cron, and
+    # gateway platform bundles without allowing any future toolset member.
+    if tool_policy is not None and getattr(tool_policy, "mode", None) == "allowlist":
+        tools_to_include = set(tool_policy.allowed_names)
+
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
     # all check the tool registry for plugin-provided toolsets.  No bypass
@@ -508,6 +518,10 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    if tool_policy is not None:
+        from agent.tool_policy import filter_tool_definitions
+        filtered_tools = filter_tool_definitions(filtered_tools, tool_policy)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1205,6 +1219,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    allowed_tool_names: Optional[set[str] | frozenset[str]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1230,6 +1245,13 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # Per-agent authorization must run before coercion, middleware, hooks, or
+    # dispatch. This is defense in depth for direct/fabricated calls; normal
+    # model calls are also gated in agent.tool_executor.
+    if allowed_tool_names is not None and function_name not in allowed_tool_names:
+        from agent.tool_policy import denied_tool_result
+        return denied_tool_result(function_name)
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1284,6 +1306,11 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            if allowed_tool_names is not None:
+                current_defs = [
+                    d for d in current_defs
+                    if (d.get("function") or {}).get("name") in allowed_tool_names
+                ]
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
@@ -1344,6 +1371,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                allowed_tool_names=allowed_tool_names,
             )
 
     _tool_original_args = dict(function_args)
