@@ -2166,6 +2166,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    from agent.tool_policy import authorize_agent_tool
+    policy_denial = authorize_agent_tool(agent, function_name)
+    if policy_denial is not None:
+        return policy_denial
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2345,6 +2350,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                allowed_tool_names=(
+                    None if agent.tool_policy.mode == "legacy"
+                    else frozenset(agent.valid_tool_names)
+                ),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
 

@@ -272,6 +272,7 @@ def init_agent(
     tool_delay: float = 1.0,
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    tool_policy=None,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -590,6 +591,26 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    from agent.tool_policy import ToolAccessPolicy, parse_tool_policy
+    if tool_policy is None:
+        try:
+            from agent.tool_policy import policy_from_config
+            from hermes_cli.config import load_config_readonly
+            tool_policy = policy_from_config(load_config_readonly())
+        except Exception as exc:
+            # A present but untrusted managed policy must never degrade to the
+            # historical unrestricted/legacy behavior.
+            try:
+                from hermes_cli.managed_scope import ManagedConfigError
+            except Exception:
+                ManagedConfigError = ()  # type: ignore[assignment,misc]
+            if isinstance(exc, ManagedConfigError):
+                raise
+            from agent.tool_policy import LEGACY_TOOL_POLICY
+            tool_policy = LEGACY_TOOL_POLICY
+    elif not isinstance(tool_policy, ToolAccessPolicy):
+        tool_policy = parse_tool_policy(tool_policy, source="AIAgent.tool_policy")
+    agent.tool_policy = tool_policy
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1162,12 +1183,23 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        tool_policy=agent.tool_policy,
     )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
         agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+        if agent.tool_policy.mode == "allowlist":
+            _missing_policy_tools = agent.tool_policy.allowed_names - agent.valid_tool_names
+            if _missing_policy_tools:
+                _ra().logger.error(
+                    "Exact tool allowlist contains unavailable or unknown names (%s); "
+                    "denying the entire tool surface",
+                    ", ".join(sorted(_missing_policy_tools)),
+                )
+                agent.tools = []
+                agent.valid_tool_names = set()
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
@@ -1420,6 +1452,11 @@ def init_agent(
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
+    from agent.tool_policy import filter_tool_definitions as _filter_policy_tools
+    agent.tools = _filter_policy_tools(agent.tools or [], agent.tool_policy)
+    agent.valid_tool_names = {
+        t["function"]["name"] for t in agent.tools if t.get("function", {}).get("name")
+    }
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -1929,6 +1966,24 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # Context engines are runtime injectors rather than registry entries; apply
+    # the same exact-name boundary after they have had a chance to contribute.
+    agent.tools = _filter_policy_tools(agent.tools or [], agent.tool_policy)
+    agent.valid_tool_names = {
+        t["function"]["name"] for t in agent.tools if t.get("function", {}).get("name")
+    }
+    agent._context_engine_tool_names.intersection_update(agent.valid_tool_names)
+    if agent.tool_policy.mode == "allowlist":
+        _missing_policy_tools = agent.tool_policy.allowed_names - agent.valid_tool_names
+        if _missing_policy_tools:
+            _ra().logger.error(
+                "Exact tool allowlist is incomplete (%s); denying all tools",
+                ", ".join(sorted(_missing_policy_tools)),
+            )
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._context_engine_tool_names.clear()
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

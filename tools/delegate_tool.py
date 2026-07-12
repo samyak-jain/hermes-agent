@@ -141,6 +141,26 @@ def _get_subagent_grant_toolsets(cfg: Optional[dict] = None) -> List[str]:
             grants.append(name)
     return grants
 
+
+def _get_child_tool_policy_mode(cfg: Optional[dict] = None) -> str:
+    if cfg is None:
+        cfg = _load_config()
+    raw = cfg.get("child_tool_policy")
+    if raw is None:
+        return "legacy"
+    if isinstance(raw, str):
+        mode = raw
+    elif isinstance(raw, dict):
+        mode = raw.get("mode", "")
+    else:
+        logger.error("delegation.child_tool_policy must be a mapping")
+        return "deny_all"
+    mode = str(mode or "").strip().lower()
+    if mode not in {"legacy", "all_configured"}:
+        logger.error("Invalid delegation.child_tool_policy.mode=%r; denying child tools", mode)
+        return "deny_all"
+    return mode
+
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
@@ -1128,50 +1148,64 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+    child_policy_mode = _get_child_tool_policy_mode(delegation_cfg)
+
+    # all_configured deliberately resolves the complete registered/configured
+    # universe. Registry check functions still gate unavailable services, and
+    # the exact child denylist below removes security-blocked names after all
+    # composites (including future toolsets) have expanded.
+    if child_policy_mode == "all_configured":
+        child_toolsets = ["all"]
+        if toolsets:
+            child_toolsets = list(dict.fromkeys(toolsets))
+    elif child_policy_mode == "deny_all":
+        child_toolsets = []
+    else:
+        child_toolsets = None
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
+    if child_toolsets is None:  # legacy policy
+        if parent_enabled is not None:
+            parent_toolsets = set(parent_enabled)
+        elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+            # enabled_toolsets is None (all tools) — derive from loaded tool names
+            import model_tools
 
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
+            parent_toolsets = {
+                ts
+                for name in parent_agent.valid_tool_names
+                if (ts := model_tools.get_toolset_for_tool(name)) is not None
+            }
+        else:
+            parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks.
-        # Expand composite toolsets (e.g. hermes-cli) so that individual
-        # toolset names (e.g. web, terminal) are recognised during intersection.
-        expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
-            child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
-            )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
-    else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        if toolsets:
+            # Intersect with parent — subagent must not gain tools the parent lacks.
+            expanded_parent = _expand_parent_toolsets(parent_toolsets)
+            child_toolsets = [t for t in toolsets if t in expanded_parent]
+            if _get_inherit_mcp_toolsets():
+                child_toolsets = _preserve_parent_mcp_toolsets(
+                    child_toolsets, parent_toolsets
+                )
+            child_toolsets = _strip_blocked_tools(child_toolsets)
+        elif parent_agent and parent_enabled is not None:
+            child_toolsets = _strip_blocked_tools(parent_enabled)
+        elif parent_toolsets:
+            child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+        else:
+            child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     # Operator-granted toolsets are independent of parent visibility. This is
     # what permits a main agent with disabled_toolsets: [browser] to delegate
     # browser work while keeping browser schemas out of its own API calls.
-    for granted_toolset in _get_subagent_grant_toolsets(delegation_cfg):
-        if granted_toolset not in child_toolsets:
-            child_toolsets.append(granted_toolset)
+    if child_policy_mode != "deny_all":
+        for granted_toolset in _get_subagent_grant_toolsets(delegation_cfg):
+            if granted_toolset not in child_toolsets:
+                child_toolsets.append(granted_toolset)
     child_toolsets = _strip_blocked_tools(child_toolsets)
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
@@ -1180,6 +1214,20 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    from agent.tool_policy import ToolAccessPolicy
+    child_denied_names = set(DELEGATE_BLOCKED_TOOLS)
+    if effective_role == "orchestrator":
+        child_denied_names.discard("delegate_task")
+    child_exact_policy = (
+        ToolAccessPolicy(mode="allowlist", source="delegation.invalid")
+        if child_policy_mode == "deny_all"
+        else ToolAccessPolicy(
+            mode="denylist",
+            denied_names=frozenset(child_denied_names),
+            source=f"delegation.{effective_role}",
+        )
+    )
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -1369,6 +1417,7 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        tool_policy=child_exact_policy,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",

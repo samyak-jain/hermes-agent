@@ -1947,6 +1947,60 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 **Child-only toolsets:** Set `agent.disabled_toolsets` to hide a capability from the main agent, then list it under `delegation.subagent_grant_toolsets` to make it available only to delegated children. For example, `agent.disabled_toolsets: [browser]` together with `delegation.subagent_grant_toolsets: [browser]` keeps browser schemas out of main-agent calls while allowing the main agent to delegate browsing tasks. Security-blocked child capabilities such as delegation and memory cannot be restored through this setting. The `delegate_task` description tells the main model which child-only toolsets are available.
 
+### Exact tool policies
+
+For a fail-closed main-agent surface, use an individual-name allowlist. The
+same policy filters schemas and runtime execution, including plugin, MCP,
+memory-provider, and context-engine tools:
+
+```yaml
+agent:
+  # Clear legacy parent-only denylisting. The exact policy is the main-agent
+  # boundary; unrestricted trusted channels still respect disabled_toolsets.
+  disabled_toolsets: []
+  tool_policy:
+    mode: allowlist
+    tools: [clarify, delegate_task, memory, skills_list, skill_manage]
+    gateway_override_authority: managed_only
+
+delegation:
+  child_tool_policy:
+    mode: all_configured
+  subagent_grant_toolsets: []
+```
+
+`all_configured` gives children the complete registered tool universe for the
+active profile independently of the parent's exact visibility. Normal service
+checks still remove tools whose prerequisites are not configured. Hermes then
+expands composites and removes `DELEGATE_BLOCKED_TOOLS` by individual name.
+Configured MCP and plugin tools therefore reach children automatically, while
+leaf children retain Hermes's security restrictions.
+
+A managed Discord channel may remove the main-agent cap without tying trust to
+its model:
+
+```yaml
+platforms:
+  discord:
+    channel_overrides:
+      "123456789012345678":
+        model: openai/gpt-5
+        provider: openrouter
+        tool_policy:
+          mode: unrestricted
+```
+
+`unrestricted` means all tools configured and available for that platform and
+profile, not every process-global registry entry. With
+`gateway_override_authority: managed_only`, only administrator-managed channel
+policy can elevate access. Discord threads inherit their parent channel policy;
+an exact managed thread policy takes precedence.
+
+When migrating from a child-only `browser` deny/grant pair, remove it or pin
+the two empty lists above in managed configuration. Otherwise the trusted
+channel's `unrestricted` policy will correctly continue honoring the legacy
+main-agent `disabled_toolsets: [browser]` setting.
+
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 
 ## Clarify

@@ -268,6 +268,7 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
   # subagent_grant_toolsets: [browser]       # Grant toolsets even when the parent has them disabled
+  # child_tool_policy: {mode: all_configured} # All configured tools minus the name-level child blocklist
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.

@@ -374,6 +374,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            parsed_calls.append(
+                (tool_call, function_name, function_args, [], _policy_block, False)
+            )
+            continue
+
         # Reset nudge counters only for a structurally valid invocation.
         if function_name == "memory":
             agent._turns_since_memory = 0
@@ -414,6 +422,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         }, ensure_ascii=False)
         except Exception:
             pass
+
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            parsed_calls.append(
+                (tool_call, function_name, function_args, [], _policy_block, False)
+            )
+            continue
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -1087,6 +1103,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            messages.append(make_tool_result_message(
+                function_name, _policy_block, tool_call.id,
+            ))
+            _flush_session_db_after_tool_progress(
+                agent, messages, stage=f"policy-blocked tool {function_name}",
+            )
+            agent._apply_pending_steer_to_tool_results(messages, 1)
+            continue
+
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -1483,6 +1511,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    allowed_tool_names=(
+                        None if agent.tool_policy.mode == "legacy"
+                        else frozenset(agent.valid_tool_names)
+                    ),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1525,6 +1557,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    allowed_tool_names=(
+                        None if agent.tool_policy.mode == "legacy"
+                        else frozenset(agent.valid_tool_names)
+                    ),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:

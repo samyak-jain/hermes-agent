@@ -2356,6 +2356,8 @@ def _load_gateway_config() -> dict:
     try:
         from hermes_cli import managed_scope
         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
+    except managed_scope.ManagedConfigError:
+        raise
     except Exception:
         pass
     if not isinstance(raw, dict):
@@ -2461,6 +2463,75 @@ def _get_channel_override(
         if ov is not None:
             return ov
     return None
+
+
+def _resolve_tool_policy_for_source(user_config: dict, source: SessionSource):
+    """Resolve exact tool authority independently from model selection.
+
+    Elevating channel policies may be restricted to managed config provenance;
+    malformed or unauthorized overrides fall back to the global policy.
+    """
+    from agent.tool_policy import parse_tool_policy, policy_from_config
+
+    global_policy = policy_from_config(user_config)
+    agent_cfg = user_config.get("agent") or {}
+    raw_global = agent_cfg.get("tool_policy") if isinstance(agent_cfg, dict) else {}
+    authority = (
+        str((raw_global or {}).get("gateway_override_authority", "managed_only") or "managed_only")
+        if isinstance(raw_global, dict) else "any"
+    ).strip().lower()
+    if authority not in {"any", "managed_only"}:
+        logger.error(
+            "Invalid agent.tool_policy.gateway_override_authority=%r; "
+            "ignoring all channel tool-policy overrides",
+            authority,
+        )
+        return global_policy
+    if source.platform != Platform.DISCORD:
+        return global_policy
+
+    platforms = user_config.get("platforms") or {}
+    discord_cfg = platforms.get("discord") if isinstance(platforms, dict) else None
+    if not isinstance(discord_cfg, dict):
+        discord_cfg = user_config.get("discord") or {}
+    overrides = discord_cfg.get("channel_overrides") if isinstance(discord_cfg, dict) else None
+    if not isinstance(overrides, dict):
+        return global_policy
+
+    for key in _channel_override_lookup_keys(
+        str(source.chat_id or ""),
+        thread_id=getattr(source, "thread_id", None),
+        parent_id=getattr(source, "parent_chat_id", None),
+    ):
+        entry = overrides.get(key)
+        if entry is None:
+            entry = overrides.get(int(key)) if key.isdigit() else None
+        if not isinstance(entry, dict) or "tool_policy" not in entry:
+            continue
+        if authority == "managed_only":
+            try:
+                from hermes_cli import managed_scope
+                paths = (
+                    f"platforms.discord.channel_overrides.{key}.tool_policy",
+                    f"platforms.discord.channel_overrides.{key}.tool_policy.mode",
+                    f"discord.channel_overrides.{key}.tool_policy",
+                    f"discord.channel_overrides.{key}.tool_policy.mode",
+                )
+                if not any(managed_scope.is_key_managed(path) for path in paths):
+                    logger.warning(
+                        "Ignoring unmanaged Discord tool_policy override for channel %s",
+                        key,
+                    )
+                    continue
+            except Exception:
+                continue
+        resolved = parse_tool_policy(
+            entry.get("tool_policy"),
+            source=f"platforms.discord.channel_overrides.{key}.tool_policy",
+            fallback=global_policy,
+        )
+        return resolved if resolved.valid else global_policy
+    return global_policy
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -13361,6 +13432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             user_config = _load_gateway_config()
+            tool_policy = _resolve_tool_policy_for_source(user_config, source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
@@ -13413,6 +13485,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    tool_policy=tool_policy,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -15844,6 +15917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        tool_policy=None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -15897,6 +15971,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                getattr(tool_policy, "fingerprint", "legacy"),
             ],
             sort_keys=True,
             default=str,
@@ -17040,6 +17115,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        tool_policy = _resolve_tool_policy_for_source(user_config, source)
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -18163,6 +18239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                tool_policy=tool_policy,
             )
             agent = None
             reused_cached_agent = False
@@ -18297,6 +18374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    tool_policy=tool_policy,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,

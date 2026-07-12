@@ -103,7 +103,7 @@ Toolsets are named bundles of tools. Hermes resolves them through:
 
 ### How `get_tool_definitions()` filters tools
 
-The main entry point is `model_tools.get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode)`:
+The main entry point is `model_tools.get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, tool_policy)`:
 
 1. **If `enabled_toolsets` is provided** — only tools from those toolsets are included. Each toolset name is resolved via `resolve_toolset()` which expands composite toolsets into individual tool names.
 
@@ -111,9 +111,14 @@ The main entry point is `model_tools.get_tool_definitions(enabled_toolsets, disa
 
 3. **If neither** — include all known toolsets.
 
-4. **Registry filtering** — the resolved tool name set is passed to `registry.get_definitions()`, which applies `check_fn` filtering and returns OpenAI-format schemas.
+4. **Exact policy filtering** — an `allowlist` policy replaces positive
+   selection with its individual names; all policy modes are applied again to
+   registry results. This is the authorization boundary, while toolsets remain
+   capability grouping and availability configuration.
 
-5. **Dynamic schema patching** — after filtering, `execute_code` and `browser_navigate` schemas are dynamically adjusted to only reference tools that actually passed filtering (prevents model hallucination of unavailable tools).
+5. **Registry filtering** — the resolved tool name set is passed to `registry.get_definitions()`, which applies `check_fn` filtering and returns OpenAI-format schemas.
+
+6. **Dynamic schema patching** — after filtering, `execute_code` and `browser_navigate` schemas are dynamically adjusted to only reference tools that actually passed filtering (prevents model hallucination of unavailable tools).
 
 ### Legacy toolset names
 
@@ -122,6 +127,11 @@ Old toolset names with `_tools` suffixes (e.g., `web_tools`, `terminal_tools`) a
 ## Dispatch
 
 At runtime, tools are dispatched through the central registry, with agent-loop exceptions for some agent-level tools such as memory/todo/session-search handling.
+
+Agents using a non-legacy exact policy authorize the requested individual name
+before middleware, hooks, argument coercion, or handler dispatch, and require
+the name to be in that agent's current schema snapshot. MCP refresh and
+runtime-injected provider/context tools pass through the same policy.
 
 ### Dispatch flow: model tool_call → handler execution
 

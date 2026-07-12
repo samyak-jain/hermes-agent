@@ -44,6 +44,28 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_cannot_add_mcp_tool_to_exact_allowlist(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"clarify", "delegate_task", "memory", "skills_list", "skill_manage"}
+    agent = _agent(allowed, enabled=["hermes-discord", "mcp-demo"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool(n) for n in sorted(allowed | {"mcp__demo__new_tool"})],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.valid_tool_names == allowed
+    assert "mcp__demo__new_tool" not in agent.valid_tool_names
+
+
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):
     """No new tools → empty set, and the snapshot object is not swapped."""
     agent = _agent(["read_file", "terminal"])
