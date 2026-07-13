@@ -1282,6 +1282,25 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         )
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_named_provider_honors_explicit_api_mode(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "oauth-access-token",
+            "api_mode": "codex_app_server",
+        }
+        creds = _resolve_delegation_credentials(
+            {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            },
+            _make_mock_parent(depth=0),
+        )
+        self.assertEqual(creds["api_mode"], "codex_responses")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_forwards_runtime_request_overrides_and_output_cap(self, mock_resolve):
         mock_resolve.return_value = {
             "provider": "custom",

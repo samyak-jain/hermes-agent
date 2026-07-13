@@ -1,29 +1,13 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
 import { RpcConnection, RpcMethodError } from "./rpc.js";
+import { ensureRuntimeSkillsVisible } from "./skills.js";
 import { ThreadStore } from "./threads.js";
 import { runTurn } from "./turn.js";
 
 if (process.argv.includes("--version")) {
   process.stdout.write("codex-cli 0.130.0\n");
   process.exit(0);
-}
-
-function ensureRuntimeSkillsVisible(): void {
-  const home = process.env.HOME;
-  const runtimeHome = process.env.HERMES_HOME ?? home;
-  if (!home || !runtimeHome) return;
-  const source = join(runtimeHome, "skills");
-  const destination = join(home, ".claude", "skills");
-  if (!existsSync(source)) return;
-  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-  if (existsSync(destination)) {
-    if (lstatSync(destination).isSymbolicLink()) return;
-    return;
-  }
-  symlinkSync(source, destination, "dir");
 }
 
 ensureRuntimeSkillsVisible();
