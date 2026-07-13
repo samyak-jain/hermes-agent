@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -168,8 +169,9 @@ def test_unknown_kid_refresh_has_cooldown(rsa_keypair):
     provider._jwks_client.get_signing_key.assert_called_once()
 
 
-def test_cf_connecting_ip_is_trusted_only_with_provider(rsa_keypair):
+def test_cf_connecting_ip_is_trusted_only_after_verified_assertion(rsa_keypair):
     request = MagicMock()
+    request.state = SimpleNamespace()
     request.headers = {
         "cf-connecting-ip": "10.0.0.1",
         "x-forwarded-for": "203.0.113.9, 192.0.2.1",
@@ -179,7 +181,12 @@ def test_cf_connecting_ip_is_trusted_only_with_provider(rsa_keypair):
     clear_providers()
     assert client_ip(request) == "203.0.113.9"
     try:
-        register_provider(_provider(rsa_keypair))
+        provider = _provider(rsa_keypair)
+        register_provider(provider)
+        # Registration alone is insufficient: failed assertions must use the
+        # ordinary peer/proxy chain so a direct origin request cannot spoof CF.
+        assert client_ip(request) == "203.0.113.9"
+        request.state.session = SimpleNamespace(provider=provider.name)
         assert client_ip(request) == "10.0.0.1"
     finally:
         clear_providers()

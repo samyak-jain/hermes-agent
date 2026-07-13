@@ -101,6 +101,10 @@ def test_assert_protocol_compliance_accepts_full_impl():
     assert assert_protocol_compliance(_CompliantProvider) is None
 
 
+def test_logout_url_defaults_to_local_logout_contract():
+    assert _CompliantProvider.logout_url == ""
+
+
 def test_request_auth_capability_requires_verify_request_override():
     class MissingRequestVerifier(_CompliantProvider):
         supports_request_auth = True

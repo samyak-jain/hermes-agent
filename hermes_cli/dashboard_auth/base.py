@@ -192,6 +192,11 @@ class DashboardAuthProvider(ABC):
     # proxy-specific headers in ordinary cookie-session deployments.
     trusted_client_ip_header: str = ""
 
+    # Optional provider-owned logout target surfaced by ``/api/auth/me``.
+    # Request-auth providers commonly delegate logout to their upstream edge;
+    # interactive providers can leave this empty and use Hermes' local route.
+    logout_url: str = ""
+
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
 

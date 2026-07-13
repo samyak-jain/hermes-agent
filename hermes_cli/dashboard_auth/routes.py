@@ -590,7 +590,7 @@ async def api_auth_me(request: Request):
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
     provider = get_provider(sess.provider)
-    logout_url = str(getattr(provider, "logout_url", "") or "")
+    logout_url = str(provider.logout_url or "") if provider is not None else ""
     return {
         "user_id": sess.user_id,
         "email": sess.email,
