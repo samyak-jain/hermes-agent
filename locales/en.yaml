@@ -52,7 +52,7 @@ gateway:
     capabilities_label:     "Capabilities: {capabilities}"
     prompt_caching_enabled: "Prompt caching: enabled"
     warning_prefix:         "Warning: {warning}"
-    saved_global:           "Saved to config.yaml (`--global`)"
+    saved_global:           "Also set as the global default for all chats — use `/model --session` to switch only this chat."
     session_only_hint:      "_(session only — add `--global` to persist)_"
     current_label:          "Current: `{model}` on {provider}"
     current_tag:            " (current)"

@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Yetenekler: {capabilities}"
     prompt_caching_enabled: "Prompt önbelleği: etkin"
     warning_prefix:         "Uyarı: {warning}"
-    saved_global:           "config.yaml'a kaydedildi (`--global`)"
+    saved_global:           "Ayrıca tüm sohbetler için genel varsayılan olarak ayarlandı — yalnızca bu sohbeti değiştirmek için `/model --session` kullanın."
     session_only_hint:      "_(yalnızca bu oturum — kalıcı yapmak için `--global` ekleyin)_"
     current_label:          "Geçerli: `{model}` ({provider})"
     current_tag:            " (geçerli)"

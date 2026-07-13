@@ -94,6 +94,8 @@ async def test_model_global_persists_when_config_has_flat_string_model(tmp_path,
     # Sanity: the handler returned a success-looking message (not a crash log).
     assert result is not None
     assert "gpt-5.5" in result
+    assert "global default for all chats" in result
+    assert "/model --session" in result
 
     # The persist block must have rewritten config.yaml as a nested dict.
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
@@ -177,6 +179,8 @@ async def test_model_no_flag_is_session_scoped_by_default(tmp_path, monkeypatch)
 
     assert result is not None
     assert "gpt-5.5" in result
+    assert "session only" in result
+    assert "--global" in result
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
 
@@ -196,6 +200,7 @@ async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
 
     assert result is not None
     assert "gpt-5.5" in result
+    assert "global default for all chats" not in result
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     # Config untouched — the session override is in-memory only.
     assert written["model"]["default"] == "old-model"

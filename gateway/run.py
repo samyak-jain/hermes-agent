@@ -13646,10 +13646,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source=source)
+        return self._format_session_info(source=source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -13658,7 +13658,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        model = None
+        global_model = None
         config_context_length = None
         provider = None
         base_url = None
@@ -13671,14 +13672,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if data:
                 model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
-                    raw_ctx = model_cfg.get("context_length")
-                    if raw_ctx is not None:
-                        try:
-                            config_context_length = int(raw_ctx)
-                        except (TypeError, ValueError):
-                            pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
+                    if source is None:
+                        provider = model_cfg.get("provider") or None
+                        base_url = model_cfg.get("base_url") or None
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(data)
@@ -13686,6 +13682,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        # A reset notice is session-scoped, so use the same effective-runtime
+        # resolver as the next agent turn: persisted/session /model override,
+        # then channel override, then the global default.  The no-source path
+        # retains the historical global-only behavior for callers that do not
+        # have session identity available.
+        if source is not None:
+            try:
+                global_model = _resolve_gateway_model(data)
+                model, runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    user_config=data,
+                )
+                provider = runtime.get("provider")
+                base_url = runtime.get("base_url")
+                api_key = runtime.get("api_key")
+            except Exception:
+                logger.debug(
+                    "Failed to resolve session runtime for reset notice",
+                    exc_info=True,
+                )
+                model = global_model or _resolve_gateway_model(data)
+        else:
+            model = _resolve_gateway_model()
+            global_model = model
+
+        # model.context_length describes the global default model.  Reusing it
+        # for a session/channel model override can make the reset banner report
+        # a plausible but incorrect context window (for example 1M instead of
+        # 372K).  Override models continue through custom-provider matching and
+        # the normal provider-aware detection chain below.
+        if model == global_model and data:
+            try:
+                model_cfg = data.get("model", {})
+                if isinstance(model_cfg, dict):
+                    raw_ctx = model_cfg.get("context_length")
+                    if raw_ctx is not None:
+                        config_context_length = int(raw_ctx)
+            except (TypeError, ValueError):
+                pass
 
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:
@@ -13722,14 +13758,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        # Resolve runtime credentials for probing
-        try:
-            runtime = _resolve_runtime_agent_kwargs()
-            provider = provider or runtime.get("provider")
-            base_url = base_url or runtime.get("base_url")
-            api_key = runtime.get("api_key")
-        except Exception:
-            pass
+        # Resolve global runtime credentials for probing when no session was
+        # supplied (or when session resolution failed before yielding any).
+        if source is None or (provider is None and base_url is None and api_key is None):
+            try:
+                runtime = _resolve_runtime_agent_kwargs()
+                provider = provider or runtime.get("provider")
+                base_url = base_url or runtime.get("base_url")
+                api_key = runtime.get("api_key")
+            except Exception:
+                pass
 
         context_length = get_model_context_length(
             model,
