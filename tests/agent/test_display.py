@@ -314,3 +314,28 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
+
+
+def test_claude_host_tool_previews_and_labels_hide_private_payloads():
+    from agent.display import build_tool_label
+
+    assert build_tool_preview(
+        "spawn_agent",
+        {"label": "OAuth status", "prompt": "long private prompt"},
+    ) == "OAuth status"
+    assert build_tool_preview(
+        "spawn_agent",
+        {"prompt": "Inspect OAuth status without changing deployment"},
+    ) == "Inspect OAuth status without changing deployment"
+    assert build_tool_preview(
+        "memory",
+        {"operations": [{"action": "add", "content": "private"}]},
+    ) is None
+    assert build_tool_label(
+        "spawn_agent",
+        {"label": "OAuth status", "prompt": "long private prompt"},
+    ) == "Spawning agent OAuth status"
+    assert build_tool_label(
+        "memory",
+        {"operations": [{"action": "add", "content": "private"}]},
+    ) == "Updating memory"

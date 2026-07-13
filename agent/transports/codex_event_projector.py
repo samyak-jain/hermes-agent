@@ -217,9 +217,10 @@ class CodexEventProjector:
     def _project_mcp_tool_call(self, item: dict, item_id: str) -> ProjectionResult:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
+        projected_name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
         # Mirror the native MCP tool-name convention (mcp__server__tool) so the
         # deterministic call_id input stays consistent with registration names.
-        call_id = _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+        call_id = _deterministic_call_id(projected_name, item_id)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
@@ -231,7 +232,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": f"mcp.{server}.{tool}",
+                        "name": projected_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -244,6 +245,8 @@ class CodexEventProjector:
         error = item.get("error")
         if error:
             content = f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+        elif isinstance(result, str):
+            content = result[:4000]
         elif result is not None:
             content = json.dumps(result, ensure_ascii=False)[:4000]
         else:

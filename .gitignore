@@ -54,6 +54,7 @@ data/*
 # symlink node_modules to the main checkout; the dir-only pattern let one
 # slip into a commit and break `npm ci` on CI with ENOTDIR).
 node_modules
+codex-claude-shim/dist/
 browser-use/
 agent-browser/
 # Private keys

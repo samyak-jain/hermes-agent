@@ -2019,5 +2019,25 @@ class TestConfiguredChildToolPolicy(unittest.TestCase):
         self.assertNotIn("memory", enabled)
 
 
+@patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+def test_named_provider_honors_explicit_api_mode(mock_resolve):
+    mock_resolve.return_value = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "oauth-access-token",
+        "api_mode": "codex_app_server",
+    }
+    creds = _resolve_delegation_credentials(
+        {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+        },
+        _make_mock_parent(depth=0),
+    )
+    assert creds["api_mode"] == "codex_responses"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4619,7 +4619,9 @@ class TurnRunner:
             elif preview:
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
-                msg = f"{emoji} {tool_name}..."
+                from agent.display import get_tool_verb
+                _verb = get_tool_verb(tool_name)
+                msg = f"{emoji} {_verb}" if _verb else f"{emoji} {tool_name}..."
             ctx.progress_queue.put(msg)
             return
 
@@ -4666,7 +4668,9 @@ class TurnRunner:
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             ctx.last_was_terminal_block[0] = False
         else:
-            msg = f"{emoji} {tool_name}..."
+            from agent.display import get_tool_verb
+            _verb = get_tool_verb(tool_name)
+            msg = f"{emoji} {_verb}" if _verb else f"{emoji} {tool_name}..."
             ctx.last_was_terminal_block[0] = False
 
         # Dedup: collapse consecutive identical progress messages.
