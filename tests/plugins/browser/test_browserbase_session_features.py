@@ -75,6 +75,26 @@ def test_existing_context_merges_with_stealth_proxy_location_and_region(
     assert result["features"]["region"] is True
 
 
+def test_context_resolver_uses_already_resolved_explicit_id(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _configure(
+        monkeypatch,
+        tmp_path,
+        BROWSERBASE_CONTEXT_ID="environment-value",
+    )
+    provider = BrowserbaseBrowserProvider()
+    config = provider._get_config()
+
+    assert provider._resolve_context_id(
+        config,
+        {"X-BB-API-Key": "test-key"},
+        persist=True,
+        explicit_id="resolved-once",
+    ) == "resolved-once"
+
+
 def test_persistent_context_is_created_once_and_reused_from_profile_cache(
     monkeypatch, tmp_path
 ) -> None:

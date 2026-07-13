@@ -52,7 +52,8 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-_CONTEXT_CACHE_LOCK = threading.Lock()
+_CONTEXT_CACHE_LOCKS_GUARD = threading.Lock()
+_CONTEXT_CACHE_LOCKS: Dict[str, threading.Lock] = {}
 _CONTEXT_CACHE_FILENAME = "browserbase_contexts.json"
 
 
@@ -143,19 +144,36 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         except OSError as exc:
             logger.warning("Could not persist Browserbase context cache %s: %s", path, exc)
 
+    @staticmethod
+    def _context_cache_lock(project_id: str) -> threading.Lock:
+        """Return a per-project single-flight lock for context creation.
+
+        The cache write is atomic, so separate processes cannot corrupt the
+        JSON file, but this in-process lock cannot prevent two gateway
+        processes from creating one context each before either writes. Shared
+        multi-process deployments should set ``BROWSERBASE_CONTEXT_ID``
+        explicitly to avoid that harmless orphan-context race.
+        """
+        with _CONTEXT_CACHE_LOCKS_GUARD:
+            return _CONTEXT_CACHE_LOCKS.setdefault(project_id, threading.Lock())
+
     def _resolve_context_id(
-        self, config: Dict[str, Any], headers: Dict[str, str], persist: bool
+        self,
+        config: Dict[str, Any],
+        headers: Dict[str, str],
+        persist: bool,
+        explicit_id: str,
     ) -> Optional[str]:
-        explicit_id = os.environ.get("BROWSERBASE_CONTEXT_ID", "").strip()
         if explicit_id:
             return explicit_id
         if not persist:
             return None
 
         project_id = str(config["project_id"])
-        # Context creation is process-global and must remain single-flight when
-        # several delegated browser tasks start at the same time.
-        with _CONTEXT_CACHE_LOCK:
+        # Context creation must remain single-flight per project when several
+        # delegated browser tasks start at the same time. Other projects no
+        # longer wait behind this 30-second network boundary.
+        with self._context_cache_lock(project_id):
             cached_id = self._load_cached_context_id(project_id)
             if cached_id:
                 return cached_id
@@ -260,7 +278,12 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         if enable_advanced_stealth:
             browser_settings["advancedStealth"] = True
         if context_requested:
-            context_id = self._resolve_context_id(config, headers, context_persist)
+            context_id = self._resolve_context_id(
+                config,
+                headers,
+                context_persist,
+                context_id_from_env,
+            )
             if context_id:
                 browser_settings["context"] = {
                     "id": context_id,
