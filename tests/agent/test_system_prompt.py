@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import build_app_server_system_prompt, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -22,6 +22,11 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _parallel_tool_call_guidance=False,
+        context_compressor=None,
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -99,3 +104,42 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class _PromptMemoryStore:
+    def format_for_system_prompt(self, target):
+        return {
+            "memory": "# Long-term memory\nThe user prefers terse answers.",
+            "user": "# User profile\nThe user's name is Samyak.",
+        }[target]
+
+
+def test_app_server_prompt_keeps_persona_context_and_memory_without_product_identity():
+    agent = _make_agent(
+        valid_tool_names={"memory", "session_search", "skill_manage"},
+        _memory_store=_PromptMemoryStore(),
+        pass_session_id=True,
+        session_id="session-123",
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value="# Soul\nBe warm and incisive."),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md says to verify deployments.",
+        ),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        prompt = build_app_server_system_prompt(
+            agent,
+            system_message="Messages can be prefixed with a sender name.",
+        )
+
+    assert "Be warm and incisive" in prompt
+    assert "AGENTS.md says to verify deployments" in prompt
+    assert "The user prefers terse answers" in prompt
+    assert "The user's name is Samyak" in prompt
+    assert "Messages can be prefixed" in prompt
+    assert "Session ID: session-123" in prompt
+    assert "You are Hermes Agent" not in prompt
+    assert "You run on Hermes Agent" not in prompt

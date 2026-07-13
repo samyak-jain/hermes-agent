@@ -116,6 +116,7 @@ WORKDIR /opt/hermes
 # ui-tui/package.json.  Copying the tree up front lets npm resolve the
 # workspace to real content instead of stopping at a bare package.json.
 COPY package.json package-lock.json ./
+COPY codex-claude-shim/package.json codex-claude-shim/
 COPY web/package.json web/
 COPY ui-tui/package.json ui-tui/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
@@ -188,8 +189,10 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
+COPY codex-claude-shim/ codex-claude-shim/
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    cd ../codex-claude-shim && npm run build
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -215,6 +218,8 @@ USER root
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
     chmod 0755 /opt/hermes/bin/hermes && \
+    ln -sf /opt/hermes/codex-claude-shim/dist/index.js /opt/hermes/bin/codex && \
+    chmod 0755 /opt/hermes/codex-claude-shim/dist/index.js && \
     printf 'docker\n' > /opt/hermes/.install_method
 # The ``.install_method`` stamp is baked next to the running code (the install
 # tree), NOT into $HERMES_HOME. $HERMES_HOME (/opt/data) is a shared data

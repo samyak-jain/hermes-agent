@@ -25,6 +25,45 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _codex_app_server_config() -> dict[str, Any]:
+    """Return the validated ``model.codex_app_server`` mapping."""
+    try:
+        from hermes_cli.config import load_config
+
+        model_cfg = (load_config().get("model") or {})
+        if not isinstance(model_cfg, dict):
+            return {}
+        app_cfg = model_cfg.get("codex_app_server") or {}
+        return dict(app_cfg) if isinstance(app_cfg, dict) else {}
+    except Exception:
+        logger.debug("failed to load codex app-server config", exc_info=True)
+        return {}
+
+
+def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
+    """Convert the agent's policy-filtered OpenAI tools to bridge schemas."""
+    allowed = set(getattr(agent, "valid_tool_names", set()) or set())
+    schemas: list[dict[str, Any]] = []
+    for raw_tool in getattr(agent, "tools", None) or []:
+        if not isinstance(raw_tool, dict):
+            continue
+        function = raw_tool.get("function") or raw_tool
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "")
+        if not name or name not in allowed:
+            continue
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        schemas.append(
+            {
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": parameters,
+            }
+        )
+    return schemas
+
+
 def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
     """Map a Codex app-server ``item/started`` notification to a Hermes
     tool-progress event ``(tool_name, preview, args)``.
@@ -68,7 +107,8 @@ def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
-        return f"mcp.{server}.{tool}", tool, args
+        progress_name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
+        return progress_name, tool, args
 
     if item_type == "dynamicToolCall":
         tool = item.get("tool") or "unknown"
@@ -322,6 +362,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    system_message: str | None = None,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -341,8 +382,12 @@ def run_codex_app_server_turn(
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         from agent.runtime_cwd import resolve_agent_cwd
+        from agent.system_prompt import build_app_server_system_prompt
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        app_cfg = _codex_app_server_config()
+        adapter = str(app_cfg.get("adapter") or "").strip().lower()
+        use_host_bridge = adapter == "claude_agent_sdk"
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -389,8 +434,41 @@ def run_codex_app_server_turn(
             except Exception:
                 logger.debug("codex tool-progress callback raised", exc_info=True)
 
+        def _invoke_host_tool(
+            name: str,
+            arguments: dict[str, Any],
+            tool_call_id: str,
+        ) -> Any:
+            if name not in (getattr(agent, "valid_tool_names", set()) or set()):
+                raise PermissionError(f"Tool is not enabled for this session: {name}")
+            context = getattr(agent, "_codex_host_tool_context", {}) or {}
+            return agent._invoke_tool(
+                name,
+                arguments,
+                context.get("effective_task_id") or "",
+                tool_call_id=tool_call_id or None,
+                messages=context.get("messages"),
+            )
+
+        system_prompt_append = (
+            build_app_server_system_prompt(agent, system_message=system_message)
+            if use_host_bridge
+            else None
+        )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_bin=str(app_cfg.get("binary") or "codex"),
+            model=(str(app_cfg.get("model") or agent.model) if use_host_bridge else None),
+            permission_mode=(
+                str(app_cfg.get("permission_mode") or "bypassPermissions")
+                if use_host_bridge
+                else None
+            ),
+            host_session_id=(agent.session_id if use_host_bridge else None),
+            system_prompt_append=system_prompt_append,
+            tool_schemas=(_app_server_tool_schemas(agent) if use_host_bridge else None),
+            tool_callback=(_invoke_host_tool if use_host_bridge else None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -399,12 +477,31 @@ def run_codex_app_server_turn(
             on_event=_on_codex_event,
         )
 
+    agent._codex_host_tool_context = {
+        "effective_task_id": effective_task_id,
+        "messages": messages,
+    }
+    app_cfg = _codex_app_server_config()
+    try:
+        quiet_timeout = max(
+            1.0,
+            float(app_cfg.get("post_tool_quiet_timeout") or 300.0),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid model.codex_app_server.post_tool_quiet_timeout; using 300 seconds"
+        )
+        quiet_timeout = 300.0
+
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            post_tool_quiet_timeout=quiet_timeout,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

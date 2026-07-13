@@ -212,6 +212,22 @@ class TestMcpToolCallProjection:
         assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp.obsidian.search_notes"
         assert "found" in msgs[1]["content"]
 
+    def test_host_runtime_tool_keeps_original_name_and_text_result(self) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "m-host",
+            "server": "agent-runtime",
+            "tool": "spawn_agent",
+            "status": "completed",
+            "arguments": {"prompt": "research this"},
+            "result": "Spawned child agent child-1",
+        }
+        msgs = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+        assert msgs[0]["tool_calls"][0]["function"]["name"] == "spawn_agent"
+        assert msgs[1]["content"] == "Spawned child agent child-1"
+
     def test_mcp_error_surfaced(self) -> None:
         item = {
             "type": "mcpToolCall", "id": "m2",

@@ -334,11 +334,9 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
-    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
-    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
-    # instead of Hermes' tool dispatch. Gated behind config key
-    # `model.openai_runtime == "codex_app_server"` AND provider in
-    # {"openai", "openai-codex"}. Default is unchanged.
+    # Optional opt-in: hand the entire turn to a `codex app-server` compatible
+    # subprocess. ``model.agent_runtime`` is provider-neutral; the historical
+    # ``model.openai_runtime`` spelling remains OpenAI-only for compatibility.
     "codex_app_server",
 }
 
@@ -369,18 +367,19 @@ def _maybe_apply_codex_app_server_runtime(
     api_mode: str,
     model_cfg: Optional[Dict[str, Any]],
 ) -> str:
-    """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
-    providers when the user has explicitly enabled that runtime via
-    `model.openai_runtime: codex_app_server` in config.yaml.
+    """Optionally rewrite ``api_mode`` to ``codex_app_server``.
 
-    Default behavior is preserved: when the key is unset, "auto", or empty,
-    this function is a no-op. Only providers in {"openai", "openai-codex"}
-    are eligible — other providers (anthropic, openrouter, etc.) cannot be
-    rerouted through codex.
+    ``model.agent_runtime`` is the provider-neutral switch used by compatible
+    app-server implementations.  ``model.openai_runtime`` remains supported,
+    but only for OpenAI providers, so existing configurations retain their
+    previous behavior.
 
     Returns the (possibly-rewritten) api_mode."""
     if not model_cfg:
         return api_mode
+    runtime = str(model_cfg.get("agent_runtime") or "").strip().lower()
+    if runtime == "codex_app_server":
+        return "codex_app_server"
     if provider not in {"openai", "openai-codex"}:
         return api_mode
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()

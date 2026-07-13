@@ -5,6 +5,7 @@
   "private": true,
   "workspaces": [
     "apps/*",
+    "codex-claude-shim",
     "ui-tui",
     "ui-tui/packages/*",
     "web"

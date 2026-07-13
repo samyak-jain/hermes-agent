@@ -24,6 +24,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -205,6 +206,12 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        host_session_id: Optional[str] = None,
+        system_prompt_append: Optional[str] = None,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+        tool_callback: Optional[Callable[[str, dict[str, Any], str], Any]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -219,6 +226,12 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        self._model = model
+        self._permission_mode = permission_mode
+        self._host_session_id = host_session_id
+        self._system_prompt_append = system_prompt_append or ""
+        self._tool_schemas = list(tool_schemas or [])
+        self._tool_callback = tool_callback
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -248,8 +261,8 @@ class CodexAppServerSession:
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
         self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
+            client_name="host-agent",
+            client_title="Agent Runtime",
             client_version=_get_hermes_version(),
         )
         # Permission selection is intentionally NOT sent on thread/start.
@@ -267,7 +280,17 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
+        params: dict[str, Any] = {
+            "cwd": self._cwd,
+            "model": self._model,
+            "permissionMode": self._permission_mode,
+            "hostSessionId": self._host_session_id,
+            "systemPromptAppend": self._system_prompt_append,
+            "tools": self._tool_schemas,
+        }
+        params = {
+            key: value for key, value in params.items() if value not in (None, "", [])
+        }
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -818,7 +841,33 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "item/commandExecution/requestApproval":
+        if method == "agent/tool/call":
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments") or {}
+            tool_call_id = str(params.get("toolCallId") or "")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if self._tool_callback is None:
+                self._client.respond(
+                    rid,
+                    {"content": "Host tool bridge is unavailable", "isError": True},
+                )
+                return
+            try:
+                output = self._tool_callback(name, arguments, tool_call_id)
+                if not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False, default=str)
+                self._client.respond(
+                    rid,
+                    {"content": output, "isError": False},
+                )
+            except Exception as exc:
+                logger.exception("app-server host tool %s failed", name)
+                self._client.respond(
+                    rid,
+                    {"content": f"Tool {name} failed: {exc}", "isError": True},
+                )
+        elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
         elif method == "item/fileChange/requestApproval":
