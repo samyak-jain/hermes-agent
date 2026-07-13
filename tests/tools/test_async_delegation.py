@@ -229,6 +229,59 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_delegation_by_id_is_owner_and_type_scoped():
+    gate = threading.Event()
+    interrupted = {"count": 0}
+
+    def blocker():
+        gate.wait(timeout=5)
+        return {"status": "interrupted", "summary": None, "error": "cancelled"}
+
+    def interrupt_fn():
+        interrupted["count"] += 1
+        gate.set()
+
+    result = ad.dispatch_async_delegation(
+        goal="long spawn",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner-route",
+        parent_session_id="owner-session",
+        runner=blocker,
+        interrupt_fn=interrupt_fn,
+        max_async_children=3,
+        delegation_id="sa_12ab34",
+        completion_type="spawn_result",
+    )
+    assert result["status"] == "dispatched"
+
+    assert ad.interrupt_delegation("sa_12ab34") is False
+    assert ad.interrupt_delegation("sa_12ab34", session_key="other-route") is False
+    assert ad.interrupt_delegation(
+        "sa_12ab34",
+        session_key="owner-route",
+        completion_type="async_delegation",
+    ) is False
+    assert interrupted["count"] == 0
+
+    assert ad.interrupt_delegation(
+        "sa_12ab34",
+        parent_session_id="owner-session",
+        completion_type="spawn_result",
+    ) is True
+    assert interrupted["count"] == 1
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["delegation_id"] == "sa_12ab34"
+    assert evt["status"] == "interrupted"
+    assert ad.interrupt_delegation(
+        "sa_12ab34", session_key="owner-route"
+    ) is False
+
+
 def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
     for i in range(ad._MAX_RETAINED_COMPLETED + 10):
@@ -829,6 +882,22 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_gateway_formatter_renders_compact_spawn_result():
+    from gateway.run import _format_gateway_process_notification
+
+    txt = _format_gateway_process_notification(
+        _make_async_evt(
+            type="spawn_result",
+            delegation_id="sa_123abc",
+            label="inspect auth",
+        )
+    )
+    assert txt == (
+        '[Subagent sa_123abc ("inspect auth") finished — 12s]\n'
+        "Found the bug in test_foo"
+    )
+
+
 def test_gateway_watch_drain_requeues_async_without_looping():
     from gateway.run import _drain_gateway_watch_events
 
@@ -851,6 +920,17 @@ def test_gateway_watch_drain_requeues_async_without_looping():
     assert q.get_nowait() == async_evt
 
 
+def test_gateway_watch_drain_requeues_spawn_result():
+    from gateway.run import _drain_gateway_watch_events
+
+    q = queue.Queue()
+    spawn_evt = _make_async_evt(type="spawn_result", delegation_id="sa_123abc")
+    q.put(spawn_evt)
+
+    assert _drain_gateway_watch_events(q) == []
+    assert q.get_nowait() == spawn_evt
+
+
 def test_gateway_builds_routable_source_from_enriched_event():
     from gateway.run import GatewayRunner
 
@@ -871,5 +951,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

@@ -9377,7 +9377,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
 
 def _notification_event_requires_owner(evt: dict) -> bool:
     """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(
+    return evt.get("type") in {"async_delegation", "spawn_result"} or bool(
         str(evt.get("origin_ui_session_id") or "")
         or str(evt.get("session_key") or "")
     )
@@ -9412,7 +9412,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("message", ""),
             evt.get("suppressed", 0),
         )
-    if evt_type == "async_delegation":
+    if evt_type in {"async_delegation", "spawn_result"}:
         # Async-delegation completions have no process session_id; without
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
@@ -9461,7 +9461,7 @@ def _notification_poller_loop(
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
             log = (
                 logger.warning
-                if evt.get("type") == "async_delegation"
+                if evt.get("type") in {"async_delegation", "spawn_result"}
                 else logger.debug
             )
             log(
@@ -9544,7 +9544,7 @@ def _notification_poller_loop(
         # for a later resume; ordinary addressed orphans are dropped.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            if evt.get("type") == "async_delegation":
+            if evt.get("type") in {"async_delegation", "spawn_result"}:
                 deferred.append(evt)
             else:
                 logger.debug(

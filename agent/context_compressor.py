@@ -802,6 +802,17 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             goal = goal[:57] + "..."
         return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
 
+    if tool_name == "spawn_agent":
+        cancel_id = args.get("cancel_id")
+        label = (
+            f"cancel {cancel_id}"
+            if cancel_id
+            else args.get("label") or args.get("prompt", "")
+        )
+        if len(label) > 60:
+            label = label[:57] + "..."
+        return f"[spawn_agent] '{label}' ({content_len:,} chars result)"
+
     if tool_name == "execute_code":
         code_str = _str_arg(args, "code")
         code_preview = code_str[:60].replace("\n", " ")

@@ -44,6 +44,10 @@ class TestSessionOwnsNotificationEvent:
         evt = {"type": "async_delegation", "origin_ui_session_id": "", "session_key": "sess_key_1"}
         assert _session_owns_notification_event("tabX", self._session("sess_key_1"), evt) is True
 
+    def test_spawn_result_uses_same_positive_ownership(self):
+        evt = {"type": "spawn_result", "origin_ui_session_id": "", "session_key": "sess_key_1"}
+        assert _session_owns_notification_event("tabX", self._session("sess_key_1"), evt) is True
+
     def test_orphan_is_not_owned(self):
         """No origin match, no key match, owner gone → NOT ours (fail closed)."""
         evt = {"type": "async_delegation", "origin_ui_session_id": "dead_tab", "session_key": "gone_key"}
