@@ -3,13 +3,18 @@
 import pytest
 from unittest.mock import patch
 
+from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 
 
 @pytest.fixture()
 def runner():
     """Create a bare GatewayRunner without __init__."""
-    return GatewayRunner.__new__(GatewayRunner)
+    instance = GatewayRunner.__new__(GatewayRunner)
+    instance.config = GatewayConfig()
+    instance._session_model_overrides = {}
+    return instance
 
 
 def _patch_info(tmp_path, config_yaml, model, runtime):
@@ -113,7 +118,7 @@ class TestResetNoticeSessionInfo:
     """#59003: the auto-reset banner must report the serving profile's config,
     not the multiplexer's base config."""
 
-    _RUNTIME = {"provider": "", "base_url": "", "api_key": ""}
+    _RUNTIME = {"provider": "anthropic", "base_url": "", "api_key": ""}
 
     def _source(self):
         from gateway.config import Platform
@@ -155,3 +160,145 @@ class TestResetNoticeSessionInfo:
             info = runner._reset_notice_session_info(self._source())
         assert "base-model" in info
         assert "profile-model" not in info
+
+
+class TestResetNoticeEffectiveSessionModel:
+    """Reset banners use the same model priority as the following agent turn."""
+
+    _GLOBAL_RUNTIME = {
+        "provider": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "api_key": "global-key",
+        "api_mode": "anthropic_messages",
+    }
+    _CHANNEL_RUNTIME = {
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "channel-key",
+        "api_mode": "chat_completions",
+    }
+
+    @staticmethod
+    def _source():
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="channel",
+            user_id="user-1",
+        )
+
+    @staticmethod
+    def _write_config(tmp_path):
+        tmp_path.joinpath("config.yaml").write_text(
+            "model:\n"
+            "  default: global/model\n"
+            "  provider: anthropic\n"
+            "  context_length: 1000000\n",
+            encoding="utf-8",
+        )
+
+    def test_channel_override_model_and_context(self, runner, tmp_path):
+        self._write_config(tmp_path)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "channel-1": ChannelOverride(
+                            model="channel/model",
+                            provider="openrouter",
+                        ),
+                    },
+                ),
+            },
+        )
+
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs",
+                 return_value=self._GLOBAL_RUNTIME,
+             ), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value=self._CHANNEL_RUNTIME,
+             ), \
+             patch(
+                 "agent.model_metadata.get_model_context_length",
+                 return_value=372_000,
+             ) as get_context:
+            info = runner._reset_notice_session_info(self._source())
+
+        assert "channel/model" in info
+        assert "openrouter" in info
+        assert "global/model" not in info
+        assert "372K" in info
+        assert "1.0M" not in info
+        assert get_context.call_args.kwargs["config_context_length"] is None
+
+    def test_global_default_without_override(self, runner, tmp_path):
+        self._write_config(tmp_path)
+        runner.config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+        )
+
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs",
+                 return_value=self._GLOBAL_RUNTIME,
+             ):
+            info = runner._reset_notice_session_info(self._source())
+
+        assert "global/model" in info
+        assert "anthropic" in info
+        assert "1.0M" in info
+
+    def test_persisted_session_override_beats_channel(self, runner, tmp_path):
+        self._write_config(tmp_path)
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "channel-1": ChannelOverride(
+                            model="channel/model",
+                            provider="openrouter",
+                        ),
+                    },
+                ),
+            },
+        )
+
+        class _PersistedOverrideStore:
+            @staticmethod
+            def _generate_session_key(_source):
+                return "session-key"
+
+            @staticmethod
+            def get_model_override(session_key):
+                assert session_key == "session-key"
+                return {
+                    "model": "session/model",
+                    "provider": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                }
+
+        runner.session_store = _PersistedOverrideStore()
+        persisted_runtime = {
+            **self._GLOBAL_RUNTIME,
+            "api_key": "persisted-session-key",
+        }
+
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value=persisted_runtime,
+             ), \
+             patch(
+                 "agent.model_metadata.get_model_context_length",
+                 return_value=200_000,
+             ):
+            info = runner._reset_notice_session_info(self._source())
+
+        assert "session/model" in info
+        assert "channel/model" not in info
+        assert "global/model" not in info

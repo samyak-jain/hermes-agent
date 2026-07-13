@@ -187,6 +187,8 @@ async def test_picker_tap_persists_by_default(tmp_path, monkeypatch, seed_model)
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
+    assert "global default for all chats" in confirmation
+    assert "/model --session" in confirmation
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert isinstance(written["model"], dict), (
         "model: should be coerced to a dict, got %r" % (written["model"],)
@@ -213,6 +215,7 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
+    assert "global default for all chats" not in confirmation
     # The session override IS applied in-memory (proves the path didn't no-op).
     assert runner._session_model_overrides, "session override should be set"
     assert any(

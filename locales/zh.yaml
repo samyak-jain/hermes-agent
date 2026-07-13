@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "能力：{capabilities}"
     prompt_caching_enabled: "提示词缓存：已启用"
     warning_prefix:         "警告：{warning}"
-    saved_global:           "已保存到 config.yaml（`--global`）"
+    saved_global:           "同时设为所有聊天的全局默认模型 — 如只切换当前聊天，请使用 `/model --session`。"
     session_only_hint:      "_（仅本次会话有效 — 添加 `--global` 可永久保存）_"
     current_label:          "当前：`{model}`（{provider}）"
     current_tag:            "（当前）"

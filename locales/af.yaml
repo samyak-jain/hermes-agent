@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Vermoëns: {capabilities}"
     prompt_caching_enabled: "Prompt-kasing: geaktiveer"
     warning_prefix:         "Waarskuwing: {warning}"
-    saved_global:           "Gestoor in config.yaml (`--global`)"
+    saved_global:           "Ook as die globale verstek vir alle kletse gestel — gebruik `/model --session` om net hierdie klets te verander."
     session_only_hint:      "_(slegs sessie — voeg `--global` by om permanent te stoor)_"
     current_label:          "Huidig: `{model}` op {provider}"
     current_tag:            " (huidig)"

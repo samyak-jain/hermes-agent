@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Capacidades: {capabilities}"
     prompt_caching_enabled: "Cache de prompts: ativado"
     warning_prefix:         "Aviso: {warning}"
-    saved_global:           "Guardado em config.yaml (`--global`)"
+    saved_global:           "Também definido como padrão global para todas as conversas — usa `/model --session` para alterar apenas esta conversa."
     session_only_hint:      "_(apenas para esta sessão — adiciona `--global` para tornar permanente)_"
     current_label:          "Atual: `{model}` em {provider}"
     current_tag:            " (atual)"

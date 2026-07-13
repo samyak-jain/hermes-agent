@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Fähigkeiten: {capabilities}"
     prompt_caching_enabled: "Prompt-Caching: aktiviert"
     warning_prefix:         "Warnung: {warning}"
-    saved_global:           "In config.yaml gespeichert (`--global`)"
+    saved_global:           "Auch als globaler Standard für alle Chats festgelegt — mit `/model --session` wird nur dieser Chat umgestellt."
     session_only_hint:      "_(nur für diese Sitzung — `--global` ergänzen, um zu speichern)_"
     current_label:          "Aktuell: `{model}` bei {provider}"
     current_tag:            " (aktuell)"
