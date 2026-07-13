@@ -87,6 +87,17 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
         assert got == "codex_app_server"
 
+    def test_configured_main_runtime_does_not_capture_side_provider(self) -> None:
+        got = _maybe_apply_codex_app_server_runtime(
+            provider="openai-codex",
+            api_mode="codex_responses",
+            model_cfg={
+                "provider": "anthropic",
+                "agent_runtime": "codex_app_server",
+            },
+        )
+        assert got == "codex_responses"
+
     def test_case_insensitive(self) -> None:
         got = _maybe_apply_codex_app_server_runtime(
             provider="openai",
