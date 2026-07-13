@@ -340,11 +340,9 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
-    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
-    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
-    # instead of Hermes' tool dispatch. Gated behind config key
-    # `model.openai_runtime == "codex_app_server"` AND provider in
-    # {"openai", "openai-codex"}. Default is unchanged.
+    # Optional opt-in: hand the entire turn to a `codex app-server` compatible
+    # subprocess. ``model.agent_runtime`` is provider-neutral; the historical
+    # ``model.openai_runtime`` spelling remains OpenAI-only for compatibility.
     "codex_app_server",
 }
 
@@ -375,18 +373,28 @@ def _maybe_apply_codex_app_server_runtime(
     api_mode: str,
     model_cfg: Optional[Dict[str, Any]],
 ) -> str:
-    """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
-    providers when the user has explicitly enabled that runtime via
-    `model.openai_runtime: codex_app_server` in config.yaml.
+    """Optionally rewrite ``api_mode`` to ``codex_app_server``.
 
-    Default behavior is preserved: when the key is unset, "auto", or empty,
-    this function is a no-op. Only providers in {"openai", "openai-codex"}
-    are eligible — other providers (anthropic, openrouter, etc.) cannot be
-    rerouted through codex.
+    ``model.agent_runtime`` is the provider-neutral switch used by compatible
+    app-server implementations.  ``model.openai_runtime`` remains supported,
+    but only for OpenAI providers, so existing configurations retain their
+    previous behavior.
 
     Returns the (possibly-rewritten) api_mode."""
     if not model_cfg:
         return api_mode
+    runtime = str(model_cfg.get("agent_runtime") or "").strip().lower()
+    if runtime == "codex_app_server":
+        configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        # ``agent_runtime`` belongs to the configured main model. Explicit
+        # side-task providers (delegation, compression, background review,
+        # etc.) resolve through this same function and must retain their own
+        # native transport. An absent/auto provider keeps the historical
+        # provider-neutral behavior because the selected main provider is not
+        # known until credential resolution completes.
+        if configured_provider not in {"", "auto"} and provider != configured_provider:
+            return api_mode
+        return "codex_app_server"
     if provider not in {"openai", "openai-codex"}:
         return api_mode
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
@@ -1512,7 +1520,7 @@ def _resolve_explicit_runtime(
     return None
 
 
-def resolve_runtime_provider(
+def _resolve_runtime_provider_unadjusted(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
@@ -2088,6 +2096,36 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     runtime["requested_provider"] = requested_provider
+    return runtime
+
+
+def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve credentials, then apply the configured main agent runtime.
+
+    Credential resolution has several provider-specific early returns. Keeping
+    the runtime rewrite at this public boundary ensures ``model.agent_runtime``
+    applies equally to pool-backed and singleton/env-backed providers while
+    :func:`_maybe_apply_codex_app_server_runtime` prevents a configured main
+    provider from hijacking explicitly routed side tasks.
+    """
+    runtime = _resolve_runtime_provider_unadjusted(
+        requested=requested,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+    )
+    runtime = dict(runtime)
+    runtime["api_mode"] = _maybe_apply_codex_app_server_runtime(
+        provider=str(runtime.get("provider") or ""),
+        api_mode=str(runtime.get("api_mode") or "chat_completions"),
+        model_cfg=_get_model_config(),
+    )
     return runtime
 
 

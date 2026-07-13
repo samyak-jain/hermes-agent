@@ -186,6 +186,30 @@ class TestBuildToolPreview:
         result = build_tool_preview("delegate_task", {"goal": "Review gateway status"})
         assert result == "Review gateway status"
 
+    def test_spawn_agent_prefers_short_label_over_prompt(self):
+        result = build_tool_preview(
+            "spawn_agent",
+            {
+                "label": "OAuth status",
+                "prompt": "Inspect every OAuth credential and report all details",
+            },
+        )
+        assert result == "OAuth status"
+
+    def test_spawn_agent_falls_back_to_prompt(self):
+        result = build_tool_preview(
+            "spawn_agent",
+            {"prompt": "Inspect OAuth status without changing deployment"},
+        )
+        assert result == "Inspect OAuth status without changing deployment"
+
+    def test_memory_batch_has_no_content_preview(self):
+        result = build_tool_preview(
+            "memory",
+            {"operations": [{"action": "add", "target": "user", "content": "private"}]},
+        )
+        assert result is None
+
     def test_delegate_task_batch_goal_preview(self):
         result = build_tool_preview(
             "delegate_task",
@@ -465,6 +489,22 @@ class TestBuildToolLabel:
         # image_generate with empty args still yields the verb (no preview)
         label = build_tool_label("image_generate", {})
         assert label == "Generating image"
+
+    def test_spawn_agent_uses_friendly_label(self):
+        from agent.display import build_tool_label
+        label = build_tool_label(
+            "spawn_agent",
+            {"label": "OAuth status", "prompt": "long private prompt"},
+        )
+        assert label == "Spawning agent OAuth status"
+
+    def test_memory_batch_uses_verb_without_echoing_contents(self):
+        from agent.display import build_tool_label
+        label = build_tool_label(
+            "memory",
+            {"operations": [{"action": "add", "content": "private"}]},
+        )
+        assert label == "Updating memory"
 
     def test_unknown_tool_falls_back_to_preview(self):
         from agent.display import build_tool_label, build_tool_preview
