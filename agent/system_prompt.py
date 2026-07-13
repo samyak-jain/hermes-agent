@@ -501,6 +501,132 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
+def build_app_server_system_prompt(
+    agent: Any,
+    system_message: Optional[str] = None,
+) -> str:
+    """Build the host-owned prompt appended to an app-server preset.
+
+    App-server backends own their base agent prompt and tool loop.  Sending the
+    normal prompt wholesale would duplicate tool/runtime instructions and would
+    incorrectly replace the backend's identity.  This builder preserves the
+    user-owned behavior layers (SOUL, project instructions, memories, platform
+    context, and self-improvement guidance) while deliberately omitting the
+    product identity and provider/model-specific runtime guidance.
+
+    The result is built once when the app-server session starts and remains
+    byte-stable for the lifetime of that session.
+    """
+    _r = _ra()
+    _ctx_len: Optional[int] = None
+    _cc = getattr(agent, "context_compressor", None)
+    if _cc is not None:
+        _candidate = getattr(_cc, "context_length", None)
+        if isinstance(_candidate, int) and _candidate > 0:
+            _ctx_len = _candidate
+
+    parts: List[str] = []
+    _soul_loaded = False
+    if agent.load_soul_identity or not agent.skip_context_files:
+        soul = _r.load_soul_md(_ctx_len)
+        if soul:
+            parts.append(soul)
+            _soul_loaded = True
+
+    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+        parts.append(TASK_COMPLETION_GUIDANCE)
+    if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
+        parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    tool_guidance: List[str] = []
+    if "memory" in agent.valid_tool_names:
+        tool_guidance.append(MEMORY_GUIDANCE)
+    if "session_search" in agent.valid_tool_names:
+        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+    if "skill_manage" in agent.valid_tool_names:
+        tool_guidance.append(SKILLS_GUIDANCE)
+    kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
+    if kanban_guidance:
+        tool_guidance.append(kanban_guidance)
+    elif kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+        tool_guidance.append(KANBAN_GUIDANCE)
+    if tool_guidance:
+        parts.append(" ".join(tool_guidance))
+
+    if "computer_use" in agent.valid_tool_names:
+        from agent.prompt_builder import computer_use_guidance
+
+        parts.append(computer_use_guidance())
+
+    environment_hints = _r.build_environment_hints()
+    if environment_hints:
+        parts.append(environment_hints)
+    if agent.valid_tool_names:
+        try:
+            from agent.coding_context import coding_system_blocks
+
+            parts.extend(
+                coding_system_blocks(
+                    platform=agent.platform,
+                    cwd=resolve_context_cwd(),
+                    model=agent.model,
+                )
+            )
+        except Exception:
+            pass
+
+    platform_key = (agent.platform or "").lower().strip()
+    default_hint = PLATFORM_HINTS.get(platform_key, "")
+    if not default_hint and platform_key:
+        try:
+            from gateway.platform_registry import platform_registry
+
+            entry = platform_registry.get(platform_key)
+            if entry and entry.platform_hint:
+                default_hint = entry.platform_hint
+        except Exception:
+            pass
+    platform_hint = _resolve_platform_hint(agent, platform_key, default_hint)
+    if platform_key == "tui" and platform_hint:
+        platform_hint = _tui_embedded_pane_clarifier(platform_hint)
+    if platform_hint:
+        parts.append(platform_hint)
+
+    if system_message:
+        parts.append(system_message)
+    if not agent.skip_context_files:
+        context_files = _r.build_context_files_prompt(
+            cwd=resolve_context_cwd(),
+            skip_soul=_soul_loaded,
+            context_length=_ctx_len,
+        )
+        if context_files:
+            parts.append(context_files)
+
+    if agent._memory_store:
+        if agent._memory_enabled:
+            memory = agent._memory_store.format_for_system_prompt("memory")
+            if memory:
+                parts.append(memory)
+        if agent._user_profile_enabled:
+            user_profile = agent._memory_store.format_for_system_prompt("user")
+            if user_profile:
+                parts.append(user_profile)
+    if agent._memory_manager:
+        try:
+            external_memory = agent._memory_manager.build_system_prompt()
+            if external_memory:
+                parts.append(external_memory)
+        except Exception:
+            pass
+    if agent.pass_session_id and agent.session_id:
+        parts.append(f"Session ID: {agent.session_id}")
+
+    for warning in drain_truncation_warnings():
+        agent._emit_status(warning)
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
