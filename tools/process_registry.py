@@ -1210,10 +1210,10 @@ class ProcessRegistry:
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
             # legacy single-session delivery.
-            is_async_delegation = evt.get("type") == "async_delegation"
+            is_agent_result = evt.get("type") in {"async_delegation", "spawn_result"}
             evt_session_key = str(evt.get("session_key") or "")
             evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
-            requires_positive_proof = is_async_delegation or bool(
+            requires_positive_proof = is_agent_result or bool(
                 evt_session_key or evt_origin_sid
             )
             if owns_event is not None and requires_positive_proof:
@@ -1228,7 +1228,7 @@ class ProcessRegistry:
                 if evt_session_key != session_key:
                     requeue.append(evt)
                     continue
-            elif is_async_delegation and evt.get("restored"):
+            elif is_agent_result and evt.get("restored"):
                 # Durable restore can enqueue previous-process payloads into a
                 # fresh registry. An unfiltered legacy drain cannot prove
                 # ownership, so leave those events queued for the owner.
@@ -1242,7 +1242,6 @@ class ProcessRegistry:
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
                 continue
-
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
@@ -2170,6 +2169,46 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_spawn_result(evt: dict) -> str:
+    """Format the intentionally compact spawn_agent completion message."""
+    spawn_id = evt.get("delegation_id") or "unknown"
+    label = str(evt.get("label") or "").strip()
+    if not label:
+        goal = evt.get("goal") or "background task"
+        label = next(
+            (line.strip() for line in str(goal).splitlines() if line.strip()),
+            "background task",
+        )
+    label = " ".join(label.split()).replace('"', "'")
+    if len(label) > 80:
+        label = label[:77] + "..."
+
+    status = (evt.get("status") or "completed").lower()
+    succeeded = status in {"completed", "success"}
+    cancelled = status in {"cancelled", "canceled", "interrupted"}
+    if succeeded:
+        outcome = "finished"
+    elif cancelled:
+        outcome = "cancelled"
+    else:
+        outcome = "FAILED"
+    duration = _format_age(evt.get("duration_seconds") or 0)
+    lines = [f'[Subagent {spawn_id} ("{label}") {outcome} — {duration}]']
+
+    summary = evt.get("summary")
+    error = evt.get("error")
+    if succeeded:
+        if summary:
+            lines.append(str(summary))
+    elif not cancelled:
+        if error:
+            lines.append(str(error))
+        if summary:
+            lines.append("Partial output:")
+            lines.append(str(summary))
+    return "\n".join(lines)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2200,6 +2239,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if evt_type == "spawn_result":
+        return _format_spawn_result(evt)
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
