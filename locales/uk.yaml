@@ -37,7 +37,7 @@ gateway:
     capabilities_label:     "Можливості: {capabilities}"
     prompt_caching_enabled: "Кешування промптів: увімкнено"
     warning_prefix:         "Попередження: {warning}"
-    saved_global:           "Збережено в config.yaml (`--global`)"
+    saved_global:           "Також установлено як глобальну модель за замовчуванням для всіх чатів — використовуйте `/model --session`, щоб перемкнути лише цей чат."
     session_only_hint:      "_(лише для цього сеансу — додайте `--global`, щоб зберегти)_"
     current_label:          "Поточна: `{model}` на {provider}"
     current_tag:            " (поточна)"

@@ -2891,7 +2891,10 @@ class _GatewayModelContext:
     context_source: str
 
 
-def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
+def _resolve_gateway_model_context(
+    model: Optional[str] = None,
+    runtime_override: Optional[Dict[str, Any]] = None,
+) -> _GatewayModelContext:
     """Resolve the configured gateway route and its effective context window.
 
     This is the shared non-resident authority for status/session banners and
@@ -2935,13 +2938,18 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     except Exception:
         pass
 
-    try:
-        runtime = _resolve_runtime_agent_kwargs()
-        provider = runtime.get("provider") or provider
-        base_url = runtime.get("base_url") or base_url
-        api_key = runtime.get("api_key")
-    except Exception:
-        pass
+    if runtime_override is not None:
+        provider = runtime_override.get("provider") or provider
+        base_url = runtime_override.get("base_url") or base_url
+        api_key = runtime_override.get("api_key")
+    else:
+        try:
+            runtime = _resolve_runtime_agent_kwargs()
+            provider = runtime.get("provider") or provider
+            base_url = runtime.get("base_url") or base_url
+            api_key = runtime.get("api_key")
+        except Exception:
+            pass
 
     if config_context_length is not None:
         try:
@@ -20932,17 +20940,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source=source)
+        return self._format_session_info(source=source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
         """
-        resolved = _resolve_gateway_model_context()
+        effective_model = None
+        effective_runtime = None
+        if source is not None:
+            try:
+                user_config = _load_gateway_config()
+                effective_model, effective_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    user_config=user_config,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to resolve session runtime for reset notice",
+                    exc_info=True,
+                )
+        resolved = _resolve_gateway_model_context(
+            model=effective_model,
+            runtime_override=effective_runtime,
+        )
         model = resolved.model
         provider = resolved.provider
         base_url = resolved.base_url

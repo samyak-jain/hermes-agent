@@ -189,6 +189,8 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
+    assert "global default for all chats" in confirmation
+    assert "/model --session" in confirmation
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert isinstance(written["model"], dict), (
         "model: should be coerced to a dict, got %r" % (written["model"],)
