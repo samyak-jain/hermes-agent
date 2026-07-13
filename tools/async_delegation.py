@@ -7,7 +7,8 @@ subagent that runs on a module-level daemon executor and returns a handle
 immediately, so the user and the model can keep working while the child runs.
 
 When the child finishes, a completion event is pushed onto the SHARED
-``process_registry.completion_queue`` with ``type="async_delegation"``. The
+``process_registry.completion_queue`` (normally ``type="async_delegation"``;
+thin adapters may select another routed type such as ``spawn_result``). The
 CLI (``cli.py`` process_loop) and gateway (``_run_process_watcher`` /
 ``completion_queue`` drain) already poll that queue while the agent is idle
 and forge a fresh user/internal turn from each event. We deliberately reuse
@@ -765,6 +766,9 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    delegation_id: Optional[str] = None,
+    completion_type: str = "async_delegation",
+    label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -801,6 +805,10 @@ def dispatch_async_delegation(
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
         should fall back to sync or tell the user) rather than queued, so a
         runaway model can't pile up unbounded background work.
+    delegation_id, completion_type, label
+        Optional adapter metadata. Defaults preserve the delegate_task handle
+        and completion payload exactly; spawn_agent supplies its compact id,
+        routed event type, and display label.
 
     Returns
     -------
@@ -808,7 +816,7 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    delegation_id = _new_delegation_id()
+    delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -822,6 +830,8 @@ def dispatch_async_delegation(
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
+        "completion_type": completion_type,
+        "label": label,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -961,7 +971,7 @@ def _push_completion_event(
     completed_at = record.get("completed_at") or time.time()
 
     evt = {
-        "type": "async_delegation",
+        "type": record.get("completion_type") or "async_delegation",
         "delegation_id": record.get("delegation_id"),
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
@@ -969,6 +979,7 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "label": record.get("label"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -1497,6 +1508,58 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
+
+
+def interrupt_delegation(
+    delegation_id: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    completion_type: Optional[str] = None,
+) -> bool:
+    """Signal one running async delegation owned by the caller to stop.
+
+    At least one ownership selector must match the dispatch record.  This is
+    intentionally stricter than a process-global id lookup: gateway processes
+    host multiple users, so possession (or guessing) of a short delegation id
+    must not permit one conversation to interrupt another conversation's work.
+
+    ``completion_type`` lets thin adapters constrain the handle namespace;
+    ``spawn_agent`` uses it to avoid cancelling a ``delegate_task`` batch even
+    if an id is accidentally passed across the two APIs.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    selectors = (
+        ("session_key", str(session_key or "")),
+        ("origin_ui_session_id", str(origin_ui_session_id or "")),
+        ("parent_session_id", str(parent_session_id or "")),
+    )
+    if not delegation_id or not any(value for _, value in selectors):
+        return False
+
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") != "running":
+            return False
+        if completion_type and record.get("completion_type") != completion_type:
+            return False
+        if not any(
+            value and str(record.get(field) or "") == value
+            for field, value in selectors
+        ):
+            return False
+        interrupt_fn = record.get("interrupt_fn")
+
+    if not callable(interrupt_fn):
+        return False
+    try:
+        interrupt_fn()
+    except Exception as exc:
+        logger.debug("interrupt_delegation(%s) failed: %s", delegation_id, exc)
+        return False
+    logger.info("Requested interrupt for async delegation %s by id", delegation_id)
+    return True
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
