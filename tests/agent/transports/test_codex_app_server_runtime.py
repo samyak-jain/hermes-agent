@@ -70,6 +70,34 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
         assert got == "codex_app_server"
 
+    @pytest.mark.parametrize("provider", ["anthropic", "openrouter", "bedrock"])
+    def test_provider_neutral_agent_runtime(self, provider: str) -> None:
+        got = _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode="anthropic_messages",
+            model_cfg={"agent_runtime": "codex_app_server"},
+        )
+        assert got == "codex_app_server"
+
+    def test_provider_neutral_agent_runtime_is_case_insensitive(self) -> None:
+        got = _maybe_apply_codex_app_server_runtime(
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model_cfg={"agent_runtime": "Codex_App_Server"},
+        )
+        assert got == "codex_app_server"
+
+    def test_configured_main_runtime_does_not_capture_side_provider(self) -> None:
+        got = _maybe_apply_codex_app_server_runtime(
+            provider="openai-codex",
+            api_mode="codex_responses",
+            model_cfg={
+                "provider": "anthropic",
+                "agent_runtime": "codex_app_server",
+            },
+        )
+        assert got == "codex_responses"
+
     def test_case_insensitive(self) -> None:
         got = _maybe_apply_codex_app_server_runtime(
             provider="openai",

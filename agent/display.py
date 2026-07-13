@@ -457,6 +457,15 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         preview = _oneline(str(goal))
         return _truncate_preview(preview, max_len) if preview else None
 
+    # Async subagents carry a short, user-facing label in addition to their
+    # full prompt.  Prefer the label both for readability and to avoid echoing
+    # a potentially sensitive multi-line delegation prompt into chat progress.
+    if tool_name == "spawn_agent":
+        label = _oneline(str(args.get("label") or ""))
+        prompt = _oneline(str(args.get("prompt") or ""))
+        preview = label or prompt
+        return _truncate_preview(preview, max_len) if preview else None
+
     if tool_name == "process":
         action = args.get("action", "")
         sid = args.get("session_id", "")
@@ -515,7 +524,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         elif action == "remove":
             old = _oneline(args.get("old_text") or "") or "<missing old_text>"
             return f"-{target}: \"{old[:20]}\""
-        return action
+        return action or None
 
     if tool_name == "send_message":
         target = args.get("target", "?")
@@ -589,6 +598,7 @@ _TOOL_VERBS: dict[str, str] = {
     "skills_list": "Listing skills",
     "skill_manage": "Updating skill",
     "delegate_task": "Delegating",
+    "spawn_agent": "Spawning agent",
     "cronjob": "Scheduling",
     "clarify": "Asking",
     "memory": "Updating memory",
@@ -1506,5 +1516,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
-

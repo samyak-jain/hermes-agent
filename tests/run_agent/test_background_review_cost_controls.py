@@ -76,6 +76,25 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
     assert rt["max_tokens"] == 2048
 
 
+def test_routed_openai_review_downgrades_foreground_app_server_runtime():
+    agent = _FakeAgent(provider="anthropic", model="claude-fable-5")
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "openai-codex", "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+    }}}
+    fake_rp = {
+        "provider": "openai-codex", "model": "gpt-5.6-sol",
+        "api_key": "oauth-token",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_app_server",
+    }
+    with patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["routed"] is True
+    assert rt["api_mode"] == "codex_responses"
+
+
 def test_unrouted_runtime_keeps_parent_pool_and_overrides():
     agent = _FakeAgent()
     agent._credential_pool = "parent-pool"

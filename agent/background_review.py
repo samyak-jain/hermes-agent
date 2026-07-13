@@ -80,6 +80,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
+    task_api_mode = (str(task.get("api_mode", "")).strip().lower() or None)
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
@@ -92,12 +93,24 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             explicit_api_key=task_api_key,
             explicit_base_url=task_base_url,
         )
+        resolved_api_mode = rp.get("api_mode")
+        if task_api_mode in {
+            "chat_completions",
+            "codex_responses",
+            "anthropic_messages",
+        }:
+            resolved_api_mode = task_api_mode
+        # Reviews need the native Hermes tool loop for skill_manage/memory.
+        # A provider-neutral app-server selection is valid for the foreground
+        # parent but cannot drive this isolated review fork.
+        if resolved_api_mode == "codex_app_server":
+            resolved_api_mode = "codex_responses"
         return {
             "provider": rp.get("provider") or task_provider,
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
-            "api_mode": rp.get("api_mode"),
+            "api_mode": resolved_api_mode,
             "credential_pool": rp.get("credential_pool"),
             "request_overrides": dict(rp.get("request_overrides") or {}),
             "max_tokens": rp.get("max_output_tokens"),

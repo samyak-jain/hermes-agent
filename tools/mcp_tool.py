@@ -5604,13 +5604,15 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     try:
-        from agent.tool_policy import filter_tool_definitions
-        new_defs = filter_tool_definitions(new_defs, agent.tool_policy)
+        from agent.tool_policy import LEGACY_TOOL_POLICY, filter_tool_definitions
+
+        tool_policy = getattr(agent, "tool_policy", None) or LEGACY_TOOL_POLICY
+        new_defs = filter_tool_definitions(new_defs, tool_policy)
         new_names = {t["function"]["name"] for t in new_defs}
         staged_engine_names.intersection_update(new_names)
         if (
-            agent.tool_policy.mode == "allowlist"
-            and not agent.tool_policy.allowed_names.issubset(new_names)
+            tool_policy.mode == "allowlist"
+            and not tool_policy.allowed_names.issubset(new_names)
         ):
             logger.error(
                 "MCP refresh could not satisfy exact tool allowlist; denying refreshed surface"

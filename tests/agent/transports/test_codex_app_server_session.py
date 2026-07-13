@@ -161,6 +161,32 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_passes_claude_bridge_context(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            model="claude-fable-5",
+            permission_mode="bypassPermissions",
+            host_session_id="gateway-session-1",
+            system_prompt_append="soul and memory",
+            system_prompt_identity="soul only",
+            tool_schemas=[
+                {
+                    "name": "memory",
+                    "description": "Persistent memory",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "claude-fable-5"
+        assert params["permissionMode"] == "bypassPermissions"
+        assert params["hostSessionId"] == "gateway-session-1"
+        assert params["systemPromptAppend"] == "soul and memory"
+        assert params["systemPromptIdentity"] == "soul only"
+        assert params["tools"][0]["name"] == "memory"
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -195,6 +221,44 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_host_tool_request_runs_live_callback(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "agent/tool/call",
+            request_id="tool-request-1",
+            name="memory",
+            arguments={"action": "read"},
+            toolCallId="sdk-tool-1",
+        )
+        original_respond = client.respond
+
+        def respond_then_complete(request_id, response):
+            original_respond(request_id, response)
+            client.queue_notification(
+                "turn/completed",
+                threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
+
+        client.respond = respond_then_complete
+        calls = []
+
+        def invoke(name, arguments, tool_call_id):
+            calls.append((name, arguments, tool_call_id))
+            return '{"success": true}'
+
+        result = make_session(client, tool_callback=invoke).run_turn(
+            "remember this", turn_timeout=2.0
+        )
+        assert result.error is None
+        assert calls == [("memory", {"action": "read"}, "sdk-tool-1")]
+        assert client.responses == [
+            (
+                "tool-request-1",
+                {"content": '{"success": true}', "isError": False},
+            )
+        ]
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
