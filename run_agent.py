@@ -5727,6 +5727,16 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _dispatch_spawn_agent(self, function_args: dict) -> str:
+        """Dispatch the agent-owned fire-and-forget subagent tool."""
+        from tools.spawn_tool import spawn_agent as _spawn_agent
+
+        return _spawn_agent(
+            prompt=function_args.get("prompt"),
+            label=function_args.get("label"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,

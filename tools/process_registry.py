@@ -1186,7 +1186,7 @@ class ProcessRegistry:
             # Filter async-delegation events so they are not delivered to the
             # wrong session/thread (#58684). Positive-proof callback beats
             # bare key equality when the caller can provide one.
-            if evt.get("type") == "async_delegation":
+            if evt.get("type") in {"async_delegation", "spawn_result"}:
                 if owns_event is not None:
                     try:
                         owned = bool(owns_event(evt))
@@ -2077,6 +2077,40 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_spawn_result(evt: dict) -> str:
+    """Format the intentionally compact spawn_agent completion message."""
+    spawn_id = evt.get("delegation_id") or "unknown"
+    label = str(evt.get("label") or "").strip()
+    if not label:
+        goal = evt.get("goal") or "background task"
+        label = next(
+            (line.strip() for line in str(goal).splitlines() if line.strip()),
+            "background task",
+        )
+    label = " ".join(label.split()).replace('"', "'")
+    if len(label) > 80:
+        label = label[:77] + "..."
+
+    status = (evt.get("status") or "completed").lower()
+    succeeded = status in {"completed", "success"}
+    outcome = "finished" if succeeded else "FAILED"
+    duration = _format_age(evt.get("duration_seconds") or 0)
+    lines = [f'[Subagent {spawn_id} ("{label}") {outcome} — {duration}]']
+
+    summary = evt.get("summary")
+    error = evt.get("error")
+    if succeeded:
+        if summary:
+            lines.append(str(summary))
+    else:
+        if error:
+            lines.append(str(error))
+        if summary:
+            lines.append("Partial output:")
+            lines.append(str(summary))
+    return "\n".join(lines)
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2107,6 +2141,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if evt_type == "spawn_result":
+        return _format_spawn_result(evt)
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

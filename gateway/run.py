@@ -2641,8 +2641,8 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
-        # Reuse the shared rich formatter (self-contained task-source block).
+    if evt_type in {"async_delegation", "spawn_result"}:
+        # Reuse the shared delegation/spawn completion formatter.
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
@@ -2669,7 +2669,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "spawn_result"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -15660,7 +15660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    if evt.get("type") in {"async_delegation", "spawn_result"}:
                         async_events.append(evt)
                     else:
                         requeue.append(evt)

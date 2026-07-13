@@ -663,6 +663,12 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
             goal = goal[:57] + "..."
         return f"[delegate_task] '{goal}' ({content_len:,} chars result)"
 
+    if tool_name == "spawn_agent":
+        label = args.get("label") or args.get("prompt", "")
+        if len(label) > 60:
+            label = label[:57] + "..."
+        return f"[spawn_agent] '{label}' ({content_len:,} chars result)"
+
     if tool_name == "execute_code":
         code_preview = (args.get("code") or "")[:60].replace("\n", " ")
         if len(args.get("code", "")) > 60:

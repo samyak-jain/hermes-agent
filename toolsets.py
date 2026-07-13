@@ -248,6 +248,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "spawn": {
+        "description": "Fire-and-forget background subagents with compact results",
+        "tools": ["spawn_agent"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 

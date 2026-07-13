@@ -45,6 +45,7 @@ from utils import base_url_hostname, is_truthy_value
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "spawn_agent",  # no recursive background delegation
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
@@ -1114,6 +1115,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    relay_progress: bool = True,
+    emit_lifecycle_hooks: bool = True,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1250,18 +1253,20 @@ def _build_child_agent(
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
     child_session_ref: Dict[str, Any] = {}
-    child_progress_cb = _build_child_progress_callback(
-        task_index,
-        goal,
-        parent_agent,
-        task_count,
-        subagent_id=subagent_id,
-        parent_id=parent_subagent_id,
-        depth=tui_depth,
-        model=effective_model_for_cb,
-        toolsets=child_toolsets,
-        session_ref=child_session_ref,
-    )
+    child_progress_cb = None
+    if relay_progress:
+        child_progress_cb = _build_child_progress_callback(
+            task_index,
+            goal,
+            parent_agent,
+            task_count,
+            subagent_id=subagent_id,
+            parent_id=parent_subagent_id,
+            depth=tui_depth,
+            model=effective_model_for_cb,
+            toolsets=child_toolsets,
+            session_ref=child_session_ref,
+        )
 
     # Each subagent gets its own iteration budget capped at max_iterations
     # (configurable via delegation.max_iterations, default 50).  This means
@@ -1493,20 +1498,21 @@ def _build_child_agent(
         except Exception as exc:
             logger.debug("spawn_requested relay failed: %s", exc)
 
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "subagent_start",
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-            parent_subagent_id=parent_subagent_id,
-            child_session_id=getattr(child, "session_id", None),
-            child_subagent_id=subagent_id,
-            child_role=effective_role,
-            child_goal=goal,
-        )
-    except Exception:
-        logger.debug("subagent_start hook invocation failed", exc_info=True)
+    if emit_lifecycle_hooks:
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "subagent_start",
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                parent_subagent_id=parent_subagent_id,
+                child_session_id=getattr(child, "session_id", None),
+                child_subagent_id=subagent_id,
+                child_role=effective_role,
+                child_goal=goal,
+            )
+        except Exception:
+            logger.debug("subagent_start hook invocation failed", exc_info=True)
 
     return child
 

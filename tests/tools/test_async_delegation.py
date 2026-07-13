@@ -633,6 +633,22 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_gateway_formatter_renders_compact_spawn_result():
+    from gateway.run import _format_gateway_process_notification
+
+    txt = _format_gateway_process_notification(
+        _make_async_evt(
+            type="spawn_result",
+            delegation_id="sa_123abc",
+            label="inspect auth",
+        )
+    )
+    assert txt == (
+        '[Subagent sa_123abc ("inspect auth") finished — 12s]\n'
+        "Found the bug in test_foo"
+    )
+
+
 def test_gateway_watch_drain_requeues_async_without_looping():
     from gateway.run import _drain_gateway_watch_events
 
@@ -655,6 +671,17 @@ def test_gateway_watch_drain_requeues_async_without_looping():
     assert q.get_nowait() == async_evt
 
 
+def test_gateway_watch_drain_requeues_spawn_result():
+    from gateway.run import _drain_gateway_watch_events
+
+    q = queue.Queue()
+    spawn_evt = _make_async_evt(type="spawn_result", delegation_id="sa_123abc")
+    q.put(spawn_evt)
+
+    assert _drain_gateway_watch_events(q) == []
+    assert q.get_nowait() == spawn_evt
+
+
 def test_gateway_builds_routable_source_from_enriched_event():
     from gateway.run import GatewayRunner
 
@@ -675,5 +702,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

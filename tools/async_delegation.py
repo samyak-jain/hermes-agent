@@ -7,7 +7,8 @@ subagent that runs on a module-level daemon executor and returns a handle
 immediately, so the user and the model can keep working while the child runs.
 
 When the child finishes, a completion event is pushed onto the SHARED
-``process_registry.completion_queue`` with ``type="async_delegation"``. The
+``process_registry.completion_queue`` (normally ``type="async_delegation"``;
+thin adapters may select another routed type such as ``spawn_result``). The
 CLI (``cli.py`` process_loop) and gateway (``_run_process_watcher`` /
 ``completion_queue`` drain) already poll that queue while the agent is idle
 and forge a fresh user/internal turn from each event. We deliberately reuse
@@ -134,6 +135,9 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    completion_type: str = "async_delegation",
+    label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -162,6 +166,10 @@ def dispatch_async_delegation(
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
         should fall back to sync or tell the user) rather than queued, so a
         runaway model can't pile up unbounded background work.
+    delegation_id, completion_type, label
+        Optional adapter metadata. Defaults preserve the delegate_task handle
+        and completion payload exactly; spawn_agent supplies its compact id,
+        routed event type, and display label.
 
     Returns
     -------
@@ -169,7 +177,7 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    delegation_id = _new_delegation_id()
+    delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -181,6 +189,8 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
+        "completion_type": completion_type,
+        "label": label,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -286,13 +296,14 @@ def _push_completion_event(
     completed_at = record.get("completed_at") or time.time()
 
     evt = {
-        "type": "async_delegation",
+        "type": record.get("completion_type") or "async_delegation",
         "delegation_id": record.get("delegation_id"),
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "label": record.get("label"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),

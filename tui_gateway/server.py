@@ -8660,7 +8660,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("message", ""),
             evt.get("suppressed", 0),
         )
-    if evt_type == "async_delegation":
+    if evt_type in {"async_delegation", "spawn_result"}:
         # Async-delegation completions have no process session_id; without
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
@@ -8712,7 +8712,7 @@ def _notification_poller_loop(
         # a wrong-chat injection is unrecoverable. Non-delegation events
         # (background process completions etc.) keep the historical
         # adopt-orphans behavior.
-        if evt.get("type") == "async_delegation" and not _session_owns_notification_event(
+        if evt.get("type") in {"async_delegation", "spawn_result"} and not _session_owns_notification_event(
             sid, session, evt
         ):
             logger.warning(
@@ -8787,7 +8787,7 @@ def _notification_poller_loop(
         # payload is never adopted by a foreign session — defer it (a later
         # resume of the owner's lineage can still claim it) rather than
         # injecting another chat's conversation here (#55578).
-        if evt.get("type") == "async_delegation" and not _session_owns_notification_event(
+        if evt.get("type") in {"async_delegation", "spawn_result"} and not _session_owns_notification_event(
             sid, session, evt
         ):
             deferred.append(evt)
