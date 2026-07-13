@@ -189,13 +189,7 @@ def _write_stderr_log_header(server_name: str) -> None:
         fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
         fh.flush()
     except Exception:
-        # Refresh is a mutation of an already-authorized agent. If policy
-        # evaluation itself fails, publish no tools rather than retaining an
-        # unfiltered staged registry snapshot.
-        logger.exception("Tool policy evaluation failed during MCP refresh; denying refreshed surface")
-        new_defs = []
-        new_names = set()
-        staged_engine_names.clear()
+        pass
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -5339,7 +5333,16 @@ def refresh_agent_mcp_tools(
             new_names = set()
             staged_engine_names.clear()
     except Exception:
-        pass
+        # Refresh is a mutation of an already-authorized agent. If policy
+        # evaluation itself fails, publish no tools rather than retaining an
+        # unfiltered staged registry snapshot.
+        logger.exception(
+            "Tool policy evaluation failed during MCP refresh; "
+            "denying refreshed surface"
+        )
+        new_defs = []
+        new_names = set()
+        staged_engine_names.clear()
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

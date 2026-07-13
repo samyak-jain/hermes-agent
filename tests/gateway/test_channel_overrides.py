@@ -204,6 +204,63 @@ class TestChannelToolPolicy:
         assert policy.mode == "allowlist"
         assert not policy.allows("terminal")
 
+    def test_typed_channel_override_field_drives_resolution(self, monkeypatch):
+        cfg = {
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                    "gateway_override_authority": "managed_only",
+                }
+            }
+        }
+        gateway_config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "trusted": ChannelOverride(
+                            tool_policy={"mode": "unrestricted"},
+                        ),
+                    },
+                ),
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda path: "channel_overrides.trusted.tool_policy" in path,
+        )
+
+        source = SessionSource(platform=Platform.DISCORD, chat_id="trusted")
+        policy = _resolve_tool_policy_for_source(cfg, source, gateway_config)
+
+        assert policy.mode == "unrestricted"
+
+    def test_non_mapping_global_policy_defaults_to_managed_only(self, monkeypatch):
+        cfg = {"agent": {"tool_policy": "allowlist"}}
+        gateway_config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "trusted": ChannelOverride(
+                            tool_policy={"mode": "unrestricted"},
+                        ),
+                    },
+                ),
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda _path: False,
+        )
+
+        source = SessionSource(platform=Platform.DISCORD, chat_id="trusted")
+        policy = _resolve_tool_policy_for_source(cfg, source, gateway_config)
+
+        assert not policy.valid
+        assert not policy.allows("terminal")
+
     def test_dm_model_switch_or_same_gpt_model_never_changes_policy(self):
         cfg = self._config()
         source = SessionSource(platform=Platform.DISCORD, chat_id="dm", chat_type="dm")

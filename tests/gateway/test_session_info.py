@@ -302,3 +302,32 @@ class TestResetNoticeEffectiveSessionModel:
         assert "session/model" in info
         assert "channel/model" not in info
         assert "global/model" not in info
+
+    def test_session_runtime_failure_reuses_precomputed_global_model(
+        self,
+        runner,
+        tmp_path,
+    ):
+        self._write_config(tmp_path)
+        runner.config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+        )
+
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch(
+                 "gateway.run._resolve_gateway_model",
+                 return_value="global/model",
+             ) as resolve_global, \
+             patch.object(
+                 runner,
+                 "_resolve_session_agent_runtime",
+                 side_effect=RuntimeError("credential refresh failed"),
+             ), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs",
+                 return_value=self._GLOBAL_RUNTIME,
+             ):
+            info = runner._reset_notice_session_info(self._source())
+
+        assert "global/model" in info
+        assert resolve_global.call_count == 1

@@ -217,6 +217,24 @@ class TestExactToolPolicyValidation:
             for issue in issues
         )
 
+    def test_legacy_discord_layout_uses_same_channel_policy_validation(self):
+        issues = validate_config_structure({
+            "discord": {"channel_overrides": {
+                "123": {
+                    "tool_policy": {
+                        "mode": "unrestricted",
+                        "tools": ["terminal"],
+                    }
+                },
+            }},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "discord.channel_overrides.123.tool_policy" in issue.message
+            for issue in issues
+        )
+
 
 class TestConfigIssueDataclass:
     """ConfigIssue should be a proper dataclass."""

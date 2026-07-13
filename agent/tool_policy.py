@@ -158,3 +158,11 @@ def authorize_agent_tool(agent: Any, name: str) -> str | None:
     if name not in names:
         return denied_tool_result(name, unavailable=True)
     return None
+
+
+def allowed_tool_names_for_dispatch(agent: Any) -> frozenset[str] | None:
+    """Return the strict dispatch boundary, or ``None`` for legacy behavior."""
+    policy = getattr(agent, "tool_policy", LEGACY_TOOL_POLICY)
+    if policy.mode == "legacy":
+        return None
+    return frozenset(getattr(agent, "valid_tool_names", set()) or set())

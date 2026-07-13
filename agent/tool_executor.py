@@ -31,6 +31,9 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_policy import (
+    allowed_tool_names_for_dispatch as _allowed_tool_names_for_dispatch,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -1511,10 +1514,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    allowed_tool_names=(
-                        None if agent.tool_policy.mode == "legacy"
-                        else frozenset(agent.valid_tool_names)
-                    ),
+                    allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1557,10 +1557,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    allowed_tool_names=(
-                        None if agent.tool_policy.mode == "legacy"
-                        else frozenset(agent.valid_tool_names)
-                    ),
+                    allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:

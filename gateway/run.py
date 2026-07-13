@@ -2355,11 +2355,17 @@ def _load_gateway_config() -> dict:
     # values. Helper is fail-open and a no-op when no managed scope exists.
     try:
         from hermes_cli import managed_scope
-        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
-    except managed_scope.ManagedConfigError:
-        raise
     except Exception:
-        pass
+        managed_scope = None
+    if managed_scope is not None:
+        try:
+            raw = managed_scope.apply_managed_overlay(
+                raw if isinstance(raw, dict) else {}
+            )
+        except managed_scope.ManagedConfigError:
+            raise
+        except Exception:
+            pass
     if not isinstance(raw, dict):
         return {}
     # Canonicalize model-id aliases (model.name / model.model → model.default)
@@ -2449,23 +2455,46 @@ def _get_channel_override(
     Looks up ``channel_overrides`` by ``chat_id``, then ``thread_id``, then
     ``parent_id`` (forum threads / child channels inherit the parent entry).
     """
+    _key, override = _get_channel_override_entry(
+        config,
+        platform,
+        chat_id,
+        thread_id=thread_id,
+        parent_id=parent_id,
+    )
+    return override
+
+
+def _get_channel_override_entry(
+    config: GatewayConfig,
+    platform: Platform,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> tuple[Optional[str], Optional[ChannelOverride]]:
+    """Return the matched override key and typed override, if any."""
     platforms = getattr(config, "platforms", None)
     if not platforms:
-        return None
+        return None, None
     platform_config = platforms.get(platform)
     if not platform_config or not platform_config.channel_overrides:
-        return None
+        return None, None
     overrides = platform_config.channel_overrides
     for key in _channel_override_lookup_keys(
         chat_id, thread_id=thread_id, parent_id=parent_id
     ):
         ov = overrides.get(key)
         if ov is not None:
-            return ov
-    return None
+            return key, ov
+    return None, None
 
 
-def _resolve_tool_policy_for_source(user_config: dict, source: SessionSource):
+def _resolve_tool_policy_for_source(
+    user_config: dict,
+    source: SessionSource,
+    gateway_config: Optional[GatewayConfig] = None,
+):
     """Resolve exact tool authority independently from model selection.
 
     Elevating channel policies may be restricted to managed config provenance;
@@ -2476,10 +2505,12 @@ def _resolve_tool_policy_for_source(user_config: dict, source: SessionSource):
     global_policy = policy_from_config(user_config)
     agent_cfg = user_config.get("agent") or {}
     raw_global = agent_cfg.get("tool_policy") if isinstance(agent_cfg, dict) else {}
-    authority = (
-        str((raw_global or {}).get("gateway_override_authority", "managed_only") or "managed_only")
-        if isinstance(raw_global, dict) else "any"
-    ).strip().lower()
+    authority = "managed_only"
+    if isinstance(raw_global, dict):
+        authority = str(
+            (raw_global or {}).get("gateway_override_authority", "managed_only")
+            or "managed_only"
+        ).strip().lower()
     if authority not in {"any", "managed_only"}:
         logger.error(
             "Invalid agent.tool_policy.gateway_override_authority=%r; "
@@ -2490,48 +2521,47 @@ def _resolve_tool_policy_for_source(user_config: dict, source: SessionSource):
     if source.platform != Platform.DISCORD:
         return global_policy
 
-    platforms = user_config.get("platforms") or {}
-    discord_cfg = platforms.get("discord") if isinstance(platforms, dict) else None
-    if not isinstance(discord_cfg, dict):
-        discord_cfg = user_config.get("discord") or {}
-    overrides = discord_cfg.get("channel_overrides") if isinstance(discord_cfg, dict) else None
-    if not isinstance(overrides, dict):
-        return global_policy
+    if gateway_config is None:
+        platforms = user_config.get("platforms")
+        typed_platforms = dict(platforms) if isinstance(platforms, dict) else {}
+        if "discord" not in typed_platforms and isinstance(
+            user_config.get("discord"), dict
+        ):
+            typed_platforms["discord"] = user_config["discord"]
+        gateway_config = GatewayConfig.from_dict({"platforms": typed_platforms})
 
-    for key in _channel_override_lookup_keys(
+    key, channel_override = _get_channel_override_entry(
+        gateway_config,
+        Platform.DISCORD,
         str(source.chat_id or ""),
         thread_id=getattr(source, "thread_id", None),
         parent_id=getattr(source, "parent_chat_id", None),
-    ):
-        entry = overrides.get(key)
-        if entry is None:
-            entry = overrides.get(int(key)) if key.isdigit() else None
-        if not isinstance(entry, dict) or "tool_policy" not in entry:
-            continue
-        if authority == "managed_only":
-            try:
-                from hermes_cli import managed_scope
-                paths = (
-                    f"platforms.discord.channel_overrides.{key}.tool_policy",
-                    f"platforms.discord.channel_overrides.{key}.tool_policy.mode",
-                    f"discord.channel_overrides.{key}.tool_policy",
-                    f"discord.channel_overrides.{key}.tool_policy.mode",
+    )
+    if key is None or channel_override is None or channel_override.tool_policy is None:
+        return global_policy
+    if authority == "managed_only":
+        try:
+            from hermes_cli import managed_scope
+            paths = (
+                f"platforms.discord.channel_overrides.{key}.tool_policy",
+                f"platforms.discord.channel_overrides.{key}.tool_policy.mode",
+                f"discord.channel_overrides.{key}.tool_policy",
+                f"discord.channel_overrides.{key}.tool_policy.mode",
+            )
+            if not any(managed_scope.is_key_managed(path) for path in paths):
+                logger.warning(
+                    "Ignoring unmanaged Discord tool_policy override for channel %s",
+                    key,
                 )
-                if not any(managed_scope.is_key_managed(path) for path in paths):
-                    logger.warning(
-                        "Ignoring unmanaged Discord tool_policy override for channel %s",
-                        key,
-                    )
-                    continue
-            except Exception:
-                continue
-        resolved = parse_tool_policy(
-            entry.get("tool_policy"),
-            source=f"platforms.discord.channel_overrides.{key}.tool_policy",
-            fallback=global_policy,
-        )
-        return resolved if resolved.valid else global_policy
-    return global_policy
+                return global_policy
+        except Exception:
+            return global_policy
+    resolved = parse_tool_policy(
+        channel_override.tool_policy,
+        source=f"platforms.discord.channel_overrides.{key}.tool_policy",
+        fallback=global_policy,
+    )
+    return resolved if resolved.valid else global_policy
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -12433,8 +12463,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # retains the historical global-only behavior for callers that do not
         # have session identity available.
         if source is not None:
+            global_model = _resolve_gateway_model(data)
+            model = global_model
             try:
-                global_model = _resolve_gateway_model(data)
                 model, runtime = self._resolve_session_agent_runtime(
                     source=source,
                     user_config=data,
@@ -12447,7 +12478,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Failed to resolve session runtime for reset notice",
                     exc_info=True,
                 )
-                model = global_model or _resolve_gateway_model(data)
         else:
             model = _resolve_gateway_model()
             global_model = model

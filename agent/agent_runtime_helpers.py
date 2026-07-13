@@ -33,6 +33,9 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
+from agent.tool_policy import (
+    allowed_tool_names_for_dispatch as _allowed_tool_names_for_dispatch,
+)
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
@@ -2350,10 +2353,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                allowed_tool_names=(
-                    None if agent.tool_policy.mode == "legacy"
-                    else frozenset(agent.valid_tool_names)
-                ),
+                allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
 

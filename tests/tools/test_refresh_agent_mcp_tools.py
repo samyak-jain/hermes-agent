@@ -19,12 +19,51 @@ def _tool(name):
 
 
 def _agent(tool_names, *, enabled=None, disabled=None):
+    from agent.tool_policy import LEGACY_TOOL_POLICY
+
     a = types.SimpleNamespace()
     a.tools = [_tool(n) for n in tool_names]
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a.tool_policy = LEGACY_TOOL_POLICY
     return a
+
+
+def test_stderr_header_write_failure_is_best_effort(monkeypatch):
+    """A broken log sink must not crash MCP server startup."""
+
+    class _BrokenLog:
+        @staticmethod
+        def write(_value):
+            raise OSError("disk full")
+
+        @staticmethod
+        def flush():
+            raise AssertionError("flush should not run after write fails")
+
+    monkeypatch.setattr(mcp_tool, "_get_mcp_stderr_log", lambda: _BrokenLog())
+
+    mcp_tool._write_stderr_log_header("demo")
+
+
+def test_refresh_policy_failure_denies_entire_staged_surface(monkeypatch):
+    """Policy evaluation errors fail closed instead of publishing unfiltered tools."""
+    agent = _agent(["read_file"])
+    agent.tool_policy = object()  # no ``allows``/``mode`` policy contract
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_unfiltered_tool")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
 
 
 def test_refresh_adds_late_landing_tools(monkeypatch):

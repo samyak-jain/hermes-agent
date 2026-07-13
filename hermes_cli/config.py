@@ -5250,6 +5250,28 @@ class ConfigIssue:
     hint: str
 
 
+def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
+    """Yield ``(source_path, raw_policy)`` across supported Discord layouts."""
+    discord_maps = []
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict) and isinstance(platforms.get("discord"), dict):
+        discord_maps.append(("platforms.discord", platforms["discord"]))
+    if isinstance(config.get("discord"), dict):
+        discord_maps.append(("discord", config["discord"]))
+
+    for prefix, discord_config in discord_maps:
+        overrides = discord_config.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        for channel_id, override in overrides.items():
+            if not isinstance(override, dict) or "tool_policy" not in override:
+                continue
+            yield (
+                f"{prefix}.channel_overrides.{channel_id}.tool_policy",
+                override.get("tool_policy"),
+            )
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
@@ -5268,9 +5290,10 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     # Exact-name tool policy. Invalid explicit policy is a security error: the
     # runtime denies all tools rather than silently reverting to legacy scope.
+    from agent.tool_policy import parse_tool_policy
+
     _agent_policy = (config.get("agent") or {}).get("tool_policy") if isinstance(config.get("agent"), dict) else None
     if _agent_policy is not None:
-        from agent.tool_policy import parse_tool_policy
         _parsed_policy = parse_tool_policy(_agent_policy, source="agent.tool_policy")
         if not _parsed_policy.valid:
             issues.append(ConfigIssue(
@@ -5279,29 +5302,16 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             ))
     # Discord channel exceptions use the same parser. Validate both the
     # canonical nested layout and the legacy top-level platform layout.
-    from agent.tool_policy import parse_tool_policy as _parse_tool_policy
-    _discord_policy_maps = []
-    _platforms_cfg = config.get("platforms")
-    if isinstance(_platforms_cfg, dict) and isinstance(_platforms_cfg.get("discord"), dict):
-        _discord_policy_maps.append(("platforms.discord", _platforms_cfg["discord"]))
-    if isinstance(config.get("discord"), dict):
-        _discord_policy_maps.append(("discord", config["discord"]))
-    for _discord_prefix, _discord_cfg in _discord_policy_maps:
-        _overrides = _discord_cfg.get("channel_overrides")
-        if not isinstance(_overrides, dict):
-            continue
-        for _channel_id, _override in _overrides.items():
-            if not isinstance(_override, dict) or "tool_policy" not in _override:
-                continue
-            _source = f"{_discord_prefix}.channel_overrides.{_channel_id}.tool_policy"
-            _parsed_channel_policy = _parse_tool_policy(
-                _override.get("tool_policy"), source=_source
-            )
-            if not _parsed_channel_policy.valid:
-                issues.append(ConfigIssue(
-                    "error", _parsed_channel_policy.error,
-                    "Use mode: unrestricted or an exact individual-name allowlist; invalid channel policies fall back to the global policy",
-                ))
+    for _source, _raw_channel_policy in _iter_discord_channel_tool_policies(config):
+        _parsed_channel_policy = parse_tool_policy(
+            _raw_channel_policy,
+            source=_source,
+        )
+        if not _parsed_channel_policy.valid:
+            issues.append(ConfigIssue(
+                "error", _parsed_channel_policy.error,
+                "Use mode: unrestricted or an exact individual-name allowlist; invalid channel policies fall back to the global policy",
+            ))
     _child_policy = (config.get("delegation") or {}).get("child_tool_policy") if isinstance(config.get("delegation"), dict) else None
     if _child_policy is not None:
         _child_mode = _child_policy.get("mode") if isinstance(_child_policy, dict) else _child_policy

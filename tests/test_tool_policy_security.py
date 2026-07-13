@@ -2,8 +2,10 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.agent_init import _apply_tool_policy
 from agent.tool_policy import (
     ToolAccessPolicy,
+    allowed_tool_names_for_dispatch,
     authorize_agent_tool,
     parse_tool_policy,
 )
@@ -12,6 +14,13 @@ from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS, _build_child_agent
 
 
 MAIN_NAMES = {"clarify", "delegate_task", "memory", "skills_list", "skill_manage"}
+
+
+def _tool(name):
+    return {
+        "type": "function",
+        "function": {"name": name, "description": "", "parameters": {}},
+    }
 
 
 def test_main_exact_allowlist_has_only_five_tools():
@@ -45,6 +54,51 @@ def test_invalid_policy_fails_closed():
     typo = parse_tool_policy({"mode": "unrestricted", "toolz": []}, source="test")
     assert not typo.valid
     assert not typo.allows("terminal")
+
+
+def test_late_injected_allowlist_tool_is_checked_only_after_all_injections():
+    """Memory/context tools may satisfy an allowlist after registry discovery."""
+    policy = ToolAccessPolicy(
+        mode="allowlist",
+        allowed_names=frozenset({"read_file", "memory_search"}),
+        source="test",
+    )
+    agent = SimpleNamespace(
+        tools=[_tool("read_file")],
+        valid_tool_names={"read_file"},
+        tool_policy=policy,
+    )
+
+    _apply_tool_policy(agent)
+    assert agent.valid_tool_names == {"read_file"}
+
+    agent.tools.append(_tool("memory_search"))
+    _apply_tool_policy(agent, require_complete_allowlist=True)
+
+    assert agent.valid_tool_names == {"read_file", "memory_search"}
+    assert allowed_tool_names_for_dispatch(agent) == frozenset(
+        {"read_file", "memory_search"}
+    )
+
+
+def test_final_incomplete_allowlist_denies_entire_surface():
+    policy = ToolAccessPolicy(
+        mode="allowlist",
+        allowed_names=frozenset({"read_file", "missing_tool"}),
+        source="test",
+    )
+    agent = SimpleNamespace(
+        tools=[_tool("read_file")],
+        valid_tool_names={"read_file"},
+        tool_policy=policy,
+        _context_engine_tool_names={"read_file"},
+    )
+
+    _apply_tool_policy(agent, require_complete_allowlist=True)
+
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert agent._context_engine_tool_names == set()
 
 
 def test_fabricated_disallowed_call_is_rejected_before_dispatch():
