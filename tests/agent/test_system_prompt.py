@@ -3,7 +3,11 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_app_server_system_prompt, build_system_prompt_parts
+from agent.system_prompt import (
+    build_app_server_identity_prompt,
+    build_app_server_system_prompt,
+    build_system_prompt_parts,
+)
 
 
 def _make_agent(**overrides):
@@ -134,12 +138,14 @@ def test_app_server_prompt_keeps_persona_context_and_memory_without_product_iden
             agent,
             system_message="Messages can be prefixed with a sender name.",
         )
+        identity = build_app_server_identity_prompt(agent)
 
     assert "Be warm and incisive" in prompt
     assert "AGENTS.md says to verify deployments" in prompt
     assert "The user prefers terse answers" in prompt
     assert "The user's name is Samyak" in prompt
     assert "Messages can be prefixed" in prompt
+    assert identity == "# Soul\nBe warm and incisive."
     assert "Session ID: session-123" in prompt
     assert "You are Hermes Agent" not in prompt
     assert "You run on Hermes Agent" not in prompt

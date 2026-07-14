@@ -169,6 +169,7 @@ class TestLifecycle:
             permission_mode="bypassPermissions",
             host_session_id="gateway-session-1",
             system_prompt_append="soul and memory",
+            system_prompt_identity="soul only",
             tool_schemas=[
                 {
                     "name": "memory",
@@ -183,6 +184,7 @@ class TestLifecycle:
         assert params["permissionMode"] == "bypassPermissions"
         assert params["hostSessionId"] == "gateway-session-1"
         assert params["systemPromptAppend"] == "soul and memory"
+        assert params["systemPromptIdentity"] == "soul only"
         assert params["tools"][0]["name"] == "memory"
 
     def test_close_idempotent(self):
