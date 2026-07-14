@@ -110,8 +110,9 @@ export class ThreadStore {
     if (!state) {
       state = { threadId, claudeSessionId, tools: [], usageTotal: emptyUsage() };
       this.threads.set(threadId, state);
-    } else if (claudeSessionId) {
+    } else if (claudeSessionId && state.claudeSessionId !== claudeSessionId) {
       state.claudeSessionId = claudeSessionId;
+      state.hostContextDelivered = false;
     }
     this.persist();
     return state;
@@ -120,12 +121,19 @@ export class ThreadStore {
   bindClaudeSession(thread: ThreadState, claudeSessionId: string): void {
     if (thread.claudeSessionId === claudeSessionId) return;
     thread.claudeSessionId = claudeSessionId;
+    thread.hostContextDelivered = false;
     this.persist();
   }
 
   markHostContextDelivered(thread: ThreadState): void {
     if (thread.hostContextDelivered) return;
     thread.hostContextDelivered = true;
+    this.persist();
+  }
+
+  resetHostContextDelivery(thread: ThreadState): void {
+    if (!thread.hostContextDelivered) return;
+    thread.hostContextDelivered = false;
     this.persist();
   }
 
@@ -150,9 +158,10 @@ export class ThreadStore {
         const state: ThreadState = {
           ...persisted,
           // Version 1 sessions embedded the complete host context in the
-          // preset append. Start a fresh Claude session once so those threads
-          // migrate onto the subscription-safe first-turn context layout.
-          ...(persistenceVersion < 2
+          // preset append. Versions before 3 also predate the persona output
+          // style. Start a fresh Claude session once so no cached conversation
+          // mixes the old and new system-prompt layouts.
+          ...(persistenceVersion < 3
             ? { claudeSessionId: undefined, hostContextDelivered: false }
             : {}),
           tools: [],
@@ -179,7 +188,7 @@ export class ThreadStore {
     }));
     mkdirSync(dirname(this.persistencePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.persistencePath}.tmp-${process.pid}`;
-    writeFileSync(temporary, JSON.stringify({ version: 2, threads: records }), {
+    writeFileSync(temporary, JSON.stringify({ version: 3, threads: records }), {
       encoding: "utf8",
       mode: 0o600,
     });

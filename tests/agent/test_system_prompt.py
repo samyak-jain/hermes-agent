@@ -145,7 +145,10 @@ def test_app_server_prompt_keeps_persona_context_and_memory_without_product_iden
     assert "The user prefers terse answers" in prompt
     assert "The user's name is Samyak" in prompt
     assert "Messages can be prefixed" in prompt
-    assert identity == "# Soul\nBe warm and incisive."
+    assert "# Operator-defined persona" in identity
+    assert "# Soul\nBe warm and incisive." in identity
+    assert "governs the voice, register, expressiveness" in identity
+    assert "terse, professional, or emotionally restrained" in identity
     assert "Session ID: session-123" in prompt
     assert "You are Hermes Agent" not in prompt
     assert "You run on Hermes Agent" not in prompt

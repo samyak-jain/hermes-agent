@@ -8,6 +8,7 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { sdkEnvironment } from "./environment.js";
+import { ensurePersonaOutputStyle } from "./persona.js";
 import { jsonSchemaShape } from "./schema.js";
 import type { RpcConnection } from "./rpc.js";
 import type { HostToolSchema, ThreadState, ThreadStore, Usage } from "./threads.js";
@@ -34,6 +35,30 @@ export function systemPromptForThread(thread: ThreadState): string {
   return [thread.systemPromptIdentity?.trim(), HOST_CONTEXT_SYSTEM_GUIDANCE]
     .filter(Boolean)
     .join("\n\n");
+}
+
+export function outputStyleForThread(
+  thread: ThreadState,
+  configDir?: string,
+): string | undefined {
+  return thread.systemPromptIdentity?.trim()
+    ? ensurePersonaOutputStyle(configDir)
+    : undefined;
+}
+
+export function handleSystemMessage(
+  threads: ThreadStore,
+  thread: ThreadState,
+  message: { subtype: string; session_id?: string },
+): boolean {
+  if (message.subtype === "init" && message.session_id) {
+    threads.bindClaudeSession(thread, message.session_id);
+  }
+  if (message.subtype === "compact_boundary") {
+    threads.resetHostContextDelivery(thread);
+    return true;
+  }
+  return false;
 }
 
 export function promptForTurn(thread: ThreadState, userText: string): {
@@ -153,6 +178,7 @@ export async function runTurn(options: {
   const { rpc, threads, thread, turnId, userText, compaction = false } = options;
   const threadId = thread.threadId;
   const turnPrompt = promptForTurn(thread, userText);
+  const outputStyle = outputStyleForThread(thread);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
   let currentMessageItem: string | undefined;
@@ -171,6 +197,7 @@ export async function runTurn(options: {
       preset: "claude_code",
       append: systemPromptForThread(thread),
     },
+    ...(outputStyle ? { settings: { outputStyle } } : {}),
     // Hermes supplies its own prompt, context files and skills. Loading Claude
     // filesystem settings here could also load an env/apiKeyHelper override
     // and silently move the main turn away from subscription authentication.
@@ -192,13 +219,13 @@ export async function runTurn(options: {
   rpc.notify("turn/started", { threadId, turn: { id: turnId } });
 
   let result: TurnResult = { status: "failed", error: "no result received" };
+  let hostContextInvalidated = false;
   try {
     for await (const message of runningQuery as AsyncIterable<SDKMessage>) {
       switch (message.type) {
         case "system":
-          if (message.subtype === "init") {
-            threads.bindClaudeSession(thread, message.session_id);
-          }
+          hostContextInvalidated =
+            handleSystemMessage(threads, thread, message) || hostContextInvalidated;
           break;
         case "stream_event": {
           const event: any = (message as any).event;
@@ -318,10 +345,16 @@ export async function runTurn(options: {
       },
     });
   }
-  if (result.status === "completed" && turnPrompt.includesHostContext) {
+  if (
+    result.status === "completed" &&
+    turnPrompt.includesHostContext &&
+    !hostContextInvalidated &&
+    !compaction
+  ) {
     threads.markHostContextDelivered(thread);
   }
   if (compaction && result.status === "completed") {
+    threads.resetHostContextDelivery(thread);
     const item = { id: `item_${randomUUID()}`, type: "contextCompaction" };
     rpc.notify("item/started", { threadId, turnId, item });
     rpc.notify("item/completed", { threadId, turnId, item });

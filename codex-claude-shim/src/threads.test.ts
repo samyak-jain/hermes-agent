@@ -36,16 +36,16 @@ test("host sessions resume their Claude session and original prompt snapshot", (
   assert.equal(resumed.systemPromptAppend, "original memory snapshot");
   assert.equal(resumed.systemPromptIdentity, "original soul");
   assert.equal(resumed.hostContextDelivered, true);
-  assert.equal(JSON.parse(readFileSync(persistence, "utf8")).version, 2);
+  assert.equal(JSON.parse(readFileSync(persistence, "utf8")).version, 3);
 });
 
-test("version 1 threads start a fresh session for first-turn host context", () => {
+test("pre-persona threads start a fresh session for first-turn host context", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-bridge-v1-"));
   const persistence = join(root, "threads.json");
   writeFileSync(
     persistence,
     JSON.stringify({
-      version: 1,
+      version: 2,
       threads: [
         {
           threadId: "thr_old",
@@ -67,4 +67,27 @@ test("version 1 threads start a fresh session for first-turn host context", () =
   assert.equal(migrated.claudeSessionId, undefined);
   assert.equal(migrated.hostContextDelivered, false);
   assert.equal(migrated.systemPromptIdentity, "SOUL");
+});
+
+test("binding a replacement Claude session resets host context delivery", () => {
+  const root = mkdtempSync(join(tmpdir(), "claude-bridge-rebind-"));
+  const store = new ThreadStore(join(root, "threads.json"));
+  const state = store.create({
+    hostSessionId: "session-1",
+    systemPromptAppend: "persistent context",
+    tools: [],
+  });
+  store.bindClaudeSession(state, "claude-session-1");
+  store.markHostContextDelivered(state);
+
+  store.bindClaudeSession(state, "claude-session-2");
+
+  assert.equal(state.claudeSessionId, "claude-session-2");
+  assert.equal(state.hostContextDelivered, false);
+
+  store.markHostContextDelivered(state);
+  store.resume(state.threadId, "claude-session-3");
+
+  assert.equal(state.claudeSessionId, "claude-session-3");
+  assert.equal(state.hostContextDelivered, false);
 });

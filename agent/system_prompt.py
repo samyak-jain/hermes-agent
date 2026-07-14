@@ -48,6 +48,16 @@ from agent.runtime_cwd import resolve_context_cwd
 from utils import is_truthy_value
 
 
+APP_SERVER_PERSONA_PRECEDENCE = """# Persona precedence
+
+This operator-defined persona governs the voice, register, expressiveness,
+emotional presence, nicknames, stage directions, and emoji of every
+user-facing conversational response. If earlier general style guidance favors
+a terse, professional, or emotionally restrained voice, follow this persona
+instead. Safety, honesty, task requirements, tool-use discipline, and code
+correctness remain in force."""
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -510,10 +520,17 @@ def _app_server_context_length(agent: Any) -> Optional[int]:
 
 
 def build_app_server_identity_prompt(agent: Any) -> str:
-    """Return only the user-owned identity suitable for a preset append."""
+    """Return the authoritative user-owned identity for a preset append."""
     if not (agent.load_soul_identity or not agent.skip_context_files):
         return ""
-    return _ra().load_soul_md(_app_server_context_length(agent)) or ""
+    soul = _ra().load_soul_md(_app_server_context_length(agent)) or ""
+    if not soul.strip():
+        return ""
+    return (
+        "# Operator-defined persona\n\n"
+        f"{soul.strip()}\n\n"
+        f"{APP_SERVER_PERSONA_PRECEDENCE}"
+    )
 
 
 def build_app_server_system_prompt(
