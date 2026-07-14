@@ -43,12 +43,14 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 known_hosts_path: str = "", sync_files: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
+        self.known_hosts_path = known_hosts_path
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
@@ -68,15 +70,17 @@ class SSHEnvironment(BaseEnvironment):
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        self._sync_manager = None
+        if sync_files:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
 
         self.init_session()
 
@@ -86,7 +90,11 @@ class SSHEnvironment(BaseEnvironment):
         cmd.extend(["-o", "ControlMaster=auto"])
         cmd.extend(["-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes"])
-        cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        if self.known_hosts_path:
+            cmd.extend(["-o", f"UserKnownHostsFile={self.known_hosts_path}"])
+            cmd.extend(["-o", "StrictHostKeyChecking=yes"])
+        else:
+            cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         cmd.extend(["-o", "ConnectTimeout=10"])
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])
@@ -334,7 +342,8 @@ class SSHEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution

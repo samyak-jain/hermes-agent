@@ -2226,6 +2226,14 @@ DEFAULT_CONFIG = {
         # parent's pre-exact-policy configured universe, then subtracts the
         # child blocklist by individual tool name.
         "child_tool_policy": {"mode": "legacy"},
+        # Optional task-scoped terminal backend for delegated children. The
+        # parent keeps its configured terminal while each child receives an
+        # isolated backend through the internal task override registry.
+        # ``ssh_host_file`` supports hosts whose address is published at
+        # runtime. Disable ``ssh_sync_files`` when the remote already has its
+        # own tools and credentials, preventing gateway state from crossing
+        # the isolation boundary.
+        "child_terminal": {},
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
