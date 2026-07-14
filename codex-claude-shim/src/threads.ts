@@ -24,6 +24,8 @@ export interface ThreadState {
   model?: string;
   permissionMode?: string;
   systemPromptAppend?: string;
+  systemPromptIdentity?: string;
+  hostContextDelivered?: boolean;
   tools: HostToolSchema[];
   usageTotal: Usage;
   activeTurn?: {
@@ -48,6 +50,8 @@ interface PersistedThread {
   cwd?: string;
   model?: string;
   systemPromptAppend?: string;
+  systemPromptIdentity?: string;
+  hostContextDelivered?: boolean;
 }
 
 const emptyUsage = (): Usage => ({
@@ -83,6 +87,8 @@ export class ThreadStore {
       prior.permissionMode = options.permissionMode;
       prior.tools = options.tools;
       prior.systemPromptAppend = prior.systemPromptAppend || options.systemPromptAppend;
+      prior.systemPromptIdentity =
+        prior.systemPromptIdentity || options.systemPromptIdentity;
       this.persist();
       return prior;
     }
@@ -117,6 +123,12 @@ export class ThreadStore {
     this.persist();
   }
 
+  markHostContextDelivered(thread: ThreadState): void {
+    if (thread.hostContextDelivered) return;
+    thread.hostContextDelivered = true;
+    this.persist();
+  }
+
   require(threadId: string): ThreadState {
     const state = this.threads.get(threadId);
     if (!state) throw new Error(`Unknown threadId: ${threadId}`);
@@ -131,11 +143,18 @@ export class ThreadStore {
     if (!existsSync(this.persistencePath)) return;
     try {
       const parsed = JSON.parse(readFileSync(this.persistencePath, "utf8"));
+      const persistenceVersion = Number(parsed.version ?? 1);
       for (const record of parsed.threads ?? []) {
         const persisted = record as PersistedThread;
         if (!persisted.threadId) continue;
         const state: ThreadState = {
           ...persisted,
+          // Version 1 sessions embedded the complete host context in the
+          // preset append. Start a fresh Claude session once so those threads
+          // migrate onto the subscription-safe first-turn context layout.
+          ...(persistenceVersion < 2
+            ? { claudeSessionId: undefined, hostContextDelivered: false }
+            : {}),
           tools: [],
           usageTotal: emptyUsage(),
         };
@@ -155,10 +174,12 @@ export class ThreadStore {
       cwd: thread.cwd,
       model: thread.model,
       systemPromptAppend: thread.systemPromptAppend,
+      systemPromptIdentity: thread.systemPromptIdentity,
+      hostContextDelivered: thread.hostContextDelivered,
     }));
     mkdirSync(dirname(this.persistencePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.persistencePath}.tmp-${process.pid}`;
-    writeFileSync(temporary, JSON.stringify({ version: 1, threads: records }), {
+    writeFileSync(temporary, JSON.stringify({ version: 2, threads: records }), {
       encoding: "utf8",
       mode: 0o600,
     });

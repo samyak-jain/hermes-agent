@@ -13,11 +13,14 @@ live Python `AIAgent`. Memory, session search, approvals, file safety,
 middleware, `spawn_agent`, and channel-specific tool policy therefore use the
 same implementations as the default runtime.
 
-The appended prompt contains the user-owned behavior layers only: SOUL.md,
-gateway context, AGENTS.md or the selected project context file, built-in and
-external memories, platform hints, and memory/skill guidance. The normal
-product identity and provider-specific tool-loop instructions are omitted;
-Claude Code retains its own preset prompt.
+The preset append contains the SOUL identity plus a short host-context
+contract. The first user turn carries the complete user-owned behavior layers
+in a tagged context block: SOUL.md, gateway context, AGENTS.md or the selected
+project context file, built-in and external memories, platform hints, and
+memory/skill guidance. Claude retains that block in its resumable session.
+This avoids routing a large custom preset append through Claude's extra-usage
+path while keeping the full context. The normal product identity and
+provider-specific tool-loop instructions remain omitted.
 
 Hermes skills are made visible through `~/.claude/skills`, while Claude Code's
 separate auto-memory and auto-dream stores are disabled. App-server thread IDs,
@@ -44,10 +47,25 @@ model:
 action tools in this adapter, and every bridged call still passes through the
 host agent's policy and approval middleware.
 
-The SDK child deliberately removes `ANTHROPIC_API_KEY` so a configured API key
-cannot silently take precedence over subscription auth. Authenticate the
-container user with Claude Code and keep its credential file at
-`$HOME/.claude/.credentials.json` with mode 0600.
+The SDK child deliberately removes Anthropic API-key, OAuth-token, base-URL,
+and alternate-cloud environment overrides. Authentication therefore comes
+only from the Claude Code credential store selected by `CLAUDE_CONFIG_DIR`;
+Claude filesystem settings are disabled so an `env` or `apiKeyHelper` entry
+cannot override that credential source. Hermes side-task credentials cannot
+silently select API billing or a different account. Authenticate the container
+user with Claude Code and keep its credential file at
+`$CLAUDE_CONFIG_DIR/.credentials.json` with mode 0600.
+
+`codex --subscription-status` reads Claude's structured usage status without
+making a model request. It reports only non-secret subscription type,
+five-hour/weekly utilization, model-scoped limits, and whether extra usage is
+enabled.
+
+Use `codex --subscription-login` interactively on the machine that will run
+the adapter. It launches the Claude Code binary bundled with the Agent SDK and
+creates an independent refreshable login in `CLAUDE_CONFIG_DIR`. Do not copy a
+live `.credentials.json` between machines: Claude OAuth refreshes rotate the
+session credentials, so two copies will eventually invalidate one another.
 
 Configure OpenAI children and background self-improvement independently:
 

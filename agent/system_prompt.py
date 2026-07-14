@@ -501,6 +501,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
+def _app_server_context_length(agent: Any) -> Optional[int]:
+    context_compressor = getattr(agent, "context_compressor", None)
+    if context_compressor is None:
+        return None
+    candidate = getattr(context_compressor, "context_length", None)
+    return candidate if isinstance(candidate, int) and candidate > 0 else None
+
+
+def build_app_server_identity_prompt(agent: Any) -> str:
+    """Return only the user-owned identity suitable for a preset append."""
+    if not (agent.load_soul_identity or not agent.skip_context_files):
+        return ""
+    return _ra().load_soul_md(_app_server_context_length(agent)) or ""
+
+
 def build_app_server_system_prompt(
     agent: Any,
     system_message: Optional[str] = None,
@@ -518,12 +533,7 @@ def build_app_server_system_prompt(
     byte-stable for the lifetime of that session.
     """
     _r = _ra()
-    _ctx_len: Optional[int] = None
-    _cc = getattr(agent, "context_compressor", None)
-    if _cc is not None:
-        _candidate = getattr(_cc, "context_length", None)
-        if isinstance(_candidate, int) and _candidate > 0:
-            _ctx_len = _candidate
+    _ctx_len = _app_server_context_length(agent)
 
     parts: List[str] = []
     _soul_loaded = False

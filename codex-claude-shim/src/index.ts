@@ -2,12 +2,23 @@
 import { randomUUID } from "node:crypto";
 import { RpcConnection, RpcMethodError } from "./rpc.js";
 import { ensureRuntimeSkillsVisible } from "./skills.js";
+import { subscriptionLogin } from "./login.js";
+import { subscriptionStatus } from "./subscription.js";
 import { ThreadStore } from "./threads.js";
 import { runTurn } from "./turn.js";
 
 if (process.argv.includes("--version")) {
   process.stdout.write("codex-cli 0.130.0\n");
   process.exit(0);
+}
+
+if (process.argv.includes("--subscription-status")) {
+  process.stdout.write(`${JSON.stringify(await subscriptionStatus())}\n`);
+  process.exit(0);
+}
+
+if (process.argv.includes("--subscription-login")) {
+  process.exit(await subscriptionLogin());
 }
 
 ensureRuntimeSkillsVisible();
@@ -44,6 +55,7 @@ rpc.onRequest("thread/start", (params: any) => {
     model: params?.model,
     permissionMode: params?.permissionMode,
     systemPromptAppend: params?.systemPromptAppend,
+    systemPromptIdentity: params?.systemPromptIdentity,
     tools: Array.isArray(params?.tools) ? params.tools : [],
   });
   rpc.notify("thread/started", { thread: { id: thread.threadId } });

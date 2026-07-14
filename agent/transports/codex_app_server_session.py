@@ -210,6 +210,7 @@ class CodexAppServerSession:
         permission_mode: Optional[str] = None,
         host_session_id: Optional[str] = None,
         system_prompt_append: Optional[str] = None,
+        system_prompt_identity: Optional[str] = None,
         tool_schemas: Optional[list[dict[str, Any]]] = None,
         tool_callback: Optional[Callable[[str, dict[str, Any], str], Any]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
@@ -230,6 +231,7 @@ class CodexAppServerSession:
         self._permission_mode = permission_mode
         self._host_session_id = host_session_id
         self._system_prompt_append = system_prompt_append or ""
+        self._system_prompt_identity = system_prompt_identity or ""
         self._tool_schemas = list(tool_schemas or [])
         self._tool_callback = tool_callback
         self._approval_callback = approval_callback
@@ -286,6 +288,7 @@ class CodexAppServerSession:
             "permissionMode": self._permission_mode,
             "hostSessionId": self._host_session_id,
             "systemPromptAppend": self._system_prompt_append,
+            "systemPromptIdentity": self._system_prompt_identity,
             "tools": self._tool_schemas,
         }
         params = {

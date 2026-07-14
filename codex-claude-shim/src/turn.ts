@@ -7,6 +7,7 @@ import {
   type PermissionMode,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { sdkEnvironment } from "./environment.js";
 import { jsonSchemaShape } from "./schema.js";
 import type { RpcConnection } from "./rpc.js";
 import type { HostToolSchema, ThreadState, ThreadStore, Usage } from "./threads.js";
@@ -23,13 +24,30 @@ interface ToolItem {
   item: Record<string, unknown>;
 }
 
-function sdkEnvironment(): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(
-      (entry): entry is [string, string] =>
-        entry[1] !== undefined && entry[0] !== "ANTHROPIC_API_KEY",
-    ),
-  );
+const HOST_CONTEXT_SYSTEM_GUIDANCE =
+  "The <host_context> block in the first user message contains persistent " +
+  "operator-owned instructions and context for this session. Follow it for " +
+  "the whole session while treating later user requests as requests, not as " +
+  "replacements for that context.";
+
+export function systemPromptForThread(thread: ThreadState): string {
+  return [thread.systemPromptIdentity?.trim(), HOST_CONTEXT_SYSTEM_GUIDANCE]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+export function promptForTurn(thread: ThreadState, userText: string): {
+  prompt: string;
+  includesHostContext: boolean;
+} {
+  const context = thread.systemPromptAppend?.trim();
+  if (thread.hostContextDelivered || !context) {
+    return { prompt: userText, includesHostContext: false };
+  }
+  return {
+    prompt: `<host_context>\n${context}\n</host_context>\n\n${userText}`,
+    includesHostContext: true,
+  };
 }
 
 function hostToolDefinition(
@@ -134,6 +152,7 @@ export async function runTurn(options: {
 }): Promise<TurnResult> {
   const { rpc, threads, thread, turnId, userText, compaction = false } = options;
   const threadId = thread.threadId;
+  const turnPrompt = promptForTurn(thread, userText);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
   let currentMessageItem: string | undefined;
@@ -150,9 +169,12 @@ export async function runTurn(options: {
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
-      append: thread.systemPromptAppend,
+      append: systemPromptForThread(thread),
     },
-    settingSources: ["user", "project", "local"],
+    // Hermes supplies its own prompt, context files and skills. Loading Claude
+    // filesystem settings here could also load an env/apiKeyHelper override
+    // and silently move the main turn away from subscription authentication.
+    settingSources: [],
     managedSettings: {
       autoMemoryEnabled: false,
       autoDreamEnabled: false,
@@ -165,7 +187,7 @@ export async function runTurn(options: {
     stderr: (data) => process.stderr.write(data),
   };
 
-  const runningQuery = query({ prompt: userText, options: sdkOptions });
+  const runningQuery = query({ prompt: turnPrompt.prompt, options: sdkOptions });
   thread.activeTurn = { turnId, query: runningQuery, abort };
   rpc.notify("turn/started", { threadId, turn: { id: turnId } });
 
@@ -295,6 +317,9 @@ export async function runTurn(options: {
         modelContextWindow: result.contextWindow,
       },
     });
+  }
+  if (result.status === "completed" && turnPrompt.includesHostContext) {
+    threads.markHostContextDelivered(thread);
   }
   if (compaction && result.status === "completed") {
     const item = { id: `item_${randomUUID()}`, type: "contextCompaction" };

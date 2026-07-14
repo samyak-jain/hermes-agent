@@ -84,12 +84,16 @@ dispatches calls back through that same `AIAgent`, so `spawn_agent`,
 the current channel policy enables them. Claude Code's native action tools are
 disabled in this mode, preventing them from bypassing the host tool policy.
 
-The adapter also appends SOUL.md, the gateway system message, project context
-(including AGENTS.md), MEMORY.md, USER.md, and external-memory context to the
-Claude Code preset. It omits Hermes' default product identity and incompatible
-provider/tool-loop instructions. Skills are discovered natively through
-`~/.claude/skills`; completed calls still project into the normal transcript,
-so memory and automatic skill review retain their usual cadence.
+The adapter appends SOUL.md plus a short context contract to the Claude Code
+preset. On the first user turn it supplies the complete gateway message,
+project context (including AGENTS.md), MEMORY.md, USER.md, external-memory
+context, and memory/skill guidance in a tagged host-context block. Claude keeps
+that block in its resumable session, while the smaller preset append stays on
+the subscription's included-usage path. It omits Hermes' default product
+identity and incompatible provider/tool-loop instructions. Skills are
+discovered natively through `~/.claude/skills`; completed calls still project
+into the normal transcript, so memory and automatic skill review retain their
+usual cadence.
 
 ## Workflow features (`/goal`, kanban, cron)
 
@@ -212,12 +216,17 @@ model:
     post_tool_quiet_timeout: 300
 ```
 
-The adapter removes `ANTHROPIC_API_KEY` from the SDK child environment so a
-configured key cannot silently override Claude subscription authentication.
-Log in as the runtime user and keep the resulting
-`~/.claude/.credentials.json` private. When the main provider is Anthropic,
-configure `delegation` and `auxiliary.background_review` explicitly if child
-agents and self-improvement review should use a different provider such as
+The adapter removes API keys, authorization tokens, custom endpoints and
+alternate-cloud selectors from the SDK child environment, and disables Claude
+filesystem settings so they cannot override subscription authentication. Run
+`codex --subscription-login` interactively as the runtime user on the machine
+that will run the adapter, then verify the non-secret usage state with
+`codex --subscription-status`. Keep the resulting
+`~/.claude/.credentials.json` private. Do not copy a live credential file
+between machines: OAuth refreshes rotate that login session, so two copies can
+invalidate each other. When the main provider is Anthropic, configure
+`delegation` and `auxiliary.background_review` explicitly if child agents and
+self-improvement review should use a different provider such as
 `openai-codex`.
 
 ## Self-improvement loop (memory + skill nudges)
