@@ -1913,6 +1913,8 @@ DEFAULT_CONFIG = {
         # legacy preserves parent/toolset inheritance. all_configured uses the
         # parent's configured universe before subtracting the child blocklist.
         "child_tool_policy": {"mode": "legacy"},
+        # Optional task-scoped terminal backend for delegated children.
+        "child_terminal": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
