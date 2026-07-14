@@ -1191,12 +1191,6 @@ def get_task_env_config(task_id: Optional[str]) -> Dict[str, Any]:
     overrides = resolve_task_overrides(task_id)
     supported = {
         "env_type",
-        "cwd",
-        "timeout",
-        "docker_image",
-        "singularity_image",
-        "modal_image",
-        "daytona_image",
         "ssh_host",
         "ssh_user",
         "ssh_port",

@@ -71,8 +71,8 @@ def test_task_override_changes_child_not_parent(monkeypatch):
         parent = terminal_tool.get_task_env_config(None)
 
         assert child["env_type"] == "ssh"
-        assert child["cwd"] == "/data"
         assert child["ssh_sync_files"] is False
+        assert terminal_tool.resolve_task_overrides(task_id)["cwd"] == "/data"
         assert parent["env_type"] == "local"
         assert terminal_tool._resolve_container_task_id(task_id) == task_id
         assert _terminal_env_type_for_task(task_id) == "ssh"
