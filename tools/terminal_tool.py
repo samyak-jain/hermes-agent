@@ -1078,9 +1078,13 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     per-task sandbox settings (e.g., a custom Dockerfile for the Modal image).
 
     Supported override keys:
+        - env_type: str -- Terminal backend for this task only
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - ssh_host/ssh_user/ssh_port/ssh_key: SSH connection settings
+        - ssh_known_hosts_file: str -- Pinned SSH known-hosts file
+        - ssh_sync_files: bool -- Whether to sync Hermes files to the remote
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1173,6 +1177,37 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
+
+
+def get_task_env_config(task_id: Optional[str]) -> Dict[str, Any]:
+    """Return terminal configuration with trusted per-task overrides applied.
+
+    The process-wide environment remains authoritative for ordinary sessions.
+    Infrastructure callers can register a task-specific backend before an
+    agent run, allowing a child to execute remotely without changing its
+    parent's terminal environment or mutating process-global ``os.environ``.
+    """
+    config = dict(_get_env_config())
+    overrides = resolve_task_overrides(task_id)
+    supported = {
+        "env_type",
+        "cwd",
+        "timeout",
+        "docker_image",
+        "singularity_image",
+        "modal_image",
+        "daytona_image",
+        "ssh_host",
+        "ssh_user",
+        "ssh_port",
+        "ssh_key",
+        "ssh_known_hosts_file",
+        "ssh_sync_files",
+    }
+    for key in supported:
+        if key in overrides:
+            config[key] = overrides[key]
+    return config
 
 
 # Configuration from environment variables
@@ -1528,6 +1563,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             user=ssh_config["user"],
             port=ssh_config.get("port", 22),
             key_path=ssh_config.get("key", ""),
+            known_hosts_path=ssh_config.get("known_hosts_file", ""),
+            sync_files=ssh_config.get("sync_files", True),
             cwd=cwd,
             timeout=timeout,
         )
@@ -2064,7 +2101,7 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         # Get configuration
-        config = _get_env_config()
+        config = get_task_env_config(task_id)
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
@@ -2194,6 +2231,8 @@ def terminal_tool(
                                 "user": config.get("ssh_user", ""),
                                 "port": config.get("ssh_port", 22),
                                 "key": config.get("ssh_key", ""),
+                                "known_hosts_file": config.get("ssh_known_hosts_file", ""),
+                                "sync_files": config.get("ssh_sync_files", True),
                                 "persistent": config.get("ssh_persistent", False),
                             }
 
