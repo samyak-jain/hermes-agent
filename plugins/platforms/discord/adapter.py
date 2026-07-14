@@ -4701,6 +4701,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         async def _typing_loop() -> None:
+            typing_task = asyncio.current_task()
             try:
                 while True:
                     try:
@@ -4731,7 +4732,14 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # stop_typing() removes the current entry before awaiting its
+                # cancellation.  A concurrent generic refresh can install a
+                # replacement during that await, so only remove the entry if
+                # this task still owns it.  Otherwise the replacement becomes
+                # untracked and can keep Discord's typing indicator alive
+                # indefinitely.
+                if self._typing_tasks.get(chat_id) is typing_task:
+                    self._typing_tasks.pop(chat_id, None)
 
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
