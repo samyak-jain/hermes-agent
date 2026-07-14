@@ -17584,7 +17584,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
             else:
-                msg = f"{emoji} {tool_name}..."
+                from agent.display import get_tool_verb
+
+                # A tool can legitimately have no safe/useful argument
+                # preview (for example a batched memory update).  Keep the
+                # friendly action label instead of falling back to a raw
+                # implementation name such as ``memory...``.
+                _verb = get_tool_verb(tool_name)
+                msg = f"{emoji} {_verb}" if _verb else f"{emoji} {tool_name}..."
                 last_was_terminal_block[0] = False
             
             # Dedup: collapse consecutive identical progress messages.

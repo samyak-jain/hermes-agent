@@ -145,6 +145,32 @@ class FakeAgent:
         }
 
 
+class HostToolProgressAgent:
+    """Emits the host-tool events produced by the Claude app-server bridge."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started",
+            "spawn_agent",
+            "OAuth status",
+            {"label": "OAuth status", "prompt": "long private prompt"},
+        )
+        cb(
+            "tool.started",
+            "memory",
+            "",
+            {"operations": [{"action": "add", "content": "private"}]},
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -826,6 +852,32 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_host_tool_progress_uses_friendly_non_redundant_labels(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        HostToolProgressAgent,
+        session_id="sess-host-tool-labels",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "cleanup_progress": False,
+            }
+        },
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "done"
+    rendered = "\n".join(call["content"] for call in adapter.sent + adapter.edits)
+    assert "Spawning agent OAuth status" in rendered
+    assert "Updating memory" in rendered
+    assert 'spawn_agent: "spawn_agent"' not in rendered
+    assert "Updating memory memory" not in rendered
+    assert "long private prompt" not in rendered
+    assert "private" not in rendered
 
 
 @pytest.mark.asyncio
