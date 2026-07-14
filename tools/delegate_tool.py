@@ -163,6 +163,77 @@ def _get_child_tool_policy_mode(cfg: Optional[dict] = None) -> str:
         return "deny_all"
     return mode
 
+
+def _get_child_terminal_overrides(cfg: Optional[dict] = None) -> Dict[str, Any]:
+    """Resolve the trusted terminal backend applied only to child tasks.
+
+    ``delegation.child_terminal`` is infrastructure configuration, never a
+    model argument. A host file can provide the SSH address at spawn time so
+    dynamic container addresses do not need to be copied into config.yaml.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    raw = cfg.get("child_terminal")
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("delegation.child_terminal must be a mapping")
+
+    backend = str(raw.get("backend") or "").strip().lower()
+    supported_backends = {
+        "local", "docker", "singularity", "modal", "daytona", "ssh",
+    }
+    if backend not in supported_backends:
+        raise ValueError(
+            f"delegation.child_terminal.backend={backend!r} is invalid"
+        )
+
+    overrides: Dict[str, Any] = {"env_type": backend}
+    for key in (
+        "cwd",
+        "docker_image",
+        "singularity_image",
+        "modal_image",
+        "daytona_image",
+        "ssh_host",
+        "ssh_user",
+        "ssh_key",
+        "ssh_known_hosts_file",
+    ):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            overrides[key] = value.strip()
+
+    if backend == "ssh":
+        host_file = raw.get("ssh_host_file")
+        if isinstance(host_file, str) and host_file.strip():
+            try:
+                with open(os.path.expanduser(host_file.strip()), encoding="utf-8") as handle:
+                    host = handle.read().strip()
+            except OSError as exc:
+                logger.error("Could not read child SSH host file %r: %s", host_file, exc)
+                host = ""
+            if host:
+                overrides["ssh_host"] = host
+
+        try:
+            overrides["ssh_port"] = int(raw.get("ssh_port", 22))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "delegation.child_terminal.ssh_port must be an integer"
+            ) from exc
+        overrides["ssh_sync_files"] = is_truthy_value(
+            raw.get("ssh_sync_files"), default=True
+        )
+
+        if not overrides.get("ssh_host") or not overrides.get("ssh_user"):
+            raise ValueError(
+                "delegation.child_terminal SSH backend requires ssh_host (or "
+                "ssh_host_file) and ssh_user"
+            )
+
+    return overrides
+
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
@@ -1174,6 +1245,7 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
     child_policy_mode = _get_child_tool_policy_mode(delegation_cfg)
+    child_terminal_overrides = _get_child_terminal_overrides(delegation_cfg)
 
     # all_configured deliberately resolves the complete registered/configured
     # universe. Registry check functions still gate unavailable services, and
@@ -1276,7 +1348,10 @@ def _build_child_agent(
         )
     )
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = (
+        child_terminal_overrides.get("cwd")
+        or _resolve_workspace_hint(parent_agent)
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1508,6 +1583,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_terminal_overrides = dict(child_terminal_overrides)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2006,6 +2082,10 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    import uuid as _uuid
+
+    child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+    child_terminal_registered = False
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
@@ -2029,6 +2109,17 @@ def _run_single_child(
         )
 
     try:
+        child_terminal_overrides = getattr(
+            child, "_delegate_terminal_overrides", None
+        )
+        if child_terminal_overrides is None:
+            child_terminal_overrides = _get_child_terminal_overrides()
+        if child_terminal_overrides:
+            from tools.terminal_tool import register_task_env_overrides
+
+            register_task_env_overrides(child_task_id, child_terminal_overrides)
+            child_terminal_registered = True
+
         _heartbeat_thread.start()
         if child_progress_cb:
             try:
@@ -2040,9 +2131,6 @@ def _run_single_child(
         # task_id so file_state writes, active-subagents registry, and TUI
         # events all share one key.  Falls back to a fresh uuid only if the
         # pre-built id is somehow missing.
-        import uuid as _uuid
-
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         # Seed the child's session-cwd record from the parent's (cwd rearch):
         # children share the parent's container, and today they inherit the
@@ -2491,6 +2579,16 @@ def _run_single_child(
                 child.close()
         except Exception:
             logger.debug("Failed to close child agent after delegation")
+
+        if child_terminal_registered:
+            from tools.terminal_tool import cleanup_vm, clear_task_env_overrides
+
+            try:
+                cleanup_vm(child_task_id)
+            except Exception:
+                logger.debug("Failed to clean child terminal environment", exc_info=True)
+            finally:
+                clear_task_env_overrides(child_task_id)
 
 
 def _recover_tasks_from_json_string(

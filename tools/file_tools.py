@@ -173,7 +173,7 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         from tools.terminal_tool import (
             _active_environments,
             _env_lock,
-            _get_env_config,
+            get_task_env_config,
             _resolve_container_task_id,
         )
 
@@ -197,7 +197,7 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
-        cfg = _get_env_config()
+        cfg = get_task_env_config(task_id)
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
@@ -942,7 +942,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
+        get_task_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
@@ -998,7 +998,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         if terminal_env is None:
             from tools.terminal_tool import resolve_task_overrides
 
-            config = _get_env_config()
+            config = get_task_env_config(raw_task_id)
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
 
@@ -1062,6 +1062,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "user": config.get("ssh_user", ""),
                     "port": config.get("ssh_port", 22),
                     "key": config.get("ssh_key", ""),
+                    "known_hosts_file": config.get("ssh_known_hosts_file", ""),
+                    "sync_files": config.get("ssh_sync_files", True),
                     "persistent": config.get("ssh_persistent", False),
                 }
 
