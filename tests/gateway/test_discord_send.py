@@ -445,3 +445,35 @@ async def test_typing_stop_cleans_up():
 
     await adapter.stop_typing("12345")
     assert "12345" not in adapter._typing_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_typing_task_does_not_untrack_replacement():
+    """An older task's cleanup must not orphan a concurrent replacement."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = MagicMock()
+    adapter._client.http = MagicMock()
+    adapter._client.http.request = AsyncMock()
+    adapter._typing_tasks = {}
+
+    chat_id = "12345"
+    await adapter.send_typing(chat_id)
+    await asyncio.sleep(0)
+    original = adapter._typing_tasks[chat_id]
+
+    # Queue a refresh before stop_typing yields to the cancelled task.  The
+    # replacement starts after stop_typing removes the original entry but
+    # before the original task executes its finally block.
+    replacement_start = asyncio.create_task(adapter.send_typing(chat_id))
+    await adapter.stop_typing(chat_id)
+    await replacement_start
+    await asyncio.sleep(0)
+
+    replacement = adapter._typing_tasks.get(chat_id)
+    assert replacement is not None
+    assert replacement is not original
+    assert not replacement.done()
+
+    await adapter.stop_typing(chat_id)
+    assert replacement.done()
+    assert chat_id not in adapter._typing_tasks
