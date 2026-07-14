@@ -108,6 +108,10 @@ def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
         if not isinstance(args, dict):
             args = {"arguments": args}
         progress_name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
+        if server == "agent-runtime":
+            from agent.display import build_tool_preview
+
+            return progress_name, build_tool_preview(tool, args) or "", args
         return progress_name, tool, args
 
     if item_type == "dynamicToolCall":
@@ -115,7 +119,9 @@ def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
-        return tool, tool, args
+        from agent.display import build_tool_preview
+
+        return tool, build_tool_preview(tool, args) or "", args
 
     return None
 

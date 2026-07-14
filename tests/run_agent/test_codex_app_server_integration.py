@@ -728,6 +728,29 @@ class TestCodexToolProgressBridge:
             "type": "dynamicToolCall", "tool": "web_search", "arguments": {"q": "x"}}}}
         assert _codex_note_to_tool_progress(dyn)[0] == "web_search"
 
+    def test_mapper_host_tools_use_argument_aware_previews(self):
+        from agent.codex_runtime import _codex_note_to_tool_progress
+
+        spawn = {"method": "item/started", "params": {"item": {
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "spawn_agent",
+            "arguments": {"label": "OAuth status", "prompt": "long private prompt"},
+        }}}
+        assert _codex_note_to_tool_progress(spawn) == (
+            "spawn_agent",
+            "OAuth status",
+            {"label": "OAuth status", "prompt": "long private prompt"},
+        )
+
+        memory = {"method": "item/started", "params": {"item": {
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "memory",
+            "arguments": {"operations": [{"action": "add", "content": "private"}]},
+        }}}
+        assert _codex_note_to_tool_progress(memory)[0:2] == ("memory", "")
+
     def test_mapper_ignores_non_tool_items_and_other_methods(self):
         from agent.codex_runtime import _codex_note_to_tool_progress
         # agentMessage / reasoning items are not tool-shaped
@@ -769,4 +792,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-
