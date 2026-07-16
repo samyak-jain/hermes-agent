@@ -1833,6 +1833,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    agent_respond: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1900,6 +1901,11 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        agent_respond: When True, route the completed result back through the
+                originating gateway session as an internal turn so the main
+                agent can review it and respond automatically. Requires a live
+                gateway at fire time; delivery falls back to the normal cron
+                message path when the origin session cannot be reached.
 
     Returns:
         The created job dict
@@ -1937,6 +1943,7 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_agent_respond = agent_respond if isinstance(agent_respond, bool) else None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2046,6 +2053,11 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Like attach_to_session, absence preserves the historical job shape and
+    # behaviour.  Persist an explicit False so update/create callers can turn
+    # the feature off without relying on key deletion semantics.
+    if normalized_agent_respond is not None:
+        job["agent_respond"] = normalized_agent_respond
 
     with _jobs_lock():
         jobs = load_jobs()
