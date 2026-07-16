@@ -70,6 +70,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--agent-respond",
+        action="store_true",
+        help="Have the main agent review this job's result and respond automatically in its captured origin conversation (requires origin metadata and a live gateway).",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +138,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_response_group = cron_edit.add_mutually_exclusive_group()
+    cron_response_group.add_argument(
+        "--agent-respond",
+        dest="agent_respond",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable automatic main-agent response to this job's result.",
+    )
+    cron_response_group.add_argument(
+        "--no-agent-respond",
+        dest="agent_respond",
+        action="store_const",
+        const=False,
+        help="Disable automatic main-agent response to this job's result.",
     )
 
     # lifecycle actions

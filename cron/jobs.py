@@ -1087,6 +1087,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    agent_respond: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1131,6 +1132,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        agent_respond: When True, route the completed result back through the
+                originating gateway session as an internal turn so the main
+                agent can review it and respond automatically. Requires a live
+                gateway at fire time; delivery falls back to the normal cron
+                message path when the origin session cannot be reached.
 
     Returns:
         The created job dict
@@ -1163,6 +1169,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_agent_respond = agent_respond if isinstance(agent_respond, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1258,6 +1265,11 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Like attach_to_session, absence preserves the historical job shape and
+    # behaviour.  Persist an explicit False so update/create callers can turn
+    # the feature off without relying on key deletion semantics.
+    if normalized_agent_respond is not None:
+        job["agent_respond"] = normalized_agent_respond
 
     with _jobs_lock():
         jobs = load_jobs()
