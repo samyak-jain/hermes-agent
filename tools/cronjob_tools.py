@@ -293,17 +293,32 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
                 "Cron origin captured thread_id=%s for %s:%s",
                 thread_id, origin_platform, origin_chat_id,
             )
+        session_key = get_session_env("HERMES_SESSION_KEY") or None
+        # SessionSource.chat_type is not exported as its own context variable,
+        # but it is a stable component of every gateway session key:
+        # agent:<namespace>:<platform>:<chat_type>:<chat_id>[:...]. Capture it
+        # now so a later synthetic cron completion re-enters the exact same
+        # session bucket (especially per-user groups and topic threads).
+        chat_type = None
+        if session_key:
+            parts = str(session_key).split(":")
+            if len(parts) >= 5 and parts[0] == "agent":
+                chat_type = parts[3] or None
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
+            "chat_type": chat_type,
+            "session_key": session_key,
+            "profile": get_session_env("HERMES_SESSION_PROFILE") or None,
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in
             # per-user-isolated group chats — parity with interactive
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "user_name": get_session_env("HERMES_SESSION_USER_NAME") or None,
         }
     return None
 
@@ -594,6 +609,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("agent_respond"):
+        result["agent_respond"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -677,6 +694,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    agent_respond: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -750,6 +768,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                agent_respond=agent_respond,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -923,6 +942,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if agent_respond is not None:
+                updates["agent_respond"] = bool(agent_respond)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1085,6 +1106,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "agent_respond": {
+                "type": "boolean",
+                "description": "When True, the completed cron result re-enters the originating main-agent session as an internal turn, causing the main agent to review it and respond automatically. Use this when the user wants the main agent to act on a scheduled result, not merely receive a raw cron message. Requires a live gateway at fire time; otherwise Hermes falls back to normal cron delivery and mirrors the result into the origin transcript. Applies only to the origin conversation, never fan-out targets, and has no effect with deliver='local'. On update, pass False to disable."
+            },
         },
         "required": ["action"]
     }
@@ -1140,6 +1165,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        attach_to_session=args.get("attach_to_session"),
+        agent_respond=args.get("agent_respond"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

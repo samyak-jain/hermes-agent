@@ -289,6 +289,7 @@ The `hermes cron` CLI provides direct job management:
 ```bash
 hermes cron list                    # Show all jobs
 hermes cron create                  # Interactive job creation (alias: add)
+hermes cron edit <job_id> --agent-respond  # Re-enter results for an origin-backed job
 hermes cron edit <job_id>           # Edit job configuration
 hermes cron pause <job_id>          # Pause a running job
 hermes cron resume <job_id>         # Resume a paused job
