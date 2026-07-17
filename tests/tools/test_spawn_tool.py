@@ -1,4 +1,4 @@
-"""Behavior tests for the minimal fire-and-forget spawn_agent tool."""
+"""Behavior tests for the minimal background spawn_agent lifecycle tool."""
 
 from __future__ import annotations
 
@@ -47,31 +47,14 @@ def _parent():
     return parent
 
 
-def test_schema_is_static_and_minimal():
-    assert SPAWN_AGENT_SCHEMA == {
-        "name": "spawn_agent",
-        "description": (
-            "Spawn a background subagent to work on a task. Returns an id "
-            "immediately; the result arrives later as a new message — do not wait "
-            "or poll. The subagent has no memory of this conversation, so the "
-            "prompt must be self-contained (file paths, constraints, expected "
-            "output). For parallel work, call this tool multiple times in one turn."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Self-contained task description.",
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Optional 2–4 word label for status displays.",
-                },
-            },
-            "required": ["prompt"],
-        },
-    }
+def test_schema_supports_spawn_and_cancel_without_duplicating_tools():
+    assert SPAWN_AGENT_SCHEMA["name"] == "spawn_agent"
+    params = SPAWN_AGENT_SCHEMA["parameters"]
+    assert params["type"] == "object"
+    assert set(params["properties"]) == {"prompt", "label", "cancel_id"}
+    assert "required" not in params
+    assert "omit prompt" in params["properties"]["cancel_id"]["description"]
+
     from tools.registry import registry
 
     entry = registry.get_entry("spawn_agent")
@@ -97,7 +80,11 @@ def test_spawn_toolset_can_replace_delegation_toolset():
 
 def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     parent = _parent()
-    child = SimpleNamespace(close=lambda: None, interrupt=lambda reason=None: None)
+    interrupt_reasons = []
+    child = SimpleNamespace(
+        close=lambda: None,
+        interrupt=lambda reason=None: interrupt_reasons.append(reason),
+    )
     parent._active_children.append(child)
     captured = {}
 
@@ -127,7 +114,9 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
         },
     )
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build)
-    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "route-key")
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key", lambda default="": "route-key"
+    )
 
     result = json.loads(
         spawn_agent(
@@ -150,6 +139,83 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     assert child not in parent._active_children
     assert child._subagent_id is None
     assert parent.lines == [f"🔀 {result['id']} spawned: audit auth flow"]
+
+    captured["dispatch"]["interrupt_fn"]()
+    assert interrupt_reasons == ["Background subagent cancelled"]
+
+
+def test_cancel_requests_owned_spawn_by_returned_id(monkeypatch):
+    parent = _parent()
+    captured = {}
+
+    def fake_interrupt(delegation_id, **kwargs):
+        captured["delegation_id"] = delegation_id
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "route-key")
+    monkeypatch.setattr("tools.async_delegation.interrupt_delegation", fake_interrupt)
+
+    result = json.loads(spawn_agent(cancel_id=" sa_12ab34 ", parent_agent=parent))
+
+    assert result == {"id": "sa_12ab34", "status": "cancelling"}
+    assert captured == {
+        "delegation_id": "sa_12ab34",
+        "session_key": "route-key",
+        "origin_ui_session_id": "",
+        "parent_session_id": "parent-session",
+        "completion_type": "spawn_result",
+    }
+
+
+def test_cancel_rejects_ambiguous_or_unowned_requests(monkeypatch):
+    parent = _parent()
+
+    both = json.loads(
+        spawn_agent(prompt="do work", cancel_id="sa_12ab34", parent_agent=parent)
+    )
+    assert "either prompt or cancel_id" in both["error"]
+
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_delegation", lambda *a, **k: False
+    )
+    missing = json.loads(spawn_agent(cancel_id="sa_missing", parent_agent=parent))
+    assert "No running spawn_agent subagent found" in missing["error"]
+
+
+def test_cancel_interrupts_live_spawn_and_delivers_interrupted_result(monkeypatch):
+    parent = _parent()
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "interrupted", "error": "cancelled", "summary": None}
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="inspect auth",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="route-key",
+        parent_session_id="parent-session",
+        runner=runner,
+        interrupt_fn=gate.set,
+        delegation_id="sa_12ab34",
+        completion_type="spawn_result",
+        max_async_children=1,
+    )
+    assert dispatched["status"] == "dispatched"
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key", lambda default="": "route-key"
+    )
+
+    cancelled = json.loads(spawn_agent(cancel_id="sa_12ab34", parent_agent=parent))
+
+    assert cancelled == {"id": "sa_12ab34", "status": "cancelling"}
+    event = process_registry.completion_queue.get(timeout=2)
+    assert event["delegation_id"] == "sa_12ab34"
+    assert event["status"] == "interrupted"
 
 
 def test_spawn_result_success_and_failure_are_compact():
@@ -185,6 +251,18 @@ def test_spawn_result_success_and_failure_are_compact():
         '[Subagent sa_bad123 ("fallback label") FAILED — 45s]\n'
         "provider unavailable\nPartial output:\nChecked the first module."
     )
+
+    cancelled = format_process_notification(
+        {
+            "type": "spawn_result",
+            "delegation_id": "sa_stop123",
+            "label": "slow audit",
+            "status": "interrupted",
+            "error": "Background subagent cancelled",
+            "duration_seconds": 2,
+        }
+    )
+    assert cancelled == '[Subagent sa_stop123 ("slow audit") cancelled — 2s]'
 
 
 def test_async_dispatch_emits_spawn_result_event():
@@ -246,5 +324,22 @@ def test_agent_dispatch_forwards_parent_context():
         result = run_agent.AIAgent._dispatch_spawn_agent(
             agent, {"prompt": "do work", "label": "work"}
         )
+        assert result == '{"ok":true}'
+        call.assert_called_once_with(
+            prompt="do work",
+            label="work",
+            cancel_id=None,
+            parent_agent=agent,
+        )
+
+        call.reset_mock()
+        result = run_agent.AIAgent._dispatch_spawn_agent(
+            agent, {"cancel_id": "sa_123abc"}
+        )
     assert result == '{"ok":true}'
-    call.assert_called_once_with(prompt="do work", label="work", parent_agent=agent)
+    call.assert_called_once_with(
+        prompt=None,
+        label=None,
+        cancel_id="sa_123abc",
+        parent_agent=agent,
+    )

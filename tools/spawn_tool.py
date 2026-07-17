@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal fire-and-forget subagent tool.
+"""Minimal background subagent lifecycle tool.
 
 This module deliberately owns no child-agent machinery.  It adapts the
 existing delegation child builder/runner to the shared async completion rail,
@@ -19,25 +19,33 @@ logger = logging.getLogger(__name__)
 SPAWN_AGENT_SCHEMA = {
     "name": "spawn_agent",
     "description": (
-        "Spawn a background subagent to work on a task. Returns an id "
-        "immediately; the result arrives later as a new message — do not wait "
-        "or poll. The subagent has no memory of this conversation, so the "
-        "prompt must be self-contained (file paths, constraints, expected "
-        "output). For parallel work, call this tool multiple times in one turn."
+        "Spawn or cancel a background subagent. To spawn, provide a prompt; "
+        "the tool returns an id immediately and the result arrives later as a "
+        "new message — do not wait or poll. The subagent has no memory of this "
+        "conversation, so the prompt must be self-contained (file paths, "
+        "constraints, expected output). For parallel work, call this tool "
+        "multiple times in one turn. To cancel one previously spawned by this "
+        "conversation, provide its returned id as cancel_id and omit prompt."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "Self-contained task description.",
+                "description": "Self-contained task description. Omit when cancelling.",
             },
             "label": {
                 "type": "string",
                 "description": "Optional 2–4 word label for status displays.",
             },
+            "cancel_id": {
+                "type": "string",
+                "description": (
+                    "ID returned by an earlier spawn_agent call in this "
+                    "conversation. Cancels that subagent; omit prompt."
+                ),
+            },
         },
-        "required": ["prompt"],
     },
 }
 
@@ -88,14 +96,50 @@ def _delivery_route(parent_agent) -> tuple[str, str, Optional[str]]:
     return session_key, origin_ui_session_id, getattr(parent_agent, "session_id", None)
 
 
-def spawn_agent(prompt: str, label: Optional[str] = None, parent_agent=None) -> str:
-    """Build one leaf child, dispatch it in the background, and return its id."""
+def spawn_agent(
+    prompt: Optional[str] = None,
+    label: Optional[str] = None,
+    cancel_id: Optional[str] = None,
+    parent_agent=None,
+) -> str:
+    """Build one leaf child or cancel one previously dispatched by this parent."""
     from tools.registry import tool_error
 
     if parent_agent is None:
         return tool_error("spawn_agent requires a parent agent context.")
+
+    if cancel_id is not None:
+        if not isinstance(cancel_id, str) or not cancel_id.strip():
+            return tool_error("spawn_agent cancel_id must be a non-empty string.")
+        if isinstance(prompt, str) and prompt.strip():
+            return tool_error(
+                "spawn_agent accepts either prompt or cancel_id, not both."
+            )
+
+        from tools.async_delegation import interrupt_delegation
+
+        target_id = cancel_id.strip()
+        session_key, origin_ui_session_id, parent_session_id = _delivery_route(
+            parent_agent
+        )
+        interrupted = interrupt_delegation(
+            target_id,
+            session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
+            parent_session_id=parent_session_id,
+            completion_type="spawn_result",
+        )
+        if not interrupted:
+            return tool_error(
+                f"No running spawn_agent subagent found with id '{target_id}' "
+                "in this conversation."
+            )
+        return json.dumps({"id": target_id, "status": "cancelling"}, ensure_ascii=False)
+
     if not isinstance(prompt, str) or not prompt.strip():
-        return tool_error("spawn_agent requires a non-empty prompt.")
+        return tool_error(
+            "spawn_agent requires either a non-empty prompt or cancel_id."
+        )
 
     try:
         from gateway.session_context import async_delivery_supported
@@ -231,6 +275,7 @@ registry.register(
     handler=lambda args, **kw: spawn_agent(
         prompt=args.get("prompt"),
         label=args.get("label"),
+        cancel_id=args.get("cancel_id"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

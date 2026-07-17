@@ -208,6 +208,59 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_delegation_by_id_is_owner_and_type_scoped():
+    gate = threading.Event()
+    interrupted = {"count": 0}
+
+    def blocker():
+        gate.wait(timeout=5)
+        return {"status": "interrupted", "summary": None, "error": "cancelled"}
+
+    def interrupt_fn():
+        interrupted["count"] += 1
+        gate.set()
+
+    result = ad.dispatch_async_delegation(
+        goal="long spawn",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner-route",
+        parent_session_id="owner-session",
+        runner=blocker,
+        interrupt_fn=interrupt_fn,
+        max_async_children=3,
+        delegation_id="sa_12ab34",
+        completion_type="spawn_result",
+    )
+    assert result["status"] == "dispatched"
+
+    assert ad.interrupt_delegation("sa_12ab34") is False
+    assert ad.interrupt_delegation("sa_12ab34", session_key="other-route") is False
+    assert ad.interrupt_delegation(
+        "sa_12ab34",
+        session_key="owner-route",
+        completion_type="async_delegation",
+    ) is False
+    assert interrupted["count"] == 0
+
+    assert ad.interrupt_delegation(
+        "sa_12ab34",
+        parent_session_id="owner-session",
+        completion_type="spawn_result",
+    ) is True
+    assert interrupted["count"] == 1
+
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["delegation_id"] == "sa_12ab34"
+    assert evt["status"] == "interrupted"
+    assert ad.interrupt_delegation(
+        "sa_12ab34", session_key="owner-route"
+    ) is False
+
+
 def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
     for i in range(ad._MAX_RETAINED_COMPLETED + 10):
@@ -702,4 +755,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

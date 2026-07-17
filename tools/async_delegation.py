@@ -519,6 +519,58 @@ def list_async_delegations() -> List[Dict[str, Any]]:
         ]
 
 
+def interrupt_delegation(
+    delegation_id: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    completion_type: Optional[str] = None,
+) -> bool:
+    """Signal one running async delegation owned by the caller to stop.
+
+    At least one ownership selector must match the dispatch record.  This is
+    intentionally stricter than a process-global id lookup: gateway processes
+    host multiple users, so possession (or guessing) of a short delegation id
+    must not permit one conversation to interrupt another conversation's work.
+
+    ``completion_type`` lets thin adapters constrain the handle namespace;
+    ``spawn_agent`` uses it to avoid cancelling a ``delegate_task`` batch even
+    if an id is accidentally passed across the two APIs.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    selectors = (
+        ("session_key", str(session_key or "")),
+        ("origin_ui_session_id", str(origin_ui_session_id or "")),
+        ("parent_session_id", str(parent_session_id or "")),
+    )
+    if not delegation_id or not any(value for _, value in selectors):
+        return False
+
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") != "running":
+            return False
+        if completion_type and record.get("completion_type") != completion_type:
+            return False
+        if not any(
+            value and str(record.get(field) or "") == value
+            for field, value in selectors
+        ):
+            return False
+        interrupt_fn = record.get("interrupt_fn")
+
+    if not callable(interrupt_fn):
+        return False
+    try:
+        interrupt_fn()
+    except Exception as exc:
+        logger.debug("interrupt_delegation(%s) failed: %s", delegation_id, exc)
+        return False
+    logger.info("Requested interrupt for async delegation %s by id", delegation_id)
+    return True
+
+
 def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 

@@ -203,6 +203,10 @@ class TestBuildToolPreview:
         )
         assert result == "Inspect OAuth status without changing deployment"
 
+    def test_spawn_agent_cancel_previews_returned_id(self):
+        result = build_tool_preview("spawn_agent", {"cancel_id": "sa_12ab34"})
+        assert result == "sa_12ab34"
+
     def test_memory_batch_has_no_content_preview(self):
         result = build_tool_preview(
             "memory",
@@ -497,6 +501,12 @@ class TestBuildToolLabel:
             {"label": "OAuth status", "prompt": "long private prompt"},
         )
         assert label == "Spawning agent OAuth status"
+
+    def test_spawn_agent_cancel_uses_cancel_verb(self):
+        from agent.display import build_tool_label
+
+        label = build_tool_label("spawn_agent", {"cancel_id": "sa_12ab34"})
+        assert label == "Cancelling agent sa_12ab34"
 
     def test_memory_batch_uses_verb_without_echoing_contents(self):
         from agent.display import build_tool_label

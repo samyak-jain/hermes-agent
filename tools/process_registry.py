@@ -2093,7 +2093,13 @@ def _format_spawn_result(evt: dict) -> str:
 
     status = (evt.get("status") or "completed").lower()
     succeeded = status in {"completed", "success"}
-    outcome = "finished" if succeeded else "FAILED"
+    cancelled = status in {"cancelled", "canceled", "interrupted"}
+    if succeeded:
+        outcome = "finished"
+    elif cancelled:
+        outcome = "cancelled"
+    else:
+        outcome = "FAILED"
     duration = _format_age(evt.get("duration_seconds") or 0)
     lines = [f'[Subagent {spawn_id} ("{label}") {outcome} — {duration}]']
 
@@ -2102,7 +2108,7 @@ def _format_spawn_result(evt: dict) -> str:
     if succeeded:
         if summary:
             lines.append(str(summary))
-    else:
+    elif not cancelled:
         if error:
             lines.append(str(error))
         if summary:

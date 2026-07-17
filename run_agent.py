@@ -5734,6 +5734,7 @@ class AIAgent:
         return _spawn_agent(
             prompt=function_args.get("prompt"),
             label=function_args.get("label"),
+            cancel_id=function_args.get("cancel_id"),
             parent_agent=self,
         )
 
