@@ -323,6 +323,42 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _delivery_follows_stored_origin(job: Dict[str, Any]) -> bool:
+    """Whether a job's sole delivery target is its stored origin.
+
+    Older gateway-created jobs often persisted the concrete origin target
+    (for example ``discord:<channel_id>``) instead of ``origin``. Treat both
+    shapes as origin-following so a later live-session ``agent_respond`` opt-in
+    can move the response destination without leaving delivery pinned to the
+    old conversation. Fan-out targets deliberately return False.
+    """
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        return False
+    try:
+        from cron.scheduler import _resolve_delivery_targets, _target_matches_origin
+
+        targets = _resolve_delivery_targets(job)
+        if len(targets) != 1:
+            return False
+        target = targets[0]
+        return _target_matches_origin(
+            origin,
+            str(target.get("platform") or ""),
+            str(target.get("chat_id") or ""),
+            (
+                str(target["thread_id"])
+                if target.get("thread_id") is not None
+                else None
+            ),
+        )
+    except Exception:
+        # ``origin`` is the canonical origin-following spelling and needs no
+        # platform/config resolution. Keep this fallback narrow so a broken
+        # resolver cannot silently retarget an explicit destination.
+        return str(job.get("deliver") or "").strip().lower() == "origin"
+
+
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
@@ -944,6 +980,20 @@ def cronjob(
                 updates["attach_to_session"] = bool(attach_to_session)
             if agent_respond is not None:
                 updates["agent_respond"] = bool(agent_respond)
+                if agent_respond:
+                    response_origin = _origin_from_env()
+                    if response_origin:
+                        # Enabling active handoff from a live conversation is
+                        # also an explicit choice of where the main agent should
+                        # respond. Capture that conversation now. If the job's
+                        # sole delivery target followed its previous origin,
+                        # move delivery with it; otherwise preserve explicit
+                        # fan-out/local routing unless the caller supplied a new
+                        # ``deliver`` value in this same update.
+                        follows_old_origin = _delivery_follows_stored_origin(job)
+                        updates["origin"] = response_origin
+                        if deliver is None and follows_old_origin:
+                            updates["deliver"] = "origin"
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.

@@ -366,6 +366,11 @@ full-toolset main agent. A standalone CLI-created job has no captured origin
 conversation, so `--agent-respond` cannot wake a main-agent thread unless that
 job already carries origin metadata.
 
+Enabling `agent_respond` through the model tool from a live gateway
+conversation captures that conversation as the response origin. If the job's
+only delivery target followed its previous origin, delivery moves with the new
+origin. Explicit fan-out and local delivery settings are preserved.
+
 #### Flat, in-channel continuation (Slack)
 
 The thread-preferred behaviour above mints a dedicated thread on every

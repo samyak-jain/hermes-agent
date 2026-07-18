@@ -267,6 +267,78 @@ def test_job_and_model_tool_persist_agent_respond(tmp_path, monkeypatch):
     assert CRONJOB_SCHEMA["parameters"]["properties"]["agent_respond"]["type"] == "boolean"
 
 
+def test_enabling_agent_response_rebinds_legacy_origin_target(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    legacy = create_job(
+        prompt="Check the build",
+        schedule="every 1h",
+        deliver="discord:old-channel",
+        origin={
+            "platform": "discord",
+            "chat_id": "old-channel",
+            "chat_type": "group",
+        },
+    )
+    values = {
+        "HERMES_SESSION_PLATFORM": "discord",
+        "HERMES_SESSION_CHAT_ID": "dm-channel",
+        "HERMES_SESSION_USER_ID": "operator",
+        "HERMES_SESSION_KEY": "agent:main:discord:dm:dm-channel",
+    }
+
+    with patch(
+        "gateway.session_context.get_session_env",
+        side_effect=lambda name, default="": values.get(name, default),
+    ):
+        result = json.loads(
+            cronjob(
+                action="update",
+                job_id=legacy["id"],
+                agent_respond=True,
+            )
+        )
+
+    assert result["success"] is True
+    rebound = get_job(legacy["id"])
+    assert rebound["agent_respond"] is True
+    assert rebound["deliver"] == "origin"
+    assert rebound["origin"]["chat_id"] == "dm-channel"
+    assert rebound["origin"]["chat_type"] == "dm"
+    assert rebound["origin"]["session_key"] == "agent:main:discord:dm:dm-channel"
+
+
+def test_agent_response_rebind_preserves_fanout_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    job = create_job(
+        prompt="Check the build",
+        schedule="every 1h",
+        deliver="origin,discord:audit-channel",
+        origin={"platform": "discord", "chat_id": "old-channel"},
+    )
+    values = {
+        "HERMES_SESSION_PLATFORM": "discord",
+        "HERMES_SESSION_CHAT_ID": "dm-channel",
+        "HERMES_SESSION_KEY": "agent:main:discord:dm:dm-channel",
+    }
+
+    with patch(
+        "gateway.session_context.get_session_env",
+        side_effect=lambda name, default="": values.get(name, default),
+    ):
+        result = json.loads(
+            cronjob(action="update", job_id=job["id"], agent_respond=True)
+        )
+
+    assert result["success"] is True
+    rebound = get_job(job["id"])
+    assert rebound["origin"]["chat_id"] == "dm-channel"
+    assert rebound["deliver"] == "origin,discord:audit-channel"
+
+
 def test_registered_model_tool_forwards_response_and_continuation_flags():
     entry = registry.get_entry("cronjob")
 
