@@ -20,8 +20,10 @@ SPAWN_AGENT_SCHEMA = {
     "name": "spawn_agent",
     "description": (
         "Spawn or cancel a background subagent. To spawn, provide a prompt; "
-        "the tool returns an id immediately and the result arrives later as a "
-        "new message — do not wait or poll. The subagent has no memory of this "
+        "the tool returns an id and a live_transcripts path immediately, and "
+        "the result arrives later as a new message — do not wait or poll. You "
+        "can read or tail -f the transcript path while the child works. The "
+        "subagent has no memory of this "
         "conversation, so the prompt must be self-contained (file paths, "
         "constraints, expected output). For parallel work, call this tool "
         "multiple times in one turn. To cancel one previously spawned by this "
@@ -179,6 +181,22 @@ def spawn_agent(
     display_label = _display_label(clean_prompt, label)
     spawn_id = f"sa_{uuid.uuid4().hex[:6]}"
 
+    # Match delegate_task's live-view contract: pre-create the append-only
+    # transcript before dispatch so callers can attach `tail -f` immediately.
+    # The helper is deliberately best-effort and never blocks spawning when
+    # the cache directory is unavailable.
+    from tools.delegation_live_log import (
+        create_live_transcripts,
+        update_manifest_statuses,
+        wrap_progress_callback,
+    )
+
+    _live_id, live_writers, live_paths = create_live_transcripts(
+        [{"goal": clean_prompt}],
+        delegation_id=spawn_id,
+    )
+    live_writer = live_writers[0] if live_writers else None
+
     import model_tools
 
     parent_tool_names = list(model_tools._last_resolved_tool_names)
@@ -205,6 +223,13 @@ def spawn_agent(
             emit_lifecycle_hooks=False,
         )
         child._delegate_saved_tool_names = parent_tool_names
+        if live_writer is not None:
+            child.tool_progress_callback = wrap_progress_callback(
+                getattr(child, "tool_progress_callback", None),
+                live_writer,
+            )
+            if live_paths:
+                child._live_transcript_path = live_paths[0]
     finally:
         model_tools._last_resolved_tool_names = parent_tool_names
 
@@ -216,18 +241,35 @@ def spawn_agent(
     def runner() -> Dict[str, Any]:
         from tools.delegate_tool import _apply_summary_budget
 
-        result = _run_single_child(0, clean_prompt, child, parent_agent)
-        _apply_summary_budget([result], parent_agent)
-        result.pop("_child_role", None)
-        child_cost = result.pop("_child_cost_usd", 0.0)
         try:
-            parent_cost = float(
-                getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0
-            )
-            parent_agent.session_estimated_cost_usd = parent_cost + float(child_cost or 0.0)
-        except (TypeError, ValueError):
-            pass
-        return result
+            result = _run_single_child(0, clean_prompt, child, parent_agent)
+            _apply_summary_budget([result], parent_agent)
+            result.pop("_child_role", None)
+            child_cost = result.pop("_child_cost_usd", 0.0)
+            try:
+                parent_cost = float(
+                    getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0
+                )
+                parent_agent.session_estimated_cost_usd = parent_cost + float(child_cost or 0.0)
+            except (TypeError, ValueError):
+                pass
+            if live_paths:
+                result["live_transcript"] = live_paths[0]
+                result["live_transcripts"] = list(live_paths)
+            if live_writer is not None:
+                live_writer.finalize(result)
+            update_manifest_statuses(_live_id, [result])
+            return result
+        except Exception as exc:
+            failed = {
+                "task_index": 0,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            if live_writer is not None:
+                live_writer.finalize(failed)
+            update_manifest_statuses(_live_id, [failed])
+            raise
 
     def interrupt() -> None:
         if hasattr(child, "interrupt"):
@@ -253,6 +295,14 @@ def spawn_agent(
         label=display_label,
     )
     if dispatch.get("status") != "dispatched":
+        failed = {
+            "task_index": 0,
+            "status": "error",
+            "error": dispatch.get("error") or "Failed to spawn background subagent.",
+        }
+        if live_writer is not None:
+            live_writer.finalize(failed)
+        update_manifest_statuses(_live_id, [failed])
         try:
             child.close()
         except Exception:
@@ -262,7 +312,14 @@ def spawn_agent(
     from tools.delegate_tool import _emit_parent_console
 
     _emit_parent_console(parent_agent, f"🔀 {spawn_id} spawned: {display_label}")
-    return json.dumps({"id": spawn_id, "status": "running"}, ensure_ascii=False)
+    payload: Dict[str, Any] = {"id": spawn_id, "status": "running"}
+    if live_paths:
+        payload["live_transcripts"] = list(live_paths)
+        payload["live_transcripts_hint"] = (
+            "The subagent streams a human-readable transcript to this "
+            "append-only file. Read it or use `tail -f` to watch progress."
+        )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 from tools.delegate_tool import check_delegate_requirements

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -129,6 +130,9 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     assert result["status"] == "running"
     assert result["id"].startswith("sa_")
     assert len(result["id"]) == 9
+    assert result["live_transcripts"] == [child._live_transcript_path]
+    assert Path(result["live_transcripts"][0]).exists()
+    assert "tail -f" in result["live_transcripts_hint"]
     assert captured["build"]["role"] == "leaf"
     assert captured["build"]["toolsets"] is None
     assert captured["build"]["relay_progress"] is False
@@ -142,6 +146,77 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
 
     captured["dispatch"]["interrupt_fn"]()
     assert interrupt_reasons == ["Background subagent cancelled"]
+
+
+def test_spawn_live_transcript_streams_and_finalizes(monkeypatch, tmp_path):
+    from tools import delegation_live_log as dll
+
+    parent = _parent()
+    child = SimpleNamespace(close=lambda: None, tool_progress_callback=None)
+    parent._active_children.append(child)
+    captured = {}
+
+    monkeypatch.setattr(dll, "live_transcript_root", lambda: tmp_path / "live")
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
+    monkeypatch.setattr("tools.delegate_tool._get_max_concurrent_children", lambda: 3)
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda cfg, agent: {
+            "model": "child-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **kw: child)
+
+    def fake_run(*args, **kwargs):
+        child.tool_progress_callback("_thinking", "checking the code")
+        child.tool_progress_callback(
+            "tool.started", "terminal", "pytest -q", {"command": "pytest -q"}
+        )
+        child.tool_progress_callback(
+            "tool.completed", "terminal", None, None,
+            duration=0.2, is_error=False, result="1 passed",
+        )
+        return {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "duration_seconds": 0.2,
+        }
+
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", fake_run)
+
+    def fake_dispatch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "delegation_id": kwargs["delegation_id"]}
+
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation", fake_dispatch)
+
+    out = json.loads(spawn_agent("inspect the code", parent_agent=parent))
+    path = Path(out["live_transcripts"][0])
+    assert path.exists()
+    assert path.parent.name == out["id"]
+
+    result = captured["runner"]()
+    text = path.read_text(encoding="utf-8")
+    assert "checking the code" in text
+    assert "-> terminal(pytest -q)" in text
+    assert "terminal ok 0.2s: 1 passed" in text
+    assert "end status=completed" in text
+    assert result["live_transcript"] == str(path)
+    assert result["live_transcripts"] == [str(path)]
+
+    manifest = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["tasks"][0]["status"] == "completed"
 
 
 def test_cancel_requests_owned_spawn_by_returned_id(monkeypatch):
@@ -277,6 +352,8 @@ def test_async_dispatch_emits_spawn_result_event():
             "status": "completed",
             "summary": "done",
             "duration_seconds": 1,
+            "live_transcript": "/tmp/live/sa_abcdef/task-0.log",
+            "live_transcripts": ["/tmp/live/sa_abcdef/task-0.log"],
         },
         delegation_id="sa_abcdef",
         completion_type="spawn_result",
@@ -288,6 +365,8 @@ def test_async_dispatch_emits_spawn_result_event():
     assert evt["type"] == "spawn_result"
     assert evt["label"] == "inspect code"
     assert evt["session_key"] == "owner"
+    assert evt["live_transcript"] == "/tmp/live/sa_abcdef/task-0.log"
+    assert evt["live_transcripts"] == ["/tmp/live/sa_abcdef/task-0.log"]
 
 
 def test_spawn_result_drain_is_session_scoped():

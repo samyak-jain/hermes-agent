@@ -642,6 +642,14 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # spawn_agent and single-task adapters may expose the same live-view side
+    # channel as delegate_task. Keep it on the routed completion so durable
+    # recovery and downstream consumers retain the audit path, without
+    # changing the payload shape for adapters that do not provide transcripts.
+    if result.get("live_transcript"):
+        evt["live_transcript"] = result["live_transcript"]
+    if result.get("live_transcripts"):
+        evt["live_transcripts"] = result["live_transcripts"]
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
