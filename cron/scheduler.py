@@ -176,6 +176,28 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _resolve_cron_tool_policy(cfg: dict):
+    """Resolve cron's exact-name tool policy, falling back to the global one.
+
+    Cron agents are constructed outside the gateway's source-policy path, but
+    scheduled jobs often need a narrower capability set than interactive main
+    agents.  A dedicated ``cron.tool_policy`` makes that boundary explicit
+    while preserving the existing global ``agent.tool_policy`` behavior when
+    the cron override is absent.  Invalid explicit input remains fail-closed
+    through ``parse_tool_policy``.
+    """
+    from agent.tool_policy import parse_tool_policy, policy_from_config
+
+    global_policy = policy_from_config(cfg or {})
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw_policy = cron_cfg.get("tool_policy") if isinstance(cron_cfg, dict) else None
+    return parse_tool_policy(
+        raw_policy,
+        source="cron.tool_policy",
+        fallback=global_policy,
+    )
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -3538,6 +3560,7 @@ def run_job(
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            tool_policy=_resolve_cron_tool_policy(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project

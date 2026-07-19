@@ -212,6 +212,30 @@ class TestExactToolPolicyValidation:
         })
         assert not [issue for issue in issues if "tool policy" in issue.message]
 
+    def test_valid_cron_policy(self):
+        issues = validate_config_structure({
+            "cron": {"tool_policy": {
+                "mode": "allowlist",
+                "tools": ["delegate_task", "memory"],
+            }},
+        })
+
+        assert not [issue for issue in issues if "cron.tool_policy" in issue.message]
+
+    def test_malformed_cron_policy_is_an_error(self):
+        issues = validate_config_structure({
+            "cron": {"tool_policy": {
+                "mode": "unrestricted",
+                "tools": ["delegate_task"],
+            }},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "cron.tool_policy" in issue.message
+            for issue in issues
+        )
+
     def test_malformed_channel_policy_is_an_error(self):
         issues = validate_config_structure({
             "platforms": {"discord": {"channel_overrides": {

@@ -5646,6 +5646,21 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 "error", _parsed_policy.error,
                 "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
             ))
+    _cron_policy = (
+        (config.get("cron") or {}).get("tool_policy")
+        if isinstance(config.get("cron"), dict)
+        else None
+    )
+    if _cron_policy is not None:
+        _parsed_cron_policy = parse_tool_policy(
+            _cron_policy,
+            source="cron.tool_policy",
+        )
+        if not _parsed_cron_policy.valid:
+            issues.append(ConfigIssue(
+                "error", _parsed_cron_policy.error,
+                "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
+            ))
     # Discord channel exceptions use the same parser. Validate both the
     # canonical nested layout and the legacy top-level platform layout.
     for _source, _raw_channel_policy in _iter_discord_channel_tool_policies(config):
