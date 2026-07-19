@@ -9,7 +9,18 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_enabled_toolsets,
+    _resolve_cron_tool_policy,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -76,6 +87,52 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronToolPolicy:
+    def test_explicit_cron_policy_overrides_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+            "cron": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["delegate_task", "skill_view"],
+                },
+            },
+        })
+
+        assert policy.source == "cron.tool_policy"
+        assert policy.allows("delegate_task")
+        assert policy.allows("skill_view")
+        assert not policy.allows("memory")
+
+    def test_absent_cron_policy_preserves_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+        })
+
+        assert policy.source == "agent.tool_policy"
+        assert policy.allows("memory")
+        assert not policy.allows("delegate_task")
+
+    def test_malformed_cron_policy_denies_all(self):
+        policy = _resolve_cron_tool_policy({
+            "cron": {"tool_policy": {"mode": "surprise"}},
+        })
+
+        assert not policy.valid
+        assert not policy.allows("delegate_task")
+        assert not policy.allows("memory")
 
 
 class TestResolveOrigin:
@@ -959,6 +1016,17 @@ class TestDeliverResultErrorReturns:
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            """
+model:
+  default: test-model
+cron:
+  tool_policy:
+    mode: allowlist
+    tools: [delegate_task, memory]
+""".lstrip(),
+            encoding="utf-8",
+        )
         job = {
             "id": "test-job",
             "name": "test",
@@ -996,6 +1064,9 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert kwargs["tool_policy"].source == "cron.tool_policy"
+        assert kwargs["tool_policy"].allows("delegate_task")
+        assert not kwargs["tool_policy"].allows("terminal")
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
