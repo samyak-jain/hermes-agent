@@ -15,6 +15,7 @@ from cron.scheduler import (
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_tool_policy,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -134,6 +135,52 @@ class TestPerJobToolsetMcpMerge:
         ):
             result = _resolve_cron_enabled_toolsets(job, {})
         assert result == ["file", "memory", "web"]
+
+
+class TestCronToolPolicy:
+    def test_explicit_cron_policy_overrides_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+            "cron": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["delegate_task", "skill_view"],
+                },
+            },
+        })
+
+        assert policy.source == "cron.tool_policy"
+        assert policy.allows("delegate_task")
+        assert policy.allows("skill_view")
+        assert not policy.allows("memory")
+
+    def test_absent_cron_policy_preserves_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+        })
+
+        assert policy.source == "agent.tool_policy"
+        assert policy.allows("memory")
+        assert not policy.allows("delegate_task")
+
+    def test_malformed_cron_policy_denies_all(self):
+        policy = _resolve_cron_tool_policy({
+            "cron": {"tool_policy": {"mode": "surprise"}},
+        })
+
+        assert not policy.valid
+        assert not policy.allows("delegate_task")
+        assert not policy.allows("memory")
 
 
 class TestResolveOrigin:
@@ -537,6 +584,17 @@ class TestDeliverResultErrorReturns:
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            """
+model:
+  default: test-model
+cron:
+  tool_policy:
+    mode: allowlist
+    tools: [delegate_task, memory]
+""".lstrip(),
+            encoding="utf-8",
+        )
         job = {
             "id": "test-job",
             "name": "test",
@@ -577,6 +635,9 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_id"].startswith("cron_test-job_")
         original_session_id = kwargs["session_id"]
         fake_db.get_compression_tip.assert_called_once_with(original_session_id)
+        assert kwargs["tool_policy"].source == "cron.tool_policy"
+        assert kwargs["tool_policy"].allows("delegate_task")
+        assert not kwargs["tool_policy"].allows("terminal")
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0] == original_session_id
@@ -2785,9 +2846,6 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-
-
 
 class TestFailureStreakNudge:
     """Poke-inspired repeated-failure review nudge (_failure_streak_nudge)."""
