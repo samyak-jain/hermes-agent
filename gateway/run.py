@@ -2864,6 +2864,10 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "cron_result":
+        text = evt.get("text")
+        return str(text) if text else None
+
     return None
 
 
@@ -2887,7 +2891,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type in {"async_delegation", "spawn_result"}:
+        elif evt_type in {"async_delegation", "spawn_result", "cron_result"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -16983,10 +16987,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
+            chat_name=str(evt.get("chat_name") or "").strip() or None,
             chat_type=chat_type,
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            profile=str(evt.get("profile") or "").strip() or None,
         )
 
     async def _inject_watch_notification(
@@ -17017,7 +17023,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return None
         try:
-            metadata = {}
+            raw_metadata = evt.get("event_metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
@@ -17027,6 +17034,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
+                media_urls=evt.get("media_urls") or [],
                 metadata=metadata,
             )
             logger.info(
@@ -17052,8 +17060,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rather than risking suppression of a real completion.
         """
         evt_type = str(evt.get("type") or "")
-        if evt_type == "async_delegation":
+        if evt_type in {"async_delegation", "spawn_result"}:
             producer_id = str(evt.get("delegation_id") or "")
+            return (evt_type, producer_id, "") if producer_id else None
+        if evt_type == "cron_result":
+            producer_id = str(evt.get("execution_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
@@ -17076,7 +17087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
+        if evt.get("type") in {"async_delegation", "spawn_result"}:
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
@@ -17171,7 +17182,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt["thread_id"] = parsed["thread_id"]
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async-delegation completions and inject them as new turns.
+        """Drain routed background completions and inject them as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
@@ -17180,9 +17191,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subagent finishes while no agent turn is running, its result still
         re-enters the originating session promptly.
 
-        Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
-        queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        Cron ``agent_respond`` handoffs share this delivery seam so transient
+        adapter failures are retried and one execution cannot inject twice.
+        Other event types remain owned by ``_run_process_watcher`` or the
+        post-turn watch drain.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
@@ -17198,7 +17210,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") in {"async_delegation", "spawn_result"}:
+                    if evt.get("type") in {
+                        "async_delegation", "spawn_result", "cron_result",
+                    }:
                         async_events.append(evt)
                     else:
                         requeue.append(evt)

@@ -472,6 +472,31 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
 
 
+def test_spawn_result_uses_same_durable_delivery_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "spawn_claim",
+        "completion_type": "spawn_result",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    event = {
+        "type": "spawn_result",
+        "delegation_id": "spawn_claim",
+        "status": "completed",
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+    assert ad.get_durable_delegation("spawn_claim")["delivery_state"] == "delivered"
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------

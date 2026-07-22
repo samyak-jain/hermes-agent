@@ -223,7 +223,7 @@ def _get_child_terminal_overrides(cfg: Optional[dict] = None) -> Dict[str, Any]:
                 "delegation.child_terminal.ssh_port must be an integer"
             ) from exc
         overrides["ssh_sync_files"] = is_truthy_value(
-            raw.get("ssh_sync_files"), default=True
+            raw.get("ssh_sync_files"), default=False
         )
 
         if not overrides.get("ssh_host") or not overrides.get("ssh_user"):
@@ -886,6 +886,15 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
+def _seed_child_session_cwd(child_task_id: str, parent_task_id: Optional[str]) -> None:
+    """Inherit the parent cwd without overwriting a child backend override."""
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+    if get_session_cwd(child_task_id):
+        return
+    record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+
+
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
@@ -925,6 +934,23 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
         if defn.get("tools")
         and set(defn.get("tools", ())).issubset(blocked_names)
     )
+
+
+def _unscoped_blocked_tools_for_role(role: str) -> frozenset[str]:
+    """Return blocked names that cannot be represented by a toolset deny.
+
+    Upstream's ``disabled_toolsets`` subtraction is the primary delegated-child
+    security boundary and survives schema refreshes. A small number of
+    gateway-injected tools (currently ``send_message``) have no owning toolset,
+    so the exact-name policy remains only for that residual set.
+    """
+    blocked_names = set(DELEGATE_BLOCKED_TOOLS)
+    if role == "orchestrator":
+        blocked_names.discard("delegate_task")
+    covered_names: set[str] = set()
+    for toolset_name in _blocked_toolsets_for_role(role):
+        covered_names.update(TOOLSETS.get(toolset_name, {}).get("tools", ()))
+    return frozenset(blocked_names - covered_names)
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:
@@ -1335,15 +1361,12 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     from agent.tool_policy import ToolAccessPolicy
-    child_denied_names = set(DELEGATE_BLOCKED_TOOLS)
-    if effective_role == "orchestrator":
-        child_denied_names.discard("delegate_task")
     child_exact_policy = (
         ToolAccessPolicy(mode="allowlist", source="delegation.invalid")
         if child_policy_mode == "deny_all"
         else ToolAccessPolicy(
             mode="denylist",
-            denied_names=frozenset(child_denied_names),
+            denied_names=_unscoped_blocked_tools_for_role(effective_role),
             source=f"delegation.{effective_role}",
         )
     )
@@ -2139,9 +2162,7 @@ def _run_single_child(
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
         try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
-
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            _seed_child_session_cwd(child_task_id, parent_task_id)
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()

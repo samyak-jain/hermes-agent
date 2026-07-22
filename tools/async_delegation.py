@@ -325,7 +325,7 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") != "async_delegation":
+    if evt.get("type") not in {"async_delegation", "spawn_result"}:
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
@@ -363,12 +363,12 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if claim_id and evt.get("type") in {"async_delegation", "spawn_result"}:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if claim_id and evt.get("type") in {"async_delegation", "spawn_result"}:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 

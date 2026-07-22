@@ -728,12 +728,12 @@ def _inject_cron_agent_response(
     thread_id: Optional[str],
     loop,
 ) -> bool:
-    """Schedule a cron completion as an internal turn in its origin session.
+    """Queue a cron completion for the gateway's synthetic-turn pipeline.
 
-    Returns True once the live gateway loop accepts the event.  False means the
-    caller must preserve the normal cron delivery/mirror behaviour.  The main
-    agent turn itself is intentionally fire-and-forget so a long response does
-    not block the scheduler worker.
+    Returns True once the live gateway accepts ownership through its shared
+    completion queue. False means the caller must preserve the normal cron
+    delivery/mirror behaviour. The gateway retries transient adapter failures
+    and deduplicates a producer-stable ``execution_id`` within its lifecycle.
     """
     if job.get("agent_respond") is not True:
         return False
@@ -756,9 +756,8 @@ def _inject_cron_agent_response(
         return False
 
     try:
-        from agent.async_utils import safe_schedule_threadsafe
-        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
-        from gateway.session import SessionSource
+        from gateway.platforms.base import BasePlatformAdapter
+        from tools.process_registry import process_registry
 
         media_files, _ = BasePlatformAdapter.extract_media(content)
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -767,55 +766,31 @@ def _inject_cron_agent_response(
             # New jobs capture chat_type from their exact session key. This is
             # only a compatibility fallback for hand-edited/legacy records.
             chat_type = "thread" if thread_id else "dm"
-        source = SessionSource(
-            platform=platform,
-            chat_id=str(chat_id),
-            chat_name=origin.get("chat_name"),
-            chat_type=chat_type,
-            user_id=str(origin.get("user_id")) if origin.get("user_id") else None,
-            user_name=origin.get("user_name"),
-            thread_id=str(thread_id) if thread_id is not None else None,
-            profile=origin.get("profile"),
-        )
-        event = MessageEvent(
-            text=synth_text,
-            message_type=MessageType.TEXT,
-            source=source,
-            internal=True,
-            media_urls=media_files,
-            metadata={
+        execution_id = str(job.get("execution_id") or "").strip()
+        event = {
+            "type": "cron_result",
+            "execution_id": execution_id,
+            "text": synth_text,
+            "session_key": str(origin.get("session_key") or ""),
+            "platform": str(getattr(platform, "value", platform)),
+            "chat_id": str(chat_id),
+            "chat_name": origin.get("chat_name"),
+            "chat_type": chat_type,
+            "user_id": str(origin.get("user_id")) if origin.get("user_id") else "",
+            "user_name": origin.get("user_name"),
+            "thread_id": str(thread_id) if thread_id is not None else "",
+            "profile": origin.get("profile"),
+            "media_urls": [path for path, _is_voice in media_files],
+            "message_id": f"cron:{execution_id}" if execution_id else "",
+            "event_metadata": {
                 "automated_trigger": "cron_result",
                 "cron_job_id": str(job.get("id") or ""),
                 "cron_origin_session_key": str(origin.get("session_key") or ""),
             },
-        )
-        future = safe_schedule_threadsafe(
-            handle_message(event),
-            loop,
-            logger=logger,
-            log_message=f"Job '{job.get('id', '?')}': failed to schedule main-agent response",
-        )
-        if future is None:
-            return False
-
-        def _log_injection_failure(done_future) -> None:
-            try:
-                exc = done_future.exception()
-            except Exception as callback_exc:
-                logger.debug(
-                    "Job '%s': main-agent response future did not complete cleanly: %s",
-                    job.get("id", "?"), callback_exc,
-                )
-                return
-            if exc is not None:
-                logger.error(
-                    "Job '%s': main-agent response injection failed: %s",
-                    job.get("id", "?"), exc,
-                )
-
-        future.add_done_callback(_log_injection_failure)
+        }
+        process_registry.completion_queue.put(event)
         logger.info(
-            "Job '%s': injected result into main-agent session %s:%s thread=%s",
+            "Job '%s': queued result for main-agent session %s:%s thread=%s",
             job.get("id", "?"), getattr(platform, "value", platform), chat_id, thread_id,
         )
         return True

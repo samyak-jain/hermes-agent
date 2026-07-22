@@ -174,6 +174,30 @@ class TestCodexItemToPreview:
         assert preview is not None
         assert "hello" in preview
 
+    def test_agent_runtime_spawn_preview_does_not_leak_prompt(self):
+        preview = _codex_item_to_preview({
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "spawn_agent",
+            "arguments": {
+                "label": "OAuth status",
+                "prompt": "long private prompt",
+            },
+        })
+        assert preview == "OAuth status"
+        assert "private prompt" not in preview
+
+    def test_agent_runtime_memory_preview_does_not_leak_contents(self):
+        preview = _codex_item_to_preview({
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "memory",
+            "arguments": {
+                "operations": [{"action": "add", "content": "private"}],
+            },
+        })
+        assert preview is None
+
     def test_empty_args_returns_none(self):
         assert _codex_item_to_preview({"type": "mcpToolCall"}) is None
 

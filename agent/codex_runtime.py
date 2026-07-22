@@ -67,67 +67,6 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
     return schemas
 
 
-def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
-    """Map a Codex app-server ``item/started`` notification to a Hermes
-    tool-progress event ``(tool_name, preview, args)``.
-
-    The Codex app-server runtime processes ``item/started`` notifications for
-    command execution, file changes, and MCP/dynamic tool calls, but never
-    surfaced them as Hermes tool-progress events — so gateways (Telegram, etc.)
-    showed no verbose "running X" breadcrumbs on this route while every other
-    provider did (#38835). Returns None for items that aren't tool-shaped.
-    """
-    if not isinstance(note, dict) or note.get("method") != "item/started":
-        return None
-    params = note.get("params") or {}
-    item = params.get("item") or {}
-    if not isinstance(item, dict):
-        return None
-
-    item_type = item.get("type") or ""
-    if item_type == "commandExecution":
-        command = item.get("command") or ""
-        return "exec_command", command, {"command": command, "cwd": item.get("cwd") or ""}
-
-    if item_type == "fileChange":
-        changes = item.get("changes") or []
-        preview = "file changes"
-        if isinstance(changes, list) and changes:
-            paths = [
-                str(change.get("path"))
-                for change in changes
-                if isinstance(change, dict) and change.get("path")
-            ]
-            if paths:
-                preview = ", ".join(paths[:3])
-                if len(paths) > 3:
-                    preview += f", +{len(paths) - 3} more"
-        return "apply_patch", preview, {"changes": changes}
-
-    if item_type == "mcpToolCall":
-        server = item.get("server") or "mcp"
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        progress_name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
-        if server == "agent-runtime":
-            from agent.display import build_tool_preview
-
-            return progress_name, build_tool_preview(tool, args) or "", args
-        return progress_name, tool, args
-
-    if item_type == "dynamicToolCall":
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        from agent.display import build_tool_preview
-
-        return tool, build_tool_preview(tool, args) or "", args
-
-    return None
-
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -471,6 +410,15 @@ def _codex_item_to_preview(item: dict) -> Any:
         args = item.get("arguments") or {}
         if not isinstance(args, dict) or not args:
             return None
+        # Host-tool calls can carry private prompts, memory contents, typed
+        # browser text, and similar sensitive values. Use the same
+        # argument-aware preview builder as Hermes' native execution path
+        # instead of dumping raw JSON into a gateway progress bubble.
+        if item_type == "dynamicToolCall" or item.get("server") == "agent-runtime":
+            from agent.display import build_tool_preview
+
+            tool = item.get("tool") or "unknown"
+            return build_tool_preview(tool, args) or None
         try:
             return json.dumps(args, ensure_ascii=False)[:120]
         except (TypeError, ValueError):

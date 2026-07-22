@@ -526,12 +526,6 @@ def _resolve_runtime_from_pool_entry(
 
         base_url = normalize_opencode_base_url(provider, api_mode, base_url)
 
-    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
-    # Inert when `model.openai_runtime` is unset or "auto".
-    api_mode = _maybe_apply_codex_app_server_runtime(
-        provider=provider, api_mode=api_mode, model_cfg=model_cfg
-    )
-
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 

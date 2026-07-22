@@ -2054,9 +2054,11 @@ delegation:
 `all_configured` gives children the complete registered tool universe for the
 active profile independently of the parent's exact visibility. Normal service
 checks still remove tools whose prerequisites are not configured. Hermes then
-expands composites and removes `DELEGATE_BLOCKED_TOOLS` by individual name.
-Configured MCP and plugin tools therefore reach children automatically, while
-leaf children retain Hermes's security restrictions.
+subtracts blocked capability toolsets through the same `disabled_toolsets`
+boundary used by normal agents, after composite expansion. An exact residual
+deny covers gateway-injected tools without an owning toolset. Configured MCP
+and plugin tools therefore reach children automatically, while leaf children
+retain Hermes's security restrictions across later schema refreshes.
 
 A managed Discord channel may remove the main-agent cap without tying trust to
 its model:

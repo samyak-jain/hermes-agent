@@ -84,6 +84,24 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _cron_event(execution_id="exec_duplicate"):
+    return {
+        "type": "cron_result",
+        "execution_id": execution_id,
+        "text": "[Automated cron result]",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "12345",
+        "thread_id": "678",
+        "message_id": f"cron:{execution_id}",
+        "event_metadata": {
+            "automated_trigger": "cron_result",
+            "cron_job_id": "job-1",
+        },
+    }
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -110,6 +128,49 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_awaited_once()
+
+
+def test_duplicate_cron_queue_replay_injects_once(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(dict(_cron_event()))
+    isolated.put(dict(_cron_event()))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert delivered.message_id == "cron:exec_duplicate"
+    assert delivered.metadata["automated_trigger"] == "cron_result"
+    assert delivered.metadata["cron_job_id"] == "job-1"
+
+
+def test_failed_cron_injection_is_requeued_for_retry(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_cron_event("exec-retry"))
+
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
+    )
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+
+
+def test_spawn_result_has_positive_dedup_identity():
+    assert GatewayRunner._completion_delivery_identity({
+        "type": "spawn_result",
+        "delegation_id": "spawn-1",
+    }) == ("spawn_result", "spawn-1", "")
 
 
 def test_unroutable_async_event_is_not_requeued_forever(
