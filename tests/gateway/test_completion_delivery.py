@@ -173,6 +173,41 @@ def test_spawn_result_has_positive_dedup_identity():
     }) == ("spawn_result", "spawn-1", "")
 
 
+def test_spawn_result_is_acked_and_not_restored_after_gateway_restart(
+    monkeypatch, isolated_registry,
+):
+    """A delivered spawn completion must not replay in the next process."""
+    from tools import async_delegation
+
+    event = _async_event("spawn_restart")
+    event["type"] = "spawn_result"
+    record = {
+        "delegation_id": event["delegation_id"],
+        "completion_type": event["type"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": event["dispatched_at"],
+    }
+    async_delegation._persist_dispatch(record)
+    async_delegation._persist_completion(
+        event,
+        {"status": "completed", "summary": event["summary"]},
+    )
+    isolated_registry.completion_queue.put(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "delivered"
+    assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
+
+
 def test_unroutable_async_event_is_not_requeued_forever(
     monkeypatch, isolated_registry,
 ):
