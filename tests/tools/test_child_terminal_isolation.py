@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from tools import terminal_tool
-from tools.delegate_tool import _get_child_terminal_overrides
+from tools.delegate_tool import _get_child_terminal_overrides, _seed_child_session_cwd
 from tools.environments import ssh as ssh_env
 from tools.file_tools import _terminal_env_type_for_task
 
@@ -53,6 +53,20 @@ def test_child_ssh_config_fails_closed_without_runtime_host(tmp_path: Path):
         )
 
 
+def test_child_ssh_file_sync_is_opt_in():
+    overrides = _get_child_terminal_overrides(
+        {
+            "child_terminal": {
+                "backend": "ssh",
+                "ssh_host": "10.233.1.2",
+                "ssh_user": "root",
+            }
+        }
+    )
+
+    assert overrides["ssh_sync_files"] is False
+
+
 def test_task_override_changes_child_not_parent(monkeypatch):
     task_id = "child-isolated"
     monkeypatch.setenv("TERMINAL_ENV", "local")
@@ -73,11 +87,25 @@ def test_task_override_changes_child_not_parent(monkeypatch):
         assert child["env_type"] == "ssh"
         assert child["ssh_sync_files"] is False
         assert terminal_tool.resolve_task_overrides(task_id)["cwd"] == "/data"
+        assert terminal_tool.get_session_cwd(task_id) == "/data"
         assert parent["env_type"] == "local"
         assert terminal_tool._resolve_container_task_id(task_id) == task_id
         assert _terminal_env_type_for_task(task_id) == "ssh"
     finally:
         terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_parent_cwd_seed_does_not_overwrite_explicit_child_cwd():
+    parent_id = "parent-session"
+    child_id = "child-session"
+    terminal_tool.record_session_cwd(parent_id, "/parent")
+    terminal_tool.register_task_env_overrides(child_id, {"cwd": "/child"})
+    try:
+        _seed_child_session_cwd(child_id, parent_id)
+        assert terminal_tool.get_session_cwd(child_id) == "/child"
+    finally:
+        terminal_tool.clear_session_cwd(parent_id)
+        terminal_tool.clear_task_env_overrides(child_id)
 
 
 def test_ssh_no_sync_uses_pinned_known_hosts(monkeypatch, tmp_path: Path):

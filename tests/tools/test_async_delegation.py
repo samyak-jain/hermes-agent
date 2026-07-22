@@ -555,6 +555,31 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_spawn_result_uses_same_durable_delivery_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "spawn_claim",
+        "completion_type": "spawn_result",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    event = {
+        "type": "spawn_result",
+        "delegation_id": "spawn_claim",
+        "status": "completed",
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+    assert ad.get_durable_delegation("spawn_claim")["delivery_state"] == "delivered"
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -760,8 +785,6 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-
 def test_single_task_truncation_banner_when_max_iterations():
     """A single async subagent that hit its iteration cap (exit_reason=
     max_iterations) must surface a TRUNCATED marker in the formatted result,
@@ -824,4 +847,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-

@@ -1911,9 +1911,14 @@ DEFAULT_CONFIG = {
         # schemas. The normal subagent security blocklist still applies.
         "subagent_grant_toolsets": [],
         # legacy preserves parent/toolset inheritance. all_configured uses the
-        # parent's configured universe before subtracting the child blocklist.
+        # complete configured universe, then applies the delegated-child
+        # disabled_toolsets boundary (plus an exact residual deny for tools
+        # without an owning toolset).
         "child_tool_policy": {"mode": "legacy"},
         # Optional task-scoped terminal backend for delegated children.
+        # ssh_sync_files defaults to false for this isolated backend; opt in
+        # only when the remote intentionally needs the host's Hermes files.
+        # Credentials must not cross the boundary by default.
         "child_terminal": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)

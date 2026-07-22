@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 import json
-from concurrent.futures import Future
+import queue
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from cron.jobs import create_job, get_job
@@ -29,15 +29,6 @@ def _gateway_config(*platforms):
     return cfg
 
 
-def _run_scheduled_now(coro, _loop, **_kwargs):
-    future = Future()
-    try:
-        future.set_result(asyncio.run(coro))
-    except Exception as exc:  # pragma: no cover - surfaced through assertions
-        future.set_exception(exc)
-    return future
-
-
 def test_prepare_frames_result_as_untrusted_automated_data():
     text = _prepare_cron_agent_response(
         {"id": "job-1", "name": "Morning brief"},
@@ -58,7 +49,11 @@ def test_prepare_blocks_prompt_injection_and_allows_delivery_fallback():
     assert text is None
 
 
-def test_injection_reenters_exact_origin_as_internal_event():
+def test_injection_queues_exact_origin_for_shared_gateway_delivery(monkeypatch):
+    from tools.process_registry import process_registry
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
     adapter = MagicMock()
     adapter.supports_async_delivery = True
     adapter.handle_message = AsyncMock(return_value=None)
@@ -66,6 +61,7 @@ def test_injection_reenters_exact_origin_as_internal_event():
     loop.is_running.return_value = True
     job = {
         "id": "job-1",
+        "execution_id": "exec-1",
         "name": "Build watcher",
         "agent_respond": True,
         "origin": {
@@ -81,26 +77,23 @@ def test_injection_reenters_exact_origin_as_internal_event():
         },
     }
 
-    with patch(
-        "agent.async_utils.safe_schedule_threadsafe",
-        side_effect=_run_scheduled_now,
-    ):
-        accepted = _inject_cron_agent_response(
-            job, "Build passed.", adapter, Platform.SLACK, "C123", "1700.5", loop
-        )
+    accepted = _inject_cron_agent_response(
+        job, "Build passed.", adapter, Platform.SLACK, "C123", "1700.5", loop
+    )
 
     assert accepted is True
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert event.internal is True
-    assert event.source.platform == Platform.SLACK
-    assert event.source.chat_id == "C123"
-    assert event.source.chat_type == "group"
-    assert event.source.thread_id == "1700.5"
-    assert event.source.user_id == "U42"
-    assert event.source.profile == "coder"
-    assert event.metadata["automated_trigger"] == "cron_result"
-    assert event.metadata["cron_job_id"] == "job-1"
+    adapter.handle_message.assert_not_awaited()
+    event = isolated.get_nowait()
+    assert event["type"] == "cron_result"
+    assert event["execution_id"] == "exec-1"
+    assert event["platform"] == "slack"
+    assert event["chat_id"] == "C123"
+    assert event["chat_type"] == "group"
+    assert event["thread_id"] == "1700.5"
+    assert event["user_id"] == "U42"
+    assert event["profile"] == "coder"
+    assert event["event_metadata"]["automated_trigger"] == "cron_result"
+    assert event["event_metadata"]["cron_job_id"] == "job-1"
 
 
 def test_origin_capture_preserves_session_shape_and_profile():

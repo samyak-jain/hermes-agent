@@ -755,36 +755,23 @@ class TestCodexToolProgressBridge:
         assert events == []
 
     def test_mapper_host_tools_use_argument_aware_previews(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
+        from agent.codex_runtime import _codex_item_to_preview
 
-        spawn = {"method": "item/started", "params": {"item": {
+        spawn = {
             "type": "mcpToolCall",
             "server": "agent-runtime",
             "tool": "spawn_agent",
             "arguments": {"label": "OAuth status", "prompt": "long private prompt"},
-        }}}
-        assert _codex_note_to_tool_progress(spawn) == (
-            "spawn_agent",
-            "OAuth status",
-            {"label": "OAuth status", "prompt": "long private prompt"},
-        )
+        }
+        assert _codex_item_to_preview(spawn) == "OAuth status"
 
-        memory = {"method": "item/started", "params": {"item": {
+        memory = {
             "type": "mcpToolCall",
             "server": "agent-runtime",
             "tool": "memory",
             "arguments": {"operations": [{"action": "add", "content": "private"}]},
-        }}}
-        assert _codex_note_to_tool_progress(memory)[0:2] == ("memory", "")
-
-    def test_mapper_ignores_non_tool_items_and_other_methods(self):
-        from agent.codex_runtime import _codex_note_to_tool_progress
-        # agentMessage / reasoning items are not tool-shaped
-        assert _codex_note_to_tool_progress({"method": "item/started", "params": {
-            "item": {"type": "agentMessage", "text": "hi"}}}) is None
-        # non-item/started methods
-        assert _codex_note_to_tool_progress({"method": "item/completed", "params": {}}) is None
-        assert _codex_note_to_tool_progress({}) is None
+        }
+        assert _codex_item_to_preview(memory) is None
 
     def test_session_wired_with_on_event_that_fires_tool_progress(self, monkeypatch):
         """The session is constructed with an on_event hook that, when fed an
