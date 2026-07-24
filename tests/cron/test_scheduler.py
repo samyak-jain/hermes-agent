@@ -14,6 +14,8 @@ from cron.scheduler import (
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
+    _cron_archive_prompt,
+    _register_cron_terminal,
     _resolve_cron_enabled_toolsets,
     _resolve_cron_tool_policy,
     _resolve_delivery_target,
@@ -90,6 +92,55 @@ class TestPerJobToolsetMcpMerge:
 
 
 class TestCronToolPolicy:
+    def test_broad_denylist_keeps_noninteractive_tools(self):
+        policy = _resolve_cron_tool_policy({
+            "cron": {
+                "tool_policy": {
+                    "mode": "denylist",
+                    "tools": ["clarify", "spawn_agent", "cronjob", "send_message"],
+                },
+            },
+        })
+
+        assert policy.allows("terminal")
+        assert policy.allows("browser_navigate")
+        assert policy.allows("mcp__future__tool")
+        assert policy.allows("delegate_task")
+        assert not policy.allows("spawn_agent")
+        assert not policy.allows("send_message")
+
+    def test_terminal_override_uses_validated_task_registry(self):
+        cfg = {
+            "cron": {
+                "terminal": {
+                    "backend": "ssh",
+                    "cwd": "/data",
+                    "ssh_host": "10.0.0.2",
+                    "ssh_user": "root",
+                    "ssh_sync_files": False,
+                },
+            },
+        }
+        with patch(
+            "tools.terminal_tool.register_task_env_overrides"
+        ) as register:
+            assert _register_cron_terminal("cron-session", cfg) is True
+        overrides = register.call_args.args[1]
+        assert register.call_args.args[0] == "cron-session"
+        assert overrides["env_type"] == "ssh"
+        assert overrides["cwd"] == "/data"
+        assert overrides["ssh_sync_files"] is False
+
+    def test_prompt_archive_is_omitted_by_default_and_redacted_when_enabled(self):
+        secret = "sk-" + ("x" * 30)
+        assert _cron_archive_prompt(f"token {secret}", {}) == (
+            "[omitted from archive; set cron.archive_prompt: true to retain]"
+        )
+        archived = _cron_archive_prompt(
+            f"token {secret}", {"cron": {"archive_prompt": True}}
+        )
+        assert secret not in archived
+
     def test_explicit_cron_policy_overrides_global_policy(self):
         policy = _resolve_cron_tool_policy({
             "agent": {

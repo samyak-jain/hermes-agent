@@ -55,6 +55,8 @@ logger = logging.getLogger(__name__)
 _CONTEXT_CACHE_LOCKS_GUARD = threading.Lock()
 _CONTEXT_CACHE_LOCKS: Dict[str, threading.Lock] = {}
 _CONTEXT_CACHE_FILENAME = "browserbase_contexts.json"
+_CONTEXT_SESSION_LOCKS: Dict[str, threading.Lock] = {}
+_SESSION_CONTEXT_LEASES: Dict[str, tuple[str, threading.Lock]] = {}
 
 
 class BrowserbaseBrowserProvider(BrowserProvider):
@@ -101,6 +103,26 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             )
         return config
 
+    @staticmethod
+    def _require_paid_features() -> bool:
+        """Whether an unexpected 402 must fail instead of degrading silently."""
+        try:
+            from hermes_cli.config import read_raw_config
+
+            cfg = read_raw_config() or {}
+            browser_cfg = cfg.get("browser") or {}
+            provider_cfg = (
+                browser_cfg.get("browserbase")
+                if isinstance(browser_cfg, dict)
+                else {}
+            ) or {}
+            return bool(
+                isinstance(provider_cfg, dict)
+                and provider_cfg.get("require_paid_features", False)
+            )
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
@@ -116,14 +138,22 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         except FileNotFoundError:
             return None
         except (OSError, json.JSONDecodeError, TypeError) as exc:
-            logger.warning("Could not read Browserbase context cache %s: %s", path, exc)
-            return None
+            # Silently creating a replacement context here logs the user out
+            # of every site. Fail closed so an operator can repair/restore the
+            # small cache file without losing the browser identity.
+            raise RuntimeError(
+                f"Browserbase context cache is unreadable at {path}: {exc}"
+            ) from exc
 
         if not isinstance(data, dict):
-            return None
+            raise RuntimeError(
+                f"Browserbase context cache has invalid top-level data at {path}"
+            )
         contexts = data.get("contexts")
         if not isinstance(contexts, dict):
-            return None
+            raise RuntimeError(
+                f"Browserbase context cache has no valid contexts mapping at {path}"
+            )
         context_id = contexts.get(project_id)
         return str(context_id).strip() if context_id else None
 
@@ -156,6 +186,14 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         """
         with _CONTEXT_CACHE_LOCKS_GUARD:
             return _CONTEXT_CACHE_LOCKS.setdefault(project_id, threading.Lock())
+
+    @staticmethod
+    def _context_session_lock(context_id: str) -> threading.Lock:
+        """One active Browserbase Session per persistent Context in-process."""
+        with _CONTEXT_CACHE_LOCKS_GUARD:
+            return _CONTEXT_SESSION_LOCKS.setdefault(
+                context_id, threading.Lock()
+            )
 
     def _resolve_context_id(
         self,
@@ -292,6 +330,22 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         if browser_settings:
             session_config["browserSettings"] = browser_settings
 
+        context_lease: Optional[threading.Lock] = None
+        leased_context_id = ""
+        context_cfg = browser_settings.get("context")
+        if isinstance(context_cfg, dict) and context_cfg.get("id"):
+            leased_context_id = str(context_cfg["id"])
+            context_lease = self._context_session_lock(leased_context_id)
+            # A shared persistent browser profile is mutable state. Concurrent
+            # Sessions can race cookie/storage synchronization and corrupt the
+            # login identity, so serialize them for at most the provider's
+            # maximum Session lifetime.
+            if not context_lease.acquire(timeout=21630):
+                raise RuntimeError(
+                    "Timed out waiting for the active Browserbase Session "
+                    f"using context {leased_context_id} to release"
+                )
+
         # --- Create session via API ---
 
         try:
@@ -307,6 +361,14 @@ class BrowserbaseBrowserProvider(BrowserProvider):
 
             # Handle 402 — paid features unavailable
             if response.status_code == 402:
+                if self._require_paid_features():
+                    if context_lease is not None:
+                        context_lease.release()
+                        context_lease = None
+                    raise RuntimeError(
+                        "Browserbase rejected an expected paid Session feature "
+                        f"(HTTP 402): {response.text}"
+                    )
                 if enable_keep_alive:
                     keepalive_fallback = True
                     logger.warning(
@@ -335,17 +397,36 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                         timeout=30,
                     )
         except requests.RequestException as exc:
+            if context_lease is not None:
+                context_lease.release()
             raise RuntimeError(
                 f"Browserbase API connection failed: {exc}"
             ) from exc
 
         if not response.ok:
+            if context_lease is not None:
+                context_lease.release()
             raise RuntimeError(
                 f"Failed to create Browserbase session: "
                 f"{response.status_code} {response.text}"
             )
 
-        session_data = response.json()
+        try:
+            session_data = response.json()
+            session_id = str(session_data["id"])
+            connect_url = str(session_data["connectUrl"])
+        except (ValueError, TypeError, KeyError) as exc:
+            if context_lease is not None:
+                context_lease.release()
+            raise RuntimeError(
+                "Browserbase returned an invalid Session response"
+            ) from exc
+        if context_lease is not None:
+            with _CONTEXT_CACHE_LOCKS_GUARD:
+                _SESSION_CONTEXT_LEASES[session_id] = (
+                    leased_context_id,
+                    context_lease,
+                )
         session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
 
         if enable_proxies and not proxies_fallback:
@@ -368,10 +449,24 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "Created Browserbase session %s with features: %s", session_name, feature_str
         )
 
+        context_id = None
+        context_cfg = browser_settings.get("context")
+        if isinstance(context_cfg, dict):
+            context_id = context_cfg.get("id")
+        logger.info(
+            "Browserbase session %s id=%s context=%s keepAlive=%s timeout=%s",
+            session_name,
+            session_id,
+            context_id or "<ephemeral>",
+            features_enabled["keep_alive"],
+            session_config.get("timeout", "provider-default"),
+        )
+
         return {
             "session_name": session_name,
-            "bb_session_id": session_data["id"],
-            "cdp_url": session_data["connectUrl"],
+            "bb_session_id": session_id,
+            "cdp_url": connect_url,
+            "context_id": context_id,
             "features": features_enabled,
         }
 
@@ -411,6 +506,23 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         except Exception as e:
             logger.error("Exception closing Browserbase session %s: %s", session_id, e)
             return False
+        finally:
+            with _CONTEXT_CACHE_LOCKS_GUARD:
+                lease = _SESSION_CONTEXT_LEASES.pop(str(session_id), None)
+            if lease is not None:
+                context_id, context_lock = lease
+                try:
+                    context_lock.release()
+                    logger.debug(
+                        "Released Browserbase context lease %s after session %s",
+                        context_id,
+                        session_id,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "Browserbase context lease %s was already released",
+                        context_id,
+                    )
 
     def emergency_cleanup(self, session_id: str) -> None:
         config = self._get_config_or_none()
@@ -437,6 +549,14 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             logger.debug(
                 "Emergency cleanup failed for Browserbase session %s: %s", session_id, e
             )
+        finally:
+            with _CONTEXT_CACHE_LOCKS_GUARD:
+                lease = _SESSION_CONTEXT_LEASES.pop(str(session_id), None)
+            if lease is not None:
+                try:
+                    lease[1].release()
+                except RuntimeError:
+                    pass
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {

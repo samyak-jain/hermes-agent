@@ -38,7 +38,10 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
 )
-from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.codex_event_projector import (
+    CodexEventProjector,
+    append_projected_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -550,7 +553,9 @@ class CodexAppServerSession:
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
                     if proj.messages:
-                        result.projected_messages.extend(proj.messages)
+                        append_projected_messages(
+                            result.projected_messages, proj.messages
+                        )
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
@@ -594,7 +599,9 @@ class CodexAppServerSession:
             # Project into messages
             projection = projector.project(note)
             if projection.messages:
-                result.projected_messages.extend(projection.messages)
+                append_projected_messages(
+                    result.projected_messages, projection.messages
+                )
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a
@@ -775,7 +782,9 @@ class CodexAppServerSession:
 
             projection = projector.project(note)
             if projection.messages:
-                result.projected_messages.extend(projection.messages)
+                append_projected_messages(
+                    result.projected_messages, projection.messages
+                )
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
             if projection.final_text is not None:

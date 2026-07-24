@@ -239,15 +239,16 @@ def _drain_runner():
 
 
 class TestDrainStateMachine:
-    def test_active_work_count_includes_api_and_cron_work(self, monkeypatch):
+    def test_active_work_count_includes_api_cron_and_detached_work(self, monkeypatch):
         runner, _ = _drain_runner()
         runner.adapters = {
             Platform.API_SERVER: MagicMock(active_agent_work_count=MagicMock(return_value=2))
         }
         runner._running_agents = {"session": MagicMock()}
         monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: {"job-1"})
+        monkeypatch.setattr("tools.async_delegation.active_count", lambda: 3)
 
-        assert runner._active_work_count() == 4
+        assert runner._active_work_count() == 7
 
     def test_enter_sets_flag_and_flips_state(self):
         runner, _ = _drain_runner()

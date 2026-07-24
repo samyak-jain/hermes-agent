@@ -2804,6 +2804,23 @@ def run_conversation(
                 if recovered_with_pool:
                     continue
 
+                # `usage_limit_reached` is an authoritative account-period
+                # exhaustion signal, not a transient 429. If the pool had no
+                # next account, do not spend two more identical requests on
+                # the same exhausted subscription. The normal eager-fallback
+                # block below still gets one chance to activate a configured
+                # provider; otherwise terminal handling runs immediately.
+                _error_reason = str((error_context or {}).get("reason") or "").lower()
+                _error_message = str((error_context or {}).get("message") or "").lower()
+                _definitive_usage_exhaustion = (
+                    "usage_limit_reached" in _error_reason
+                    or "gousagelimit" in _error_reason
+                    or "usage limit reached" in _error_message
+                    or "usage limit has been reached" in _error_message
+                )
+                if _definitive_usage_exhaustion:
+                    retry_count = max_retries
+
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
                 # per-image 5 MB ceiling (400 with "image exceeds 5 MB

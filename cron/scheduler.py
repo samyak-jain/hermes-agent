@@ -198,6 +198,40 @@ def _resolve_cron_tool_policy(cfg: dict):
     )
 
 
+def _cron_archive_prompt(prompt: str, cfg: dict) -> str:
+    """Return the privacy-safe prompt representation stored in run archives."""
+    cron_cfg = (cfg or {}).get("cron") or {}
+    if not isinstance(cron_cfg, dict) or not cron_cfg.get("archive_prompt", False):
+        return "[omitted from archive; set cron.archive_prompt: true to retain]"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(prompt or "", force=True)
+    except Exception:
+        logger.warning("Cron prompt redaction failed; omitting prompt from archive")
+        return "[omitted because redaction failed]"
+
+
+def _register_cron_terminal(session_id: str, cfg: dict) -> bool:
+    """Apply trusted cron.terminal settings to this cron session only."""
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw = cron_cfg.get("terminal") if isinstance(cron_cfg, dict) else None
+    if raw in (None, {}):
+        return False
+
+    # Share the validated backend schema with delegated children. The helper
+    # accepts a delegation-shaped mapping but does not otherwise depend on
+    # child-agent state.
+    from tools.delegate_tool import _get_child_terminal_overrides
+    from tools.terminal_tool import register_task_env_overrides
+
+    overrides = _get_child_terminal_overrides({"child_terminal": raw})
+    if not overrides:
+        return False
+    register_task_env_overrides(session_id, overrides)
+    return True
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -3091,6 +3125,9 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    credential_pool = None
+    _cron_terminal_registered = False
+    _cron_credential_lease_id = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -3317,8 +3354,18 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations. Scheduled work gets its own lower, explicit budget
+        # so a frequent watcher cannot inherit a 90-call interactive ceiling.
+        _cron_cfg = _cfg.get("cron") or {}
+        max_iterations = (
+            _cron_cfg.get("max_iterations")
+            if isinstance(_cron_cfg, dict)
+            else None
+        ) or _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        try:
+            max_iterations = max(1, int(max_iterations))
+        except (TypeError, ValueError):
+            max_iterations = 30
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3477,9 +3524,15 @@ def run_job(
             )
 
         fallback_model = get_fallback_chain(_cfg) or None
-        credential_pool = None
+        _cron_terminal_registered = _register_cron_terminal(
+            _cron_session_id, _cfg
+        )
+        # Keep the exact pool instance that selected runtime["api_key"] so
+        # request accounting and exhaustion attribution cannot drift to a
+        # separately loaded instance with a different current_id.
+        credential_pool = runtime.get("credential_pool")
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
-        if runtime_provider:
+        if credential_pool is None and runtime_provider:
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(runtime_provider)
@@ -3493,6 +3546,24 @@ def run_job(
                     )
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+        if credential_pool is not None:
+            try:
+                _cron_credential_lease_id = credential_pool.acquire_lease()
+                leased_entry = credential_pool.current()
+                if _cron_credential_lease_id and leased_entry is not None:
+                    runtime = dict(runtime)
+                    runtime["api_key"] = leased_entry.runtime_api_key
+                    if leased_entry.runtime_base_url:
+                        runtime["base_url"] = leased_entry.runtime_base_url
+                    logger.info(
+                        "Job '%s': leased credential %s for this run",
+                        job_id,
+                        str(_cron_credential_lease_id)[:12],
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Job '%s': credential lease unavailable: %s", job_id, e
+                )
 
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
@@ -3746,6 +3817,7 @@ def run_job(
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         
+        archived_prompt = _cron_archive_prompt(prompt, _cfg)
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -3754,7 +3826,7 @@ def run_job(
 
 ## Prompt
 
-{prompt}
+{archived_prompt}
 
 ## Response
 
@@ -3767,7 +3839,7 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+        archived_prompt = _cron_archive_prompt(prompt, locals().get("_cfg", {}))
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -3776,7 +3848,7 @@ def run_job(
 
 ## Prompt
 
-{prompt}
+{archived_prompt}
 
 ## Error
 
@@ -3860,6 +3932,26 @@ def run_job(
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+        if _cron_terminal_registered:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(_cron_session_id)
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to clear cron terminal override",
+                    job_id,
+                    exc_info=True,
+                )
+        if _cron_credential_lease_id and credential_pool is not None:
+            try:
+                credential_pool.release_lease(_cron_credential_lease_id)
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to release credential lease",
+                    job_id,
+                    exc_info=True,
+                )
 
 
 def _teardown_cron_agent(agent, job_id: str) -> None:

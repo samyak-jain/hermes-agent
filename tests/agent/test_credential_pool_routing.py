@@ -194,7 +194,10 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         assert has_retried is False  # reset after rotation
-        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None)
+        pool.mark_exhausted_and_rotate.assert_called_once_with(
+            status_code=429,
+            error_context=None,
+        )
         agent._swap_credential.assert_called_once_with(entries[1])
 
     def test_pool_exhaustion_returns_false(self):
@@ -223,7 +226,6 @@ class TestPoolRotationCycle:
         pool.mark_exhausted_and_rotate.assert_called_once_with(
             status_code=402,
             error_context=None,
-            api_key_hint=None,
         )
 
     def test_no_pool_returns_false(self):

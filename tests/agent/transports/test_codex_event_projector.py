@@ -13,6 +13,7 @@ from agent.transports.codex_event_projector import (
     CodexEventProjector,
     _deterministic_call_id,
     _format_tool_args,
+    append_projected_messages,
 )
 
 
@@ -316,3 +317,33 @@ class TestRoleAlternationInvariant:
         assert msgs[0]["role"] == "assistant"
         assert msgs[1]["role"] == "tool"
         assert msgs[1]["tool_call_id"] == msgs[0]["tool_calls"][0]["id"]
+
+    def test_multiple_agent_items_coalesce_without_synthetic_user(self) -> None:
+        projected: list[dict] = []
+        append_projected_messages(
+            projected, [{"role": "assistant", "content": "first"}]
+        )
+        append_projected_messages(
+            projected,
+            [{"role": "assistant", "content": "second", "reasoning": "why"}],
+        )
+        assert projected == [
+            {
+                "role": "assistant",
+                "content": "first\n\nsecond",
+                "reasoning": "why",
+            }
+        ]
+
+    def test_prose_then_tool_call_is_one_assistant_turn(self) -> None:
+        projected = [{"role": "assistant", "content": "I will inspect it."}]
+        tool_messages = CodexEventProjector().project(
+            COMMAND_EXEC_COMPLETED
+        ).messages
+        append_projected_messages(projected, tool_messages)
+        assert [message["role"] for message in projected] == [
+            "assistant",
+            "tool",
+        ]
+        assert projected[0]["content"] == "I will inspect it."
+        assert projected[0]["tool_calls"][0]["function"]["name"] == "exec_command"

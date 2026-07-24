@@ -937,6 +937,16 @@ def recover_with_credential_pool(
         elif status_code in {401, 403}:
             effective_reason = FailoverReason.auth
 
+    def _mark_issuing_credential_exhausted(rotate_status: int):
+        kwargs: Dict[str, Any] = {
+            "status_code": rotate_status,
+            "error_context": error_context,
+        }
+        api_key_hint = getattr(agent, "api_key", None)
+        if api_key_hint:
+            kwargs["api_key_hint"] = api_key_hint
+        return pool.mark_exhausted_and_rotate(**kwargs)
+
     if effective_reason == FailoverReason.upstream_rate_limit:
         # An upstream provider (e.g. DeepSeek behind OpenRouter) is
         # rate-limiting the aggregator's traffic — the user's credential is
@@ -958,14 +968,9 @@ def recover_with_credential_pool(
 
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=rotate_status,
-            error_context=error_context,
-            # Runtime credentials can be resolved by a separate pool instance,
-            # leaving this recovery pool without ``current_id``. Match the key
-            # that actually failed instead of quarantining a different account.
-            api_key_hint=getattr(agent, "api_key", None),
-        )
+        # Match the key that actually failed instead of quarantining whichever
+        # account an independently resolved pool happens to call current.
+        next_entry = _mark_issuing_credential_exhausted(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
@@ -989,7 +994,7 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = _mark_issuing_credential_exhausted(rotate_status)
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -1013,7 +1018,7 @@ def recover_with_credential_pool(
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = _mark_issuing_credential_exhausted(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
@@ -1113,7 +1118,7 @@ def recover_with_credential_pool(
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by try_refresh_current().
         rotate_status = status_code if status_code is not None else 401
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = _mark_issuing_credential_exhausted(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",

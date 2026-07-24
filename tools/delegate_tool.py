@@ -3473,9 +3473,10 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+            "Check `hermes auth list` and `hermes model list` for providers "
+            "actually authenticated in this profile, or set "
+            "delegation.base_url/delegation.api_key for a direct endpoint. "
+            "A configured name is not a usable fallback without runtime auth."
         ) from exc
 
     api_key = runtime.get("api_key", "")

@@ -662,6 +662,24 @@ class CDPSupervisor:
                     self._start_error = e
                     self._ready_event.set()
                     return
+                error_text = str(e).lower()
+                if (
+                    "status code 410" in error_text
+                    or "unexpected server response: 410" in error_text
+                    or "http 410" in error_text
+                    or "410 gone" in error_text
+                ):
+                    # A signed CDP endpoint for a released Browserbase session
+                    # is terminal. An endless reconnect loop only hammers the
+                    # dead URL; the next browser command owns one-shot session
+                    # recreation in the same persistent context.
+                    logger.warning(
+                        "CDP supervisor %s: session endpoint is gone (HTTP "
+                        "410); stopping reconnects until the browser command "
+                        "recreates the session",
+                        self.task_id,
+                    )
+                    return
                 logger.warning(
                     "CDP supervisor %s: connect failed (attempt %s): %s",
                     self.task_id, attempt, _redact_cdp_error_text(e),
