@@ -17044,6 +17044,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _pending_clarify = None
         if (
             allow_gateway_control
+            # Internal background/subagent/process notifications are not user
+            # replies. Keep the live clarify waiter for the actual user.
+            and not is_internal
             and _pending_clarify is not None
             and _clarify_mod is not None
         ):

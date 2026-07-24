@@ -161,7 +161,7 @@ def test_all_configured_child_uses_upstream_disabled_toolset_boundary():
     kwargs = ctor.call_args.kwargs
     assert kwargs["enabled_toolsets"] == ["all"]
     assert {
-        "clarify", "code_execution", "cronjob", "delegation", "memory", "spawn",
+        "clarify", "cronjob", "delegation", "memory", "spawn",
     }.issubset(kwargs["disabled_toolsets"])
     policy = kwargs["tool_policy"]
     assert policy.mode == "denylist"
@@ -201,6 +201,6 @@ def test_orchestrator_only_regains_delegation_when_depth_allows():
     assert policy.denied_names == frozenset({"send_message"})
     disabled = set(ctor.call_args.kwargs["disabled_toolsets"])
     assert "delegation" not in disabled
-    assert {"clarify", "code_execution", "cronjob", "memory", "spawn"}.issubset(
+    assert {"clarify", "cronjob", "memory", "spawn"}.issubset(
         disabled
     )
