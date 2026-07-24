@@ -30,7 +30,9 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    from hermes_state import apply_sqlite_storage_policy
+
+    apply_sqlite_storage_policy(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (

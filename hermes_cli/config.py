@@ -1001,6 +1001,15 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # SQLite defaults to WAL on local filesystems. Network-filesystem
+    # deployments can explicitly select a rollback journal for every Hermes
+    # connection (TRUNCATE avoids a directory-entry mutation per commit).
+    "storage": {
+        "sqlite": {
+            "journal_mode": "auto",  # auto | wal | delete | truncate
+            "synchronous": "auto",   # auto | normal | full | extra
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

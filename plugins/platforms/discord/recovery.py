@@ -38,6 +38,11 @@ class DiscordRecoveryStore:
                 path = self.path()
                 conn = sqlite3.connect(path, timeout=0.1)
                 try:
+                    from hermes_state import apply_sqlite_storage_policy
+
+                    apply_sqlite_storage_policy(
+                        conn, db_label="gateway/discord_message_recovery.db"
+                    )
                     if not self._initialized:
                         self._initialize(conn)
                         self._initialized = True
@@ -53,7 +58,6 @@ class DiscordRecoveryStore:
             return default
 
     def _initialize(self, conn: sqlite3.Connection) -> None:
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS discord_messages (
                 message_id TEXT PRIMARY KEY,
