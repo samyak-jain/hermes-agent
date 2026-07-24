@@ -8665,7 +8665,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_async_delegation_count()
         )
+
+    def _active_async_delegation_count(self) -> int:
+        """Count detached ``spawn_agent``/background delegation work.
+
+        Detached children run on ``tools.async_delegation``'s daemon executor,
+        outside ``_running_agents``.  Omitting them lets planned restarts report
+        an idle/drainable gateway and then kill those children with the process.
+        """
+        try:
+            from tools.async_delegation import active_count
+
+            return max(0, int(active_count()))
+        except Exception:
+            return 0
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -9299,12 +9314,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                # HERMES_HOME may live on a network filesystem. A delayed
+                # metadata lookup must not freeze Discord typing, health
+                # heartbeats, or every other coroutine on the gateway loop.
+                if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
-                    self._persist_active_agents()
+                    await asyncio.to_thread(self._persist_active_agents)
                 else:
                     self._exit_external_drain()
             except asyncio.CancelledError:
@@ -10717,25 +10735,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_delegation_count = self._active_async_delegation_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_delegation_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            delegation_count = self._active_async_delegation_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or delegation_count != last_delegation_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_delegation_count = delegation_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -10744,7 +10767,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_delegation_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -10765,7 +10793,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_async_delegation_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -10781,6 +10811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_async_delegation_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -14647,6 +14678,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._stop_task
             return
 
+        def _active_async_delegations_for_shutdown() -> int:
+            counter = getattr(self, "_active_async_delegation_count", None)
+            if not callable(counter):
+                return 0
+            try:
+                return max(0, int(counter()))
+            except Exception:
+                return 0
+
         async def _stop_impl() -> None:
             def _kill_tool_subprocesses(phase: str) -> list:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
@@ -14738,6 +14778,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
+                    "active_async_delegations": _active_async_delegations_for_shutdown(),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -14813,6 +14854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _delegations_at_start = _active_async_delegations_for_shutdown()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -14847,7 +14889,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "delegations_at_start=%d, delegations_now=%d)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -14857,6 +14900,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _delegations_at_start,
+                _active_async_delegations_for_shutdown(),
             )
 
             if not timed_out:
@@ -14876,12 +14921,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), and "
+                    "%d detached delegation(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _active_async_delegations_for_shutdown(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's

@@ -52,6 +52,42 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
+def append_projected_messages(target: list[dict], incoming: list[dict]) -> None:
+    """Append a projection while coalescing adjacent same-role turns.
+
+    Codex may emit multiple ``agentMessage`` items for one turn (and may emit
+    prose immediately before a tool item). Appending each item verbatim
+    creates assistant→assistant history that strict transports reject on the
+    next request. Coalescing at the projection seam preserves every text,
+    reasoning, and tool-call field without inventing a synthetic user turn.
+    """
+    for message in incoming:
+        if (
+            target
+            and target[-1].get("role") == message.get("role")
+            and message.get("role") in {"assistant", "user"}
+        ):
+            previous = target[-1]
+            old_content = previous.get("content")
+            new_content = message.get("content")
+            if new_content not in (None, ""):
+                if old_content not in (None, ""):
+                    previous["content"] = f"{old_content}\n\n{new_content}"
+                else:
+                    previous["content"] = new_content
+            for field_name in ("reasoning",):
+                new_value = message.get(field_name)
+                if new_value:
+                    old_value = previous.get(field_name)
+                    previous[field_name] = (
+                        f"{old_value}\n{new_value}" if old_value else new_value
+                    )
+            if message.get("tool_calls"):
+                previous.setdefault("tool_calls", []).extend(message["tool_calls"])
+            continue
+        target.append(message)
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.

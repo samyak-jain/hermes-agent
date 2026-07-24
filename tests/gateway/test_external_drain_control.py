@@ -256,6 +256,23 @@ def _drain_runner():
 
 class TestDrainStateMachine:
 
+    def test_active_work_count_includes_api_cron_and_detached_work(self, monkeypatch):
+        runner, _ = _drain_runner()
+        runner.adapters = {
+            Platform.API_SERVER: MagicMock(active_agent_work_count=MagicMock(return_value=2))
+        }
+        runner._running_agents = {"session": MagicMock()}
+        monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: {"job-1"})
+        monkeypatch.setattr("tools.async_delegation.active_count", lambda: 3)
+
+        assert runner._active_work_count() == 7
+
+    def test_enter_sets_flag_and_flips_state(self):
+        runner, _ = _drain_runner()
+        runner._enter_external_drain()
+        assert runner._external_drain_active is True
+        runner._update_runtime_status.assert_called_with("draining")
+
 
     def test_enter_idempotent(self):
         runner, _ = _drain_runner()
@@ -325,4 +342,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-

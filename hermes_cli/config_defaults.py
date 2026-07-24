@@ -552,6 +552,11 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        "browserbase": {
+            # Fail instead of silently dropping requested keepAlive/proxy
+            # capability when Browserbase reports that the plan lacks it.
+            "require_paid_features": False,
+        },
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.
@@ -2579,6 +2584,13 @@ DEFAULT_CONFIG = {
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
         # same setting the scheduler reads.
         "script_timeout_seconds": 3600,
+        # The live agent receives the full prompt, but diagnostic archives omit
+        # it by default because scheduled inputs often contain private data.
+        "archive_prompt": False,
+        # Per-run model/tool-loop ceiling for unattended jobs.
+        "max_iterations": 30,
+        # Optional task-scoped terminal backend for cron agents.
+        "terminal": {},
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here
