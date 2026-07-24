@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
+from gateway.run import _stream_confirmed_final_delivery
 from gateway.session import SessionSource, build_session_key
 
 
@@ -241,6 +242,35 @@ class TestOnlyFinalStreamDeliverySuppressesFinalSend:
                 response["already_sent"] = True
 
         assert "already_sent" not in response
+
+    def test_exact_delivered_final_survives_segment_flag_reset(self):
+        """A completed Codex segment retains exact delivered content even
+        though its segment-local final flags were reset."""
+        sc = SimpleNamespace(
+            already_sent=True,
+            final_response_sent=False,
+            has_delivered_text=lambda text: text == "exact final",
+        )
+
+        assert _stream_confirmed_final_delivery(
+            sc,
+            "exact final",
+            previewed=False,
+        ) is True
+
+    def test_partial_delivered_segment_does_not_suppress_final(self):
+        """The durable delivered-text check must require exact equality."""
+        sc = SimpleNamespace(
+            already_sent=True,
+            final_response_sent=False,
+            has_delivered_text=lambda text: text == "partial progress",
+        )
+
+        assert _stream_confirmed_final_delivery(
+            sc,
+            "complete final answer",
+            previewed=False,
+        ) is False
 
 
 # ===================================================================

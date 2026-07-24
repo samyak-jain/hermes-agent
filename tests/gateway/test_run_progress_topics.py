@@ -705,6 +705,45 @@ class StreamingRefineAgent:
         }
 
 
+class CodexCompletedFinalAgent:
+    """Reproduce Codex app-server's delta -> completed-message sequence."""
+
+    calls = 0
+    FINAL_TEXT = "The exact final answer from Codex."
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            if self.stream_delta_callback:
+                self.stream_delta_callback(self.FINAL_TEXT)
+            if self.interim_assistant_callback:
+                # agent/codex_runtime.py sends each completed agentMessage
+                # through the interim callback. Since this content was already
+                # streamed, the gateway closes the segment before evaluating
+                # the final result.
+                self.interim_assistant_callback(
+                    self.FINAL_TEXT,
+                    already_streamed=True,
+                )
+            return {
+                "final_response": self.FINAL_TEXT,
+                "response_previewed": False,
+                "messages": [],
+                "api_calls": 1,
+            }
+        return {
+            "final_response": "Queued follow-up complete.",
+            "response_previewed": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -1108,6 +1147,68 @@ async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
     assert all_text, "expected streamed Matrix content to be sent or edited"
     assert all("▉" not in text for text in all_text)
     assert any("Continuing to refine:" in text for text in all_text)
+
+
+@pytest.mark.asyncio
+async def test_codex_completed_final_segment_is_not_sent_twice(monkeypatch, tmp_path):
+    """An exact final stream remains confirmed after Codex closes its segment."""
+    CodexCompletedFinalAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CodexCompletedFinalAgent,
+        session_id="sess-codex-completed-final",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    delivered = [
+        call["content"]
+        for call in adapter.sent + adapter.edits
+        if call["content"] == CodexCompletedFinalAgent.FINAL_TEXT
+    ]
+    assert result.get("already_sent") is True
+    assert delivered == [CodexCompletedFinalAgent.FINAL_TEXT]
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_does_not_resend_codex_completed_final_segment(
+    monkeypatch, tmp_path,
+):
+    """Queued delivery uses the exact-text ledger after the segment reset."""
+    CodexCompletedFinalAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CodexCompletedFinalAgent,
+        session_id="sess-codex-completed-final-queued",
+        pending_text="queued follow-up",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.DISCORD,
+        chat_id="discord-dm",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    delivered = [
+        call["content"]
+        for call in adapter.sent + adapter.edits
+        if call["content"] == CodexCompletedFinalAgent.FINAL_TEXT
+    ]
+    assert CodexCompletedFinalAgent.calls == 2
+    assert result["final_response"] == "Queued follow-up complete."
+    assert delivered == [CodexCompletedFinalAgent.FINAL_TEXT]
 
 
 class TransformedStreamAgent:
