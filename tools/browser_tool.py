@@ -2303,6 +2303,7 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    _session_recovery_attempted: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -2602,6 +2603,36 @@ def _run_browser_command(
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
 
+    # A Browserbase connect URL belongs to one finite session. HTTP 410 means
+    # that session is gone; retrying the same signed URL can never recover.
+    # Release the stale record, create a fresh session in the SAME persistent
+    # Browserbase context (cookies/storage retained), and retry exactly once.
+    error_text = str(result.get("error") or "")
+    stale_cloud_session = _is_expired_cloud_session_error(
+        session_info, error_text
+    )
+    if (
+        stale_cloud_session
+        and command != "close"
+        and not _session_recovery_attempted
+    ):
+        logger.warning(
+            "Browserbase session expired for task=%s; recreating it in "
+            "persistent context %s and retrying %s once",
+            task_id,
+            session_info.get("context_id") or "<ephemeral>",
+            command,
+        )
+        cleanup_browser(task_id)
+        return _run_browser_command(
+            task_id,
+            command,
+            args,
+            timeout=timeout,
+            _engine_override=_engine_override,
+            _session_recovery_attempted=True,
+        )
+
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
@@ -2622,6 +2653,22 @@ def _run_browser_command(
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
+
+
+def _is_expired_cloud_session_error(
+    session_info: Dict[str, Any], error_text: str
+) -> bool:
+    """True only for terminal HTTP 410s from tracked cloud sessions."""
+    text = str(error_text or "").lower()
+    return bool(
+        session_info.get("bb_session_id")
+        and (
+            "http 410" in text
+            or "status code 410" in text
+            or "unexpected server response: 410" in text
+            or "410 gone" in text
+        )
+    )
 
 
 def _store_full_snapshot(snapshot_text: str) -> Optional[str]:

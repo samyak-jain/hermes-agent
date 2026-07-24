@@ -1323,6 +1323,12 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        "browserbase": {
+            # When true, HTTP 402 for requested keepAlive/proxy capability is
+            # an operator-visible failure instead of a silent retry with the
+            # paid feature removed.
+            "require_paid_features": False,
+        },
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.
@@ -2855,6 +2861,22 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Do not persist the full assembled prompt in cron output archives by
+        # default. Scheduled prompts routinely contain message bodies, names,
+        # addresses, and other private source material. The live agent still
+        # receives the complete prompt; only the diagnostic archive omits it.
+        # Operators who explicitly need prompt capture can opt in, with the
+        # normal secret redactor still applied before serialization.
+        "archive_prompt": False,
+        # Bound model/tool-loop calls for unattended jobs independently from
+        # interactive agent.max_turns. This is a per-run ceiling, not a wall
+        # clock timeout; active jobs still use the inactivity watchdog below.
+        "max_iterations": 30,
+        # Optional task-scoped terminal backend for cron agents. This has the
+        # same schema as delegation.child_terminal and routes terminal/file/
+        # code tools through the selected sandbox without changing the
+        # gateway's own terminal backend.
+        "terminal": {},
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here

@@ -491,6 +491,22 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    try:
+        from gateway.drain_control import drain_requested
+
+        if drain_requested():
+            return {
+                "status": "rejected",
+                "error": (
+                    "Gateway drain is active; new background subagents are "
+                    "temporarily disabled until the planned restart completes."
+                ),
+            }
+    except Exception:
+        # Drain control is a gateway-only facility. Non-gateway surfaces keep
+        # their existing behavior if it is unavailable.
+        pass
+
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -696,6 +712,20 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    try:
+        from gateway.drain_control import drain_requested
+
+        if drain_requested():
+            return {
+                "status": "rejected",
+                "error": (
+                    "Gateway drain is active; new background subagents are "
+                    "temporarily disabled until the planned restart completes."
+                ),
+            }
+    except Exception:
+        pass
+
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)

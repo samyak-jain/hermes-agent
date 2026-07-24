@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.browser.browserbase.provider import BrowserbaseBrowserProvider
 
 
@@ -120,8 +122,10 @@ def test_persistent_context_is_created_once_and_reused_from_profile_cache(
     )
     provider = BrowserbaseBrowserProvider()
 
-    provider.create_session("first")
-    provider.create_session("second")
+    first = provider.create_session("first")
+    provider.close_session(first["bb_session_id"])
+    second = provider.create_session("second")
+    provider.close_session(second["bb_session_id"])
 
     context_calls = [call for call in calls if call[0].endswith("/v1/contexts")]
     session_calls = [call for call in calls if call[0].endswith("/v1/sessions")]
@@ -167,3 +171,45 @@ def test_paid_proxy_fallback_removes_entire_regional_proxy_config(
     assert "proxies" not in session_payloads[1]
     assert result["features"]["proxies"] is False
     assert result["features"]["regional_proxy"] is False
+
+
+def test_required_paid_features_fail_loudly_on_402(
+    monkeypatch, tmp_path
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        BrowserbaseBrowserProvider, "_require_paid_features", lambda self: True
+    )
+    monkeypatch.setattr(
+        "plugins.browser.browserbase.provider.requests.post",
+        lambda *args, **kwargs: _response(
+            {"error": "payment required"}, status_code=402
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="expected paid Session feature"):
+        BrowserbaseBrowserProvider().create_session("task")
+
+
+def test_corrupt_context_cache_fails_without_creating_new_identity(
+    monkeypatch, tmp_path
+) -> None:
+    _configure(
+        monkeypatch,
+        tmp_path,
+        BROWSERBASE_CONTEXT_PERSIST="true",
+        BROWSERBASE_PROXIES="false",
+    )
+    cache_path = tmp_path / "state" / "browserbase_contexts.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("{broken", encoding="utf-8")
+    post_calls = []
+    monkeypatch.setattr(
+        "plugins.browser.browserbase.provider.requests.post",
+        lambda *args, **kwargs: post_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="context cache is unreadable"):
+        BrowserbaseBrowserProvider().create_session("task")
+
+    assert post_calls == []
