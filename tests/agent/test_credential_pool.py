@@ -803,6 +803,35 @@ def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     assert entry.access_token == "sk-or-seeded"
 
 
+def test_load_pool_refreshes_sources_without_replacing_shared_identity(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-first")
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.select()
+    assert entry is not None
+    lease_id = pool.acquire_lease(entry.id)
+    assert lease_id == entry.id
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-second")
+    reloaded = load_pool("openrouter")
+
+    assert reloaded is pool
+    refreshed = reloaded.entries()
+    assert len(refreshed) == 1
+    assert refreshed[0].id == entry.id
+    assert refreshed[0].access_token == "sk-or-second"
+    assert reloaded._active_leases[entry.id] == 1
+
+    reloaded.release_lease(entry.id)
+
+
 
 def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatch):
     """Runtime env keys may be used in memory but must not land in auth.json."""

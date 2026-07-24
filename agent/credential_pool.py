@@ -618,6 +618,32 @@ class CredentialPool:
     def entries(self) -> List[PooledCredential]:
         return list(self._entries)
 
+    def _reload_entries(self, entries: List[PooledCredential]) -> None:
+        """Refresh persisted/source-backed state without replacing pool identity.
+
+        ``load_pool()`` is also the synchronization point after an interactive
+        login, an env-file edit, or a suppression change.  The process-wide
+        cache must therefore retain this object (and its live lease counters)
+        while still adopting newly seeded rows from disk.
+        """
+        refreshed = sorted(entries, key=lambda entry: entry.priority)
+        refreshed_ids = {entry.id for entry in refreshed}
+        with self._lock:
+            self._entries = refreshed
+            self._strategy = get_pool_strategy(self.provider)
+            if self._current_id not in refreshed_ids:
+                self._current_id = None
+            self._active_leases = {
+                entry_id: count
+                for entry_id, count in self._active_leases.items()
+                if entry_id in refreshed_ids and count > 0
+            }
+            self._recent_refresh_aliases = {
+                token: entry_id
+                for token, entry_id in self._recent_refresh_aliases.items()
+                if entry_id in refreshed_ids
+            }
+
     def current(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None
@@ -2566,10 +2592,6 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     process_key = (str(get_hermes_home().resolve(strict=False)), provider)
-    with _PROCESS_POOLS_LOCK:
-        existing = _PROCESS_POOLS.get(process_key)
-    if existing is not None:
-        return existing
 
     raw_entries = read_credential_pool(provider)
     disk_ids = {
@@ -2634,9 +2656,17 @@ def load_pool(provider: str) -> CredentialPool:
         )
     candidate = CredentialPool(provider, entries)
     with _PROCESS_POOLS_LOCK:
-        # Single-flight the identity even if two callers completed disk seeding
-        # concurrently. The loser discards its unleased candidate.
-        return _PROCESS_POOLS.setdefault(process_key, candidate)
+        existing = _PROCESS_POOLS.get(process_key)
+        if existing is None:
+            _PROCESS_POOLS[process_key] = candidate
+            return candidate
+
+    # Preserve the one-process identity so all agents share the same lease
+    # counters, but keep load_pool's historical role as a source/disk refresh.
+    # Do this outside _PROCESS_POOLS_LOCK to avoid nesting the global registry
+    # lock with the per-pool lock.
+    existing._reload_entries(entries)
+    return existing
 
 
 def clear_process_pool_cache() -> None:

@@ -8962,6 +8962,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._stop_task
             return
 
+        def _active_async_delegations_for_shutdown() -> int:
+            counter = getattr(self, "_active_async_delegation_count", None)
+            if not callable(counter):
+                return 0
+            try:
+                return max(0, int(counter()))
+            except Exception:
+                return 0
+
         async def _stop_impl() -> None:
             def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
@@ -9047,7 +9056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
-                    "active_async_delegations": self._active_async_delegation_count(),
+                    "active_async_delegations": _active_async_delegations_for_shutdown(),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -9122,7 +9131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
-            _delegations_at_start = self._active_async_delegation_count()
+            _delegations_at_start = _active_async_delegations_for_shutdown()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
@@ -9141,7 +9150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _api_at_start,
                 self._active_api_run_count(),
                 _delegations_at_start,
-                self._active_async_delegation_count(),
+                _active_async_delegations_for_shutdown(),
             )
 
             if not timed_out:
@@ -9168,7 +9177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
-                    self._active_async_delegation_count(),
+                    _active_async_delegations_for_shutdown(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
