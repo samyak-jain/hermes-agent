@@ -7,7 +7,7 @@ the per-session JSONL file approach. Stores session metadata, full message
 history, and model configuration for CLI and gateway sessions.
 
 Key design decisions:
-- WAL mode for concurrent readers + one writer (gateway multi-platform)
+- Configurable SQLite journaling (WAL by default; rollback mode for network filesystems)
 - FTS5 virtual table for fast text search across all session messages
 - Compression-triggered session splitting via parent_session_id chains
 - Batch runner and RL trajectories are NOT stored here (separate systems)
@@ -195,6 +195,148 @@ _last_init_error_lock = threading.Lock()
 # filesystem-incompat warning on every connection, filling errors.log.
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
+_sqlite_policy_warned_values: set[str] = set()
+_sqlite_policy_warned_lock = threading.Lock()
+_sqlite_storage_policy_cache: Dict[str, Tuple[str, str]] = {}
+_sqlite_storage_policy_cache_lock = threading.Lock()
+
+_SQLITE_JOURNAL_MODES = frozenset({"auto", "wal", "delete", "truncate"})
+_SQLITE_SYNCHRONOUS_MODES = frozenset({"auto", "normal", "full", "extra"})
+
+
+class SQLiteJournalMigrationRequired(sqlite3.OperationalError):
+    """A live connection found a persistent WAL database under rollback policy."""
+
+
+def _warn_sqlite_policy_once(key: str, message: str, *args: Any) -> None:
+    with _sqlite_policy_warned_lock:
+        if key in _sqlite_policy_warned_values:
+            return
+        _sqlite_policy_warned_values.add(key)
+    logger.warning(message, *args)
+
+
+def _sqlite_storage_policy() -> Tuple[str, str]:
+    """Resolve the low-level ``storage.sqlite`` policy from config.yaml.
+
+    ``auto`` preserves the historical behavior: request WAL and fall back to
+    DELETE only when the filesystem rejects WAL's locking protocol. Managed
+    deployments on network filesystems can instead pin DELETE or TRUNCATE.
+
+    Journal mode cannot be changed safely while sibling processes have live
+    connections, so this setting is deliberately stable for the process
+    lifetime. The per-HERMES_HOME cache also prevents every short-lived ledger
+    connection from adding a synchronous config.yaml ``stat()`` on EFS.
+    """
+    cache_key = str(get_hermes_home())
+    with _sqlite_storage_policy_cache_lock:
+        cached = _sqlite_storage_policy_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    journal_mode = "auto"
+    synchronous = "auto"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        storage = config.get("storage", {}) if isinstance(config, dict) else {}
+        sqlite_config = storage.get("sqlite", {}) if isinstance(storage, dict) else {}
+        if isinstance(sqlite_config, dict):
+            journal_mode = str(sqlite_config.get("journal_mode", "auto")).strip().lower()
+            synchronous = str(sqlite_config.get("synchronous", "auto")).strip().lower()
+    except Exception as exc:
+        _warn_sqlite_policy_once(
+            "config-load",
+            "SQLite storage policy could not be loaded; preserving automatic WAL behavior: %s",
+            exc,
+        )
+        resolved = ("auto", "auto")
+        with _sqlite_storage_policy_cache_lock:
+            _sqlite_storage_policy_cache[cache_key] = resolved
+        return resolved
+
+    if journal_mode not in _SQLITE_JOURNAL_MODES:
+        _warn_sqlite_policy_once(
+            f"journal:{journal_mode}",
+            "Invalid storage.sqlite.journal_mode=%r; expected one of %s. "
+            "Preserving automatic WAL behavior.",
+            journal_mode,
+            ", ".join(sorted(_SQLITE_JOURNAL_MODES)),
+        )
+        journal_mode = "auto"
+    if synchronous not in _SQLITE_SYNCHRONOUS_MODES:
+        _warn_sqlite_policy_once(
+            f"synchronous:{synchronous}",
+            "Invalid storage.sqlite.synchronous=%r; expected one of %s. "
+            "Preserving SQLite's connection default.",
+            synchronous,
+            ", ".join(sorted(_SQLITE_SYNCHRONOUS_MODES)),
+        )
+        synchronous = "auto"
+    resolved = (journal_mode, synchronous)
+    with _sqlite_storage_policy_cache_lock:
+        _sqlite_storage_policy_cache[cache_key] = resolved
+    return resolved
+
+
+def apply_sqlite_storage_policy(
+    conn: sqlite3.Connection,
+    *,
+    db_label: str,
+    journal_mode: Optional[str] = None,
+    synchronous: Optional[str] = None,
+) -> str:
+    """Apply the configured journal and durability policy to one connection.
+
+    TRUNCATE and DELETE are rollback-journal modes. Unlike WAL, TRUNCATE is
+    connection-local, so every writable connection must pass through this
+    function. A persistent WAL database is never downgraded while the
+    application is live: doing so can race another process that still has the
+    ``-wal``/``-shm`` files open. Deployments must use the offline migration
+    command before enabling rollback mode.
+
+    In-memory databases keep MEMORY mode because they have no network
+    filesystem durability concern.
+    """
+    if journal_mode is None or synchronous is None:
+        configured_journal, configured_sync = _sqlite_storage_policy()
+    else:
+        configured_journal, configured_sync = "auto", "auto"
+    target_journal = str(journal_mode or configured_journal).strip().lower()
+    target_sync = str(synchronous or configured_sync).strip().lower()
+    if target_journal not in _SQLITE_JOURNAL_MODES:
+        raise ValueError(f"unsupported SQLite journal mode: {target_journal}")
+    if target_sync not in _SQLITE_SYNCHRONOUS_MODES:
+        raise ValueError(f"unsupported SQLite synchronous mode: {target_sync}")
+
+    current_row = conn.execute("PRAGMA journal_mode").fetchone()
+    current = str(current_row[0]).lower() if current_row else ""
+    if current in {"memory", "off"}:
+        return current
+
+    if target_journal in {"auto", "wal"}:
+        actual = apply_wal_with_fallback(conn, db_label=db_label)
+    else:
+        if current == "wal":
+            raise SQLiteJournalMigrationRequired(
+                f"{db_label} is persistently in WAL mode but "
+                f"storage.sqlite.journal_mode={target_journal}. Stop every Hermes "
+                "process and run the offline SQLite journal migration before restart."
+            )
+        result = conn.execute(
+            f"PRAGMA journal_mode={target_journal.upper()}"
+        ).fetchone()
+        actual = str(result[0]).lower() if result else ""
+        if actual != target_journal:
+            raise sqlite3.OperationalError(
+                f"{db_label}: requested journal_mode={target_journal}, "
+                f"got {actual or 'no result'}"
+            )
+
+    if target_sync != "auto":
+        conn.execute(f"PRAGMA synchronous={target_sync.upper()}")
+    return actual
 
 _FTS_TRIGGERS = (
     "messages_fts_insert",
@@ -1075,7 +1217,7 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
+                apply_sqlite_storage_policy(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
 

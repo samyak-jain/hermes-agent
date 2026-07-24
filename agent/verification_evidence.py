@@ -63,7 +63,9 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL")
+    from hermes_state import apply_sqlite_storage_policy
+
+    apply_sqlite_storage_policy(conn, db_label="verification_evidence.db")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)

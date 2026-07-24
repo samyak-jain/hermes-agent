@@ -691,6 +691,18 @@ skills:
   #   - /home/shared/team-skills
 
 # =============================================================================
+# Storage
+# =============================================================================
+# SQLite uses WAL by default for local filesystems. If HERMES_HOME is on NFS,
+# SMB, or another network filesystem, use a rollback journal on every Hermes
+# process and perform the offline WAL migration before restart.
+#
+# storage:
+#   sqlite:
+#     journal_mode: truncate  # auto | wal | delete | truncate
+#     synchronous: full      # auto | normal | full | extra
+
+# =============================================================================
 # Agent Behavior
 # =============================================================================
 agent:
