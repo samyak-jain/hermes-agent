@@ -1239,6 +1239,48 @@ def _stamp_hygiene_compression_provenance(
         logger.debug(debug_label, exc_info=True)
 
 
+def _stream_confirmed_final_delivery(
+    consumer: Any,
+    final_text: str,
+    *,
+    previewed: bool = False,
+) -> bool:
+    """Return True only when the exact final reply reached the user.
+
+    ``final_response_sent`` is the fast path for an uninterrupted final stream.
+    Codex app-server ``item/completed`` events can close the current stream
+    segment after that same text was delivered, clearing the segment-local
+    final-delivery flags. ``has_delivered_text`` retains exact successfully
+    delivered content across that boundary, so consult it regardless of
+    ``response_previewed``. Exact equality keeps partial commentary or an
+    incomplete stream from suppressing the real final reply.
+
+    ``previewed`` remains part of the helper contract for call-site delivery
+    diagnostics, but it must not gate the authoritative delivered-text ledger.
+    """
+    if consumer is None:
+        return False
+    if getattr(consumer, "final_response_sent", False):
+        # A successful finalize is not proof that the completed response and
+        # the last delivered payload match. Split-message delivery records the
+        # authoritative final payload when available.
+        matcher = getattr(consumer, "delivered_final_matches", None)
+        if callable(matcher):
+            try:
+                if matcher(final_text) is False:
+                    return False
+            except Exception:
+                pass
+        return True
+    has_delivered_text = getattr(consumer, "has_delivered_text", None)
+    if callable(has_delivered_text):
+        try:
+            return bool(has_delivered_text(final_text))
+        except Exception:
+            return False
+    return False
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -29084,43 +29126,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
-
-        def _stream_confirmed_final_delivery(
-            consumer,
-            final_text: str,
-            *,
-            previewed: bool = False,
-        ) -> bool:
-            """Return True only when the actual final reply reached the user."""
-            if consumer is None:
-                return False
-            if getattr(consumer, "final_response_sent", False):
-                # A successful finalize call is not proof the *content* was
-                # final: the edit may have carried only the last preview
-                # snapshot while the tail generated between that snapshot and
-                # stream completion never reached any API call (#71643).
-                # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
-                matcher = getattr(consumer, "delivered_final_matches", None)
-                if callable(matcher):
-                    try:
-                        if matcher(final_text) is False:
-                            return False
-                    except Exception:
-                        pass
-                return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
-            return False
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
