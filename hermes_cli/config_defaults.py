@@ -11,10 +11,11 @@ DEFAULT_CONFIG = {
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the
-    # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
-    # not crash-safe (for example macOS virtiofs, NFS, or SMB).
+    # normal default; use DELETE or TRUNCATE for weak-fsync/shared filesystems
+    # after an offline migration. TRUNCATE avoids a directory mutation per commit.
     "database": {
         "journal_mode": "wal",
+        "synchronous": "auto",
         # Optional WAL sizing pragmas, applied when set to integers.
         # None = SQLite defaults (autocheckpoint 1000 pages, no size limit).
         "wal_autocheckpoint": None,

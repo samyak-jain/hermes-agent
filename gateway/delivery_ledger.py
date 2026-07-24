@@ -90,9 +90,9 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_sqlite_storage_policy
 
-    apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
+    apply_sqlite_storage_policy(conn, db_label="state.db (delivery ledger)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_obligations (
             obligation_id TEXT PRIMARY KEY,

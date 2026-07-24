@@ -42,6 +42,13 @@ def test_resolve_journal_mode_uses_real_database_config(monkeypatch, tmp_path):
     assert resolve_journal_mode() == "delete"
 
 
+def test_resolve_journal_mode_accepts_truncate(monkeypatch, tmp_path):
+    from hermes_state import resolve_journal_mode
+
+    _configure_mode(monkeypatch, tmp_path, "TRUNCATE")
+    assert resolve_journal_mode() == "truncate"
+
+
 def test_new_nonsecret_hermes_env_override_is_not_exposed(monkeypatch, tmp_path):
     from hermes_state import resolve_journal_mode
 
@@ -50,7 +57,7 @@ def test_new_nonsecret_hermes_env_override_is_not_exposed(monkeypatch, tmp_path)
     assert resolve_journal_mode() == "wal"
 
 
-@pytest.mark.parametrize("value", ["bogus", "truncate", None, 42, {"bad": "shape"}])
+@pytest.mark.parametrize("value", ["bogus", None, 42, {"bad": "shape"}])
 def test_invalid_config_value_falls_back_to_wal(monkeypatch, tmp_path, value):
     from hermes_state import resolve_journal_mode
 

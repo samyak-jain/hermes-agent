@@ -11,9 +11,12 @@
 # SQLite reports that WAL is incompatible with the filesystem. Set this to
 # "delete" explicitly for deployments whose backing filesystem is not WAL
 # crash-safe, such as Linux containers bind-mounted through macOS virtiofs,
-# NFS, or SMB. Hermes will not live-downgrade a database already open in WAL.
+# NFS, or SMB. TRUNCATE is also available after running the offline journal
+# migration and avoids a directory-entry mutation per commit. Hermes will not
+# live-downgrade a database already open in WAL.
 database:
-  journal_mode: "wal"  # Supported values: "wal", "delete"
+  journal_mode: "wal"  # Supported values: "wal", "delete", "truncate"
+  synchronous: "auto"  # "auto", "normal", "full", or "extra"
   # Optional WAL sizing pragmas (integers). Unset = SQLite defaults.
   # wal_autocheckpoint: 1000     # pages between automatic checkpoints
   # journal_size_limit: 67108864 # cap the WAL/journal file size in bytes
