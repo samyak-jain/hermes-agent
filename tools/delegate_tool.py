@@ -726,14 +726,12 @@ _MIN_SUMMARY_CHARS = 2000
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
-# Stale-heartbeat thresholds. A child with no API-call progress is either:
-#   - idle between turns (no current_tool) — probably stuck on a slow API call
-#   - inside a tool (current_tool set) — probably running a legitimately long
-#     operation (terminal command, web fetch, large file read)
-# The idle ceiling stays tight so genuinely stuck children don't mask the gateway
-# timeout. The in-tool ceiling is much higher so legit long-running tools get
-# time to finish; delegation.child_timeout_seconds (off by default) remains an
-# optional hard cap for users who want one.
+# Stale-heartbeat thresholds.  Freshness is determined from the child's actual
+# activity timestamp, which advances for stream events and long-running tool
+# heartbeats even when the API iteration and current tool do not change.
+# The idle ceiling stays tight so genuinely stuck children don't mask the
+# gateway timeout. The in-tool ceiling is higher for operations that cannot
+# emit fine-grained progress.
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
@@ -2021,9 +2019,9 @@ def _run_single_child(
     # Without this, the parent's _last_activity_ts freezes when delegate_task
     # starts and the gateway eventually kills the agent for "no activity".
     _heartbeat_stop = threading.Event()
-    # Stale detection: track the child's (tool, iteration) pair across
-    # heartbeat cycles. If neither advances, count the cycle as stale.
-    # Different thresholds for idle vs in-tool (see _HEARTBEAT_STALE_CYCLES_*).
+    # Legacy stale detection fallback for test doubles/older child runtimes
+    # that do not expose ``seconds_since_activity``. Real agents use their
+    # activity timestamp so a long live stream is not mistaken for a hang.
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
@@ -2042,38 +2040,39 @@ def _run_single_child(
                 child_tool = child_summary.get("current_tool")
                 child_iter = child_summary.get("api_call_count", 0)
                 child_max = child_summary.get("max_iterations", 0)
+                child_idle_secs = child_summary.get("seconds_since_activity")
 
-                # Stale detection: count cycles where neither the iteration
-                # count nor the current_tool advances. A child running a
-                # legitimately long-running tool (terminal command, web
-                # fetch) keeps current_tool set but doesn't advance
-                # api_call_count — we don't want that to look stale at the
-                # idle threshold.
-                iter_advanced = child_iter > _last_seen_iter[0]
-                tool_changed = child_tool != _last_seen_tool[0]
-                if iter_advanced or tool_changed:
-                    _last_seen_iter[0] = child_iter
-                    _last_seen_tool[0] = child_tool
-                    _stale_count[0] = 0
-                else:
-                    _stale_count[0] += 1
-
-                # Pick threshold based on whether the child is currently
-                # inside a tool call. In-tool threshold is high enough to
-                # cover legitimately slow tools; idle threshold stays
-                # tight so the gateway timeout can fire on a truly wedged
-                # child.
                 stale_limit = (
                     _HEARTBEAT_STALE_CYCLES_IN_TOOL
                     if child_tool
                     else _HEARTBEAT_STALE_CYCLES_IDLE
                 )
-                if _stale_count[0] >= stale_limit:
+                stale_for = None
+                if isinstance(child_idle_secs, (int, float)):
+                    stale_for = max(0.0, float(child_idle_secs))
+                    is_stale = stale_for >= stale_limit * _HEARTBEAT_INTERVAL
+                else:
+                    # Compatibility fallback when a custom/older child does
+                    # not expose activity age.
+                    iter_advanced = child_iter > _last_seen_iter[0]
+                    tool_changed = child_tool != _last_seen_tool[0]
+                    if iter_advanced or tool_changed:
+                        _last_seen_iter[0] = child_iter
+                        _last_seen_tool[0] = child_tool
+                        _stale_count[0] = 0
+                    else:
+                        _stale_count[0] += 1
+                    is_stale = _stale_count[0] >= stale_limit
+                if is_stale:
                     logger.warning(
-                        "Subagent %d appears stale (no progress for %d "
-                        "heartbeat cycles, tool=%s) — stopping heartbeat",
+                        "Subagent %d appears stale (no activity for %s, "
+                        "tool=%s) — stopping heartbeat",
                         task_index,
-                        _stale_count[0],
+                        (
+                            f"{stale_for:.0f}s"
+                            if stale_for is not None
+                            else f"{_stale_count[0]} heartbeat cycles"
+                        ),
                         child_tool or "<none>",
                     )
                     break  # stop touching parent, let gateway timeout fire

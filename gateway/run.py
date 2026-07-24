@@ -10363,7 +10363,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
+        # Internal events are background/subagent/process notifications, not
+        # user replies.  Let them continue through the normal internal-event
+        # queue instead of consuming the live clarify waiter.
+        if (
+            not is_internal
+            and _pending_clarify is not None
+            and _clarify_mod is not None
+        ):
             _raw_clarify_reply = (event.text or "").strip()
             # Skip slash commands — the user clearly wanted to issue a
             # command, not answer the clarify.  Leave the clarify pending

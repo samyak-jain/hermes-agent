@@ -1,7 +1,8 @@
-"""Sibling coverage for the embed-invisibility fix (send_exec_approval got it
-in the same PR): slash confirm, clarify, and update prompts must also mirror
-their payload into plain message content, since embeds don't render on some
-Discord clients (web/mobile)."""
+"""Interactive Discord prompts must remain self-contained in plain content.
+
+Clarify is content-only because mirroring the same question into an embed
+visibly duplicates it on normal clients.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -83,6 +84,9 @@ async def test_clarify_with_choices_mirrors_question_into_content():
     assert "Hermes needs your input" in sent["content"]
     assert "Which environment should I deploy to?" in sent["content"]
     assert "Pick one below" in sent["content"]
+    assert sent.get("embed") is None
+    assert sent["content"].count("Hermes needs your input") == 1
+    assert sent["content"].count("Which environment should I deploy to?") == 1
 
 
 @pytest.mark.asyncio
@@ -100,6 +104,7 @@ async def test_clarify_without_choices_mirrors_question_and_reply_hint():
 
     assert result.success is True
     assert sent.get("view") is None
+    assert sent.get("embed") is None
     assert "What should the cron schedule be?" in sent["content"]
     assert "Reply in this channel" in sent["content"]
 

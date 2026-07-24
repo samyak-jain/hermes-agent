@@ -119,3 +119,39 @@ async def test_gateway_clarify_reply_resumes_typing_before_returning_empty_ack()
 
     assert result == ""
     assert "12345" not in adapter._typing_paused
+
+
+@pytest.mark.asyncio
+async def test_internal_notification_does_not_resolve_pending_clarify():
+    """Subagent/process notifications are not user answers to clarify."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    event = _event("approve")
+    event.internal = True
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._session_key_for_source = lambda source: "clarify-session"
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-internal", "clarify-session", "Choose", ["A", "B"])
+
+    class ReachedNextDispatch(RuntimeError):
+        pass
+
+    with patch(
+        "tools.slash_confirm.get_pending",
+        side_effect=ReachedNextDispatch,
+    ):
+        with pytest.raises(ReachedNextDispatch):
+            await runner._handle_message(event)
+
+    pending = cm.get_pending_for_session(
+        "clarify-session", include_choice_prompts=True,
+    )
+    assert pending is not None
+    assert pending.clarify_id == "clarify-internal"
+    assert pending.response is None

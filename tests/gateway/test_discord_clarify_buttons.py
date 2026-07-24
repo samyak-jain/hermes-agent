@@ -348,7 +348,7 @@ class TestClarifyOtherButton:
 # ===========================================================================
 
 class TestDiscordSendClarify:
-    """Verify send_clarify renders an embed and (optionally) attaches the view."""
+    """Verify send_clarify renders one plain prompt and optional controls."""
 
     def setup_method(self):
         _clear_clarify_state()
@@ -372,10 +372,13 @@ class TestDiscordSendClarify:
 
         assert result.success is True
         assert result.message_id == "123456"
-        # Verify channel.send was called with embed + view kwargs
+        # One self-contained content prompt plus the component view.  Do not
+        # duplicate the same question in an embed.
         channel.send.assert_called_once()
         kwargs = channel.send.call_args.kwargs
-        assert "embed" in kwargs
+        assert "embed" not in kwargs
+        assert kwargs["content"].count("Hermes needs your input") == 1
+        assert kwargs["content"].count("Pick a color") == 1
         assert "view" in kwargs
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
@@ -401,8 +404,11 @@ class TestDiscordSendClarify:
         assert result.success is True
         channel.send.assert_called_once()
         kwargs = channel.send.call_args.kwargs
-        # Open-ended path renders embed but no view (text-capture handles reply)
-        assert "embed" in kwargs
+        # Open-ended path is still self-contained but has no component view
+        # (text-capture handles the reply).
+        assert "embed" not in kwargs
+        assert kwargs["content"].count("Hermes needs your input") == 1
+        assert kwargs["content"].count("What is your name?") == 1
         assert "view" not in kwargs
 
     @pytest.mark.asyncio

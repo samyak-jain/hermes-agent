@@ -2395,6 +2395,55 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
         )
 
+    def test_heartbeat_uses_fresh_child_activity_during_long_stream(self):
+        """Stream events keep the parent alive without iteration changes.
+
+        A streaming API response can remain on the same iteration with no
+        current tool for many minutes. Its activity timestamp is authoritative;
+        iteration/tool-name equality must not stop the parent heartbeat.
+        """
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        touch_calls = []
+        parent._touch_activity = lambda desc: touch_calls.append(desc)
+
+        child = MagicMock()
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 17,
+            "max_iterations": 50,
+            "last_activity_desc": "receiving stream response",
+            "seconds_since_activity": 0.01,
+        }
+
+        def slow_run(**kwargs):
+            time.sleep(0.4)
+            return {"final_response": "done", "completed": True, "api_calls": 17}
+
+        child.run_conversation.side_effect = slow_run
+
+        with (
+            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+        ):
+            _run_single_child(
+                task_index=0,
+                goal="Test long streaming response",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertGreater(
+            len(touch_calls), 2,
+            f"Fresh stream activity did not keep parent heartbeat alive: "
+            f"{touch_calls}",
+        )
+        self.assertTrue(
+            any("receiving stream response" in desc for desc in touch_calls),
+            f"Heartbeat did not report child stream activity: {touch_calls}",
+        )
+
 
 
 class TestDelegationReasoningEffort(unittest.TestCase):
