@@ -710,8 +710,21 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # Native transports compose API-only recall, plugin context, and
+        # gateway per-turn notes into the current user message below. The
+        # app-server early return must perform the same composition before
+        # handing the turn to Claude; otherwise Discord voice/reset notes and
+        # external-memory recall silently disappear on this runtime.
+        app_server_user_message = user_message
+        composed_app_server_content = compose_user_api_content(
+            user_message,
+            _ext_prefetch_cache,
+            _plugin_user_context,
+        )
+        if composed_app_server_content is not None:
+            app_server_user_message = composed_app_server_content
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=app_server_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
