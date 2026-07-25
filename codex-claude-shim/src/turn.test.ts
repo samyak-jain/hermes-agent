@@ -7,6 +7,7 @@ import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "@anthropic-ai/claude-agent-sdk";
 import { ThreadStore, type ThreadState } from "./threads.js";
 import {
   handleSystemMessage,
+  mcpServer,
   promptForTurn,
   systemPromptForThread,
   titleForThread,
@@ -48,6 +49,11 @@ test("one prompt tier does not add an unnecessary cache boundary", () => {
     "SOUL",
   );
   assert.equal(systemPromptForThread(thread()), "");
+});
+
+test("runtime MCP tools do not add a redundant instructions message", () => {
+  const server = mcpServer({} as never, thread(), "turn-1");
+  assert.equal((server.instance.server as any)._instructions, undefined);
 });
 
 test("new SDK sessions skip automatic model-generated titles", () => {

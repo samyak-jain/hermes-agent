@@ -50,16 +50,6 @@ from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
 
-APP_SERVER_PERSONA_PRECEDENCE = """# Persona precedence
-
-This operator-defined persona governs the voice, register, expressiveness,
-emotional presence, nicknames, stage directions, and emoji of every
-user-facing conversational response. If earlier general style guidance favors
-a terse, professional, or emotionally restrained voice, follow this persona
-instead. Safety, honesty, task requirements, tool-use discipline, and code
-correctness remain in force."""
-
-
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -157,8 +147,6 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
 def build_system_prompt_parts(
     agent: Any,
     system_message: Optional[str] = None,
-    *,
-    app_server_persona_precedence: bool = False,
 ) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
@@ -466,12 +454,6 @@ def build_system_prompt_parts(
     if _effective_hint:
         stable_parts.append(_effective_hint)
 
-    # The custom Claude app-server prompt has no Claude Code output-style
-    # layer to compete with SOUL. Keep this final rule as a defense against
-    # generic style language contributed by other stable Hermes guidance.
-    if app_server_persona_precedence and _soul_loaded:
-        stable_parts.append(APP_SERVER_PERSONA_PRECEDENCE)
-
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
 
@@ -560,11 +542,7 @@ def build_app_server_identity_prompt(agent: Any) -> str:
     soul = _ra().load_soul_md(_app_server_context_length(agent)) or ""
     if not soul.strip():
         return ""
-    return (
-        "# Operator-defined persona\n\n"
-        f"{soul.strip()}\n\n"
-        f"{APP_SERVER_PERSONA_PRECEDENCE}"
-    )
+    return "# Operator-defined persona\n\n" + soul.strip()
 
 
 def build_app_server_system_prompt(
