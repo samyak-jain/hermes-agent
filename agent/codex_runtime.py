@@ -663,7 +663,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -687,10 +687,7 @@ def run_codex_app_server_turn(
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         from agent.runtime_cwd import resolve_agent_cwd
-        from agent.system_prompt import (
-            build_app_server_identity_prompt,
-            build_app_server_system_prompt,
-        )
+        from agent.system_prompt import build_app_server_system_prompt_parts
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         app_cfg = _codex_app_server_config()
@@ -749,14 +746,23 @@ def run_codex_app_server_turn(
                 messages=context.get("messages"),
             )
 
-        system_prompt_append = (
-            build_app_server_system_prompt(agent, system_message=system_message)
+        app_server_prompt_parts = (
+            build_app_server_system_prompt_parts(
+                agent,
+                system_message=system_message,
+            )
             if use_host_bridge
-            else None
+            else {}
         )
-        system_prompt_identity = (
-            build_app_server_identity_prompt(agent) if use_host_bridge else None
-        )
+        system_prompt_static = app_server_prompt_parts.get("stable") or None
+        system_prompt_dynamic = "\n\n".join(
+            part
+            for part in (
+                app_server_prompt_parts.get("context"),
+                app_server_prompt_parts.get("volatile"),
+            )
+            if part
+        ) or None
 
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
@@ -768,8 +774,8 @@ def run_codex_app_server_turn(
                 else None
             ),
             host_session_id=(agent.session_id if use_host_bridge else None),
-            system_prompt_append=system_prompt_append,
-            system_prompt_identity=system_prompt_identity,
+            system_prompt_append=system_prompt_dynamic,
+            system_prompt_identity=system_prompt_static,
             tool_schemas=(_app_server_tool_schemas(agent) if use_host_bridge else None),
             tool_callback=(_invoke_host_tool if use_host_bridge else None),
             approval_callback=approval_callback,

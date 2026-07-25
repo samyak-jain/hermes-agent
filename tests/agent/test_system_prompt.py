@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import (
+    APP_SERVER_PERSONA_PRECEDENCE,
     build_app_server_identity_prompt,
     build_app_server_system_prompt,
+    build_app_server_system_prompt_parts,
     build_system_prompt_parts,
 )
 
@@ -164,7 +166,7 @@ class _PromptMemoryStore:
         }[target]
 
 
-def test_app_server_prompt_keeps_persona_context_and_memory_without_product_identity():
+def test_app_server_prompt_keeps_persona_and_full_hermes_context():
     agent = _make_agent(
         valid_tool_names={"memory", "session_search", "skill_manage"},
         _memory_store=_PromptMemoryStore(),
@@ -197,4 +199,82 @@ def test_app_server_prompt_keeps_persona_context_and_memory_without_product_iden
     assert "terse, professional, or emotionally restrained" in identity
     assert "Session ID: session-123" in prompt
     assert "You are Hermes Agent" not in prompt
-    assert "You run on Hermes Agent" not in prompt
+    assert "You run on Hermes Agent" in prompt
+
+
+def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
+    agent = _make_agent(
+        valid_tool_names={"memory"},
+        _memory_store=_PromptMemoryStore(),
+        pass_session_id=True,
+        session_id="session-cache-test",
+        model="claude-fable-5",
+        provider="anthropic",
+        ephemeral_system_prompt=(
+            "## Current Session Context\n"
+            "**Source:** Discord (DM with Samyak)"
+        ),
+    )
+    soul = "# Soul\nBe warm, candid, and curious."
+    with (
+        patch("run_agent.load_soul_md", return_value=soul),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md says to ship verified work.",
+        ) as context_files,
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        parts = build_app_server_system_prompt_parts(
+            agent,
+            system_message="Messages may be prefixed with a sender name.",
+        )
+
+    assert soul in parts["stable"]
+    assert soul not in parts["context"]
+    assert soul not in parts["volatile"]
+    assert "AGENTS.md says to ship verified work" in parts["context"]
+    assert "Messages may be prefixed" in parts["context"]
+    assert "**Source:** Discord (DM with Samyak)" in parts["context"]
+    assert "The user prefers terse answers" in parts["volatile"]
+    assert "The user's name is Samyak" in parts["volatile"]
+    assert "Conversation started:" in parts["volatile"]
+    assert "Session ID: session-cache-test" in parts["volatile"]
+    assert "Model: claude-fable-5" in parts["volatile"]
+    assert "Provider: anthropic" in parts["volatile"]
+    assert "\n\n".join(parts.values()).count(soul) == 1
+    assert context_files.call_args.kwargs["skip_soul"] is True
+
+
+def test_app_server_prompt_stays_in_parity_with_canonical_hermes_assembly():
+    agent = _make_agent(
+        valid_tool_names={"memory", "session_search"},
+        _memory_store=_PromptMemoryStore(),
+        model="claude-fable-5",
+        provider="anthropic",
+        platform="discord",
+        pass_session_id=True,
+        session_id="session-parity",
+        ephemeral_system_prompt="## Current Session Context\n**Source:** Discord",
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value="# Soul\nStay human."),
+        patch("run_agent.build_environment_hints", return_value="environment"),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md",
+        ),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        canonical = build_system_prompt_parts(agent)
+        app_server = build_app_server_system_prompt_parts(agent)
+
+    assert app_server["stable"] == (
+        canonical["stable"] + "\n\n" + APP_SERVER_PERSONA_PRECEDENCE
+    )
+    assert app_server["context"] == (
+        canonical["context"]
+        + "\n\n"
+        + "## Current Session Context\n**Source:** Discord"
+    )
+    assert app_server["volatile"] == canonical["volatile"]
