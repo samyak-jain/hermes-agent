@@ -24,7 +24,7 @@ that rail rather than reaching into a running agent loop:
 
 The completion payload carries a RICH, self-contained task-source block (the
 original goal, the context the parent supplied, toolsets, model, dispatch
-time, status, and the full result summary). When the result re-enters the
+time, status, and the context-budgeted result summary). When the result re-enters the
 conversation the parent may be deep in unrelated context and won't remember
 why the subagent existed; the block lets it either use the result or
 re-dispatch if the world has moved on.
@@ -136,7 +136,17 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in (
+            "goal",
+            "goals",
+            "context",
+            "toolsets",
+            "role",
+            "model",
+            "is_batch",
+            "completion_type",
+            "label",
+        )
         if key in record
     }
     with _DB_LOCK, _connect() as conn:
@@ -245,12 +255,14 @@ def recover_abandoned_delegations() -> int:
                 continue
             task = json.loads(task_json or "{}")
             event = {
-                "type": "async_delegation", "delegation_id": delegation_id,
+                "type": task.get("completion_type") or "async_delegation",
+                "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "label": task.get("label"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -388,6 +400,76 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
+    }
+
+
+def get_owned_durable_delegation(
+    delegation_id: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    completion_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return one durable result only when the caller proves route ownership.
+
+    The ownership contract matches ``interrupt_delegation``: at least one
+    non-empty route selector must equal the dispatch record. ``completion_type``
+    additionally binds thin adapters such as spawn_agent to their own handle
+    namespace. Returning ``None`` for both absent and unowned ids prevents a
+    caller from probing another conversation's background work.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    selectors = (
+        str(session_key or ""),
+        str(origin_ui_session_id or ""),
+        str(parent_session_id or ""),
+    )
+    if not delegation_id or not any(selectors):
+        return None
+
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT origin_session, origin_ui_session_id, parent_session_id,
+                      state, dispatched_at, completed_at, event_json,
+                      result_json, task_json
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+
+    origin_session, origin_ui, parent_id = (
+        str(row[0] or ""),
+        str(row[1] or ""),
+        str(row[2] or ""),
+    )
+    if not any(
+        candidate and candidate == recorded
+        for candidate, recorded in zip(
+            selectors,
+            (origin_session, origin_ui, parent_id),
+        )
+    ):
+        return None
+
+    event = json.loads(row[6]) if row[6] else {}
+    result = json.loads(row[7]) if row[7] else None
+    task = json.loads(row[8]) if row[8] else {}
+    recorded_type = event.get("type") or task.get("completion_type")
+    if completion_type and recorded_type != completion_type:
+        return None
+
+    return {
+        "delegation_id": delegation_id,
+        "origin_session": origin_session,
+        "origin_ui_session_id": origin_ui,
+        "parent_session_id": parent_id,
+        "state": row[3],
+        "dispatched_at": row[4],
+        "completed_at": row[5],
+        "event": event,
+        "result": result,
     }
 
 
@@ -858,8 +940,9 @@ def _finalize_batch(
         # consolidated multi-task block from this.
         "results": combined.get("results") or [],
         # Per-task live transcript log paths (cache/delegation/live/...).
-        # They persist after completion and double as the full-fidelity
-        # operational record of each child's run.
+        # They persist after completion as a compact operational view. Each
+        # event is independently preview-truncated, so this is not a
+        # full-fidelity replacement for a spilled result summary.
         "live_transcripts": combined.get("live_transcripts"),
         "error": combined.get("error"),
         "total_duration_seconds": combined.get("total_duration_seconds"),

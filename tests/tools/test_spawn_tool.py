@@ -52,9 +52,17 @@ def test_schema_supports_spawn_and_cancel_without_duplicating_tools():
     assert SPAWN_AGENT_SCHEMA["name"] == "spawn_agent"
     params = SPAWN_AGENT_SCHEMA["parameters"]
     assert params["type"] == "object"
-    assert set(params["properties"]) == {"prompt", "label", "cancel_id"}
+    assert set(params["properties"]) == {
+        "prompt",
+        "label",
+        "cancel_id",
+        "result_id",
+        "offset",
+        "limit",
+    }
     assert "required" not in params
     assert "omit prompt" in params["properties"]["cancel_id"]["description"]
+    assert "next_offset" in params["properties"]["offset"]["description"]
 
     from tools.registry import registry
 
@@ -249,13 +257,183 @@ def test_cancel_rejects_ambiguous_or_unowned_requests(monkeypatch):
     both = json.loads(
         spawn_agent(prompt="do work", cancel_id="sa_12ab34", parent_agent=parent)
     )
-    assert "either prompt or cancel_id" in both["error"]
+    assert "exactly one of prompt, cancel_id, or result_id" in both["error"]
 
     monkeypatch.setattr(
         "tools.async_delegation.interrupt_delegation", lambda *a, **k: False
     )
     missing = json.loads(spawn_agent(cancel_id="sa_missing", parent_agent=parent))
     assert "No running spawn_agent subagent found" in missing["error"]
+
+
+def _persist_spawn_result(
+    *,
+    result_id: str,
+    owner: str,
+    result: dict,
+    completion_type: str = "spawn_result",
+    parent_session_id: str = "parent-session",
+):
+    record = {
+        "delegation_id": result_id,
+        "session_key": owner,
+        "origin_ui_session_id": "",
+        "parent_session_id": parent_session_id,
+        "completion_type": completion_type,
+        "label": "long report",
+        "goal": "produce a long report",
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {
+            "type": completion_type,
+            "delegation_id": result_id,
+            "status": "completed",
+            "completed_at": 2.0,
+        },
+        result,
+    )
+
+
+def test_result_retrieval_pages_owned_full_report_without_file_tool(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "route-key",
+    )
+    result_id = "sa_page12"
+    report = "0123456789abcdefghijklmnopqrstuvwxyz"
+    report_dir = tmp_path / "cache" / "delegation" / "live" / result_id
+    report_dir.mkdir(parents=True)
+    report_path = report_dir / "subagent-summary-0-test.txt"
+    report_path.write_text(report, encoding="utf-8")
+    _persist_spawn_result(
+        result_id=result_id,
+        owner="route-key",
+        result={
+            "status": "completed",
+            "summary": "truncated",
+            "summary_truncated": True,
+            "summary_full_path": str(report_path),
+        },
+    )
+
+    first = json.loads(
+        spawn_agent(
+            result_id=result_id,
+            offset=10,
+            limit=8,
+            parent_agent=_parent(),
+        )
+    )
+    assert first == {
+        "id": result_id,
+        "status": "completed",
+        "offset": 10,
+        "returned_chars": 8,
+        "total_chars": len(report),
+        "next_offset": 18,
+        "has_more": True,
+        "full_result_available": True,
+        "content": "abcdefgh",
+    }
+
+    final = json.loads(
+        spawn_agent(
+            result_id=result_id,
+            offset=first["next_offset"],
+            limit=20,
+            parent_agent=_parent(),
+        )
+    )
+    assert final["content"] == "ijklmnopqrstuvwxyz"
+    assert final["next_offset"] is None
+    assert final["has_more"] is False
+
+
+def test_result_retrieval_fails_closed_for_foreign_or_wrong_tool_results(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "route-key",
+    )
+    _persist_spawn_result(
+        result_id="sa_foreign",
+        owner="someone-else",
+        parent_session_id="someone-else-parent",
+        result={"status": "completed", "summary": "private"},
+    )
+    _persist_spawn_result(
+        result_id="deleg_sync",
+        owner="route-key",
+        completion_type="async_delegation",
+        result={"status": "completed", "summary": "not a spawn result"},
+    )
+
+    foreign = json.loads(
+        spawn_agent(result_id="sa_foreign", parent_agent=_parent())
+    )
+    wrong_type = json.loads(
+        spawn_agent(result_id="deleg_sync", parent_agent=_parent())
+    )
+    assert foreign["error"] == (
+        "No spawn_agent result found with id 'sa_foreign' in this conversation."
+    )
+    assert wrong_type["error"] == (
+        "No spawn_agent result found with id 'deleg_sync' in this conversation."
+    )
+
+
+def test_result_retrieval_never_reads_untrusted_recorded_path(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "route-key",
+    )
+    outside = tmp_path / "secret.txt"
+    outside.write_text("must not be returned", encoding="utf-8")
+    _persist_spawn_result(
+        result_id="sa_badpath",
+        owner="route-key",
+        result={
+            "status": "completed",
+            "summary": "safe truncated copy",
+            "summary_truncated": True,
+            "summary_full_path": str(outside),
+        },
+    )
+
+    retrieved = json.loads(
+        spawn_agent(result_id="sa_badpath", parent_agent=_parent())
+    )
+    assert retrieved["content"] == "safe truncated copy"
+    assert retrieved["full_result_available"] is False
+    assert "unavailable or expired" in retrieved["message"]
+    assert "must not be returned" not in json.dumps(retrieved)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"result_id": "sa_x", "offset": -1}, "non-negative integer"),
+        ({"result_id": "sa_x", "offset": True}, "non-negative integer"),
+        ({"result_id": "sa_x", "limit": 0}, "between 1 and 20000"),
+        ({"result_id": "sa_x", "limit": 20_001}, "between 1 and 20000"),
+    ],
+)
+def test_result_retrieval_validates_page_bounds(kwargs, message):
+    result = json.loads(spawn_agent(parent_agent=_parent(), **kwargs))
+    assert message in result["error"]
 
 
 def test_cancel_interrupts_live_spawn_and_delivers_interrupted_result(monkeypatch):
@@ -408,6 +586,9 @@ def test_agent_dispatch_forwards_parent_context():
             prompt="do work",
             label="work",
             cancel_id=None,
+            result_id=None,
+            offset=None,
+            limit=None,
             parent_agent=agent,
         )
 
@@ -415,10 +596,29 @@ def test_agent_dispatch_forwards_parent_context():
         result = run_agent.AIAgent._dispatch_spawn_agent(
             agent, {"cancel_id": "sa_123abc"}
         )
-    assert result == '{"ok":true}'
-    call.assert_called_once_with(
-        prompt=None,
-        label=None,
-        cancel_id="sa_123abc",
-        parent_agent=agent,
-    )
+        assert result == '{"ok":true}'
+        call.assert_called_once_with(
+            prompt=None,
+            label=None,
+            cancel_id="sa_123abc",
+            result_id=None,
+            offset=None,
+            limit=None,
+            parent_agent=agent,
+        )
+
+        call.reset_mock()
+        result = run_agent.AIAgent._dispatch_spawn_agent(
+            agent,
+            {"result_id": "sa_123abc", "offset": 12, "limit": 34},
+        )
+        assert result == '{"ok":true}'
+        call.assert_called_once_with(
+            prompt=None,
+            label=None,
+            cancel_id=None,
+            result_id="sa_123abc",
+            offset=12,
+            limit=34,
+            parent_agent=agent,
+        )

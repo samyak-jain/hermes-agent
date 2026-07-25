@@ -450,6 +450,33 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
     assert restored.get_nowait()["status"] == "unknown"
 
 
+def test_recover_preserves_spawn_result_type_and_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "sa_abandoned",
+        "completion_type": "spawn_result",
+        "label": "research",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL "
+            "WHERE delegation_id=?",
+            (99999999, "sa_abandoned"),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    event = restored.get_nowait()
+    assert event["type"] == "spawn_result"
+    assert event["label"] == "research"
+
+
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {

@@ -6269,6 +6269,9 @@ class AIAgent:
             prompt=function_args.get("prompt"),
             label=function_args.get("label"),
             cancel_id=function_args.get("cancel_id"),
+            result_id=function_args.get("result_id"),
+            offset=function_args.get("offset"),
+            limit=function_args.get("limit"),
             parent_agent=self,
         )
 

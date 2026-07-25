@@ -2121,7 +2121,8 @@ def _format_async_delegation(evt: dict) -> str:
             r_live = r.get("live_transcript")
             if r_live:
                 lines.append(
-                    f"Full live transcript (complete tool/assistant trace): {r_live}"
+                    "Compact live progress transcript (individual events may "
+                    f"be truncated): {r_live}"
                 )
         return "\n".join(lines)
 

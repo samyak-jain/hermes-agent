@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -1803,7 +1804,11 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
-def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
+def _spill_summary_to_file(
+    task_index: int,
+    summary: str,
+    retrieval_id: Optional[str] = None,
+) -> Optional[str]:
     """Write a subagent's full summary to the delegation cache and return path.
 
     Mirrors web_extract's ``_store_full_text``: the file lands in
@@ -1818,6 +1823,13 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
         import datetime as _dt
 
         cache_dir = get_hermes_dir("cache/delegation", "delegation_cache")
+        if retrieval_id:
+            # spawn_agent owns a durable handle, so keep its full report beside
+            # the handle's live transcript. delegation_live_log prunes these
+            # directories after seven days, which gives the report the same
+            # bounded lifetime as the operational trace.
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", retrieval_id)
+            cache_dir = cache_dir / "live" / safe_id
         cache_dir.mkdir(parents=True, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = cache_dir / f"subagent-summary-{task_index}-{ts}.txt"
@@ -1829,7 +1841,10 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
 
 
 def _trim_summary_with_footer(
-    summary: str, cap: int, task_index: int
+    summary: str,
+    cap: int,
+    task_index: int,
+    retrieval_id: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Return (model_text, spill_path) for one over-budget summary.
 
@@ -1855,7 +1870,11 @@ def _trim_summary_with_footer(
     if 0 <= nl < tail_budget * 0.5:
         tail = tail[nl + 1:]
 
-    spill_path = _spill_summary_to_file(task_index, summary)
+    spill_path = _spill_summary_to_file(
+        task_index,
+        summary,
+        retrieval_id=retrieval_id,
+    )
 
     footer_lines = [
         "",
@@ -1864,14 +1883,22 @@ def _trim_summary_with_footer(
         f"of {original_len:,} total — trimmed to protect the parent's context window.",
     ]
     if spill_path:
-        # read_file is 1-indexed; +2 moves past the last head line shown.
-        middle_start_line = head.count("\n") + 2
         footer_lines.append(f"Full subagent output saved to: {spill_path}")
-        footer_lines.append(
-            f'To read the omitted middle: read_file path="{spill_path}" '
-            f"offset={middle_start_line} limit=200  (the file is the complete "
-            f"summary; raise/lower offset to page through it)."
-        )
+        if retrieval_id:
+            footer_lines.append(
+                "To read the omitted middle without spawning another subagent: "
+                f'spawn_agent result_id="{retrieval_id}" '
+                f"offset={len(head)} limit=12000. Continue with the returned "
+                "next_offset while has_more is true."
+            )
+        else:
+            # read_file is 1-indexed; +2 moves past the last head line shown.
+            middle_start_line = head.count("\n") + 2
+            footer_lines.append(
+                f'To read the omitted middle: read_file path="{spill_path}" '
+                f"offset={middle_start_line} limit=200  (the file is the complete "
+                f"summary; raise/lower offset to page through it)."
+            )
     else:
         footer_lines.append(
             "Full output could not be stored to disk; the head+tail above is "
@@ -1923,7 +1950,11 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         return None
 
 
-def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
+def _apply_summary_budget(
+    results: List[Dict[str, Any]],
+    parent_agent,
+    retrieval_id: Optional[str] = None,
+) -> None:
     """Trim subagent summaries in-place so the batch can't overflow the
     parent's context window, spilling full text to disk so nothing is lost.
 
@@ -1963,7 +1994,10 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
             continue
         original_len = len(summary)
         model_text, spill_path = _trim_summary_with_footer(
-            summary, cap, entry.get("task_index", -1)
+            summary,
+            cap,
+            entry.get("task_index", -1),
+            retrieval_id=retrieval_id,
         )
         entry["summary"] = model_text
         entry["summary_truncated"] = True
