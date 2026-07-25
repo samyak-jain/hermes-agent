@@ -14,14 +14,20 @@ middleware, `spawn_agent`, and channel-specific tool policy therefore use the
 same implementations as the default runtime.
 
 The adapter replaces Claude Code's preset with Hermes' cache-aware custom
-system prompt. SOUL and stable Hermes guidance are sent once as the globally
-cacheable prefix. Gateway context, AGENTS.md (or the selected project context
-file), memory, user profile, conversation date, model/provider identity, and
-session metadata follow the SDK's dynamic system-prompt boundary. The content
-comes from Hermes' canonical prompt builder rather than a parallel adapter
-copy, so its tool, skill, profile, environment, and platform guidance stays in
-sync with the native harness. Gateway/session context is system-level; user
-turns never carry a duplicate SOUL or project-context block.
+system prompt. SOUL and its persona-precedence rule are sent once as the
+globally cacheable prefix. Gateway context, AGENTS.md (or the selected project
+context file), memory, user profile, conversation date, model/provider
+identity, and session metadata come from Hermes' canonical prompt builder and
+follow the SDK's dynamic system-prompt boundary. Gateway/session context is
+system-level; user turns never carry a duplicate SOUL or project-context
+block.
+
+The native Hermes stable tier also contains long generic tool-loop, skills,
+environment, provider, and platform guidance. The app-server does not repeat
+that boilerplate: Claude receives the live policy-filtered schemas and MCP
+contract directly, while the generic text can push a custom subscription
+request onto the extra-usage route. This keeps the operator-owned persona and
+conversation context authoritative while removing redundant harness prose.
 
 Hermes still owns per-message composition before the SDK handoff. Discord
 sender prefixes, optional message timestamps, triggering-message IDs, gateway

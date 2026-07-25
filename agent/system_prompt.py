@@ -596,23 +596,28 @@ def build_app_server_system_prompt_parts(
     """Build cache-aware system-prompt tiers for an app-server backend.
 
     Claude Agent SDK supports a custom system prompt split into a globally
-    cacheable prefix and a session-specific suffix.  Keep Hermes' authoritative
-    identity and generic behavior guidance in ``stable``; keep project/caller
-    context in ``context``; and keep memory, profile and session identity in
-    ``volatile``.  Every tier is frozen when the app-server session starts.
+    cacheable prefix and a session-specific suffix. Keep the operator's
+    authoritative identity in ``stable``; keep project/caller context in
+    ``context``; and keep memory, profile and session identity in ``volatile``.
+    Every tier is frozen when the app-server session starts.
 
     Unlike the legacy preset bridge, no tier is injected into a user message
     and SOUL is loaded exactly once.
     """
-    # Start from the one canonical Hermes assembly path. Maintaining a second
-    # partial copy here previously dropped the date/model/provider line,
-    # skills index, profile boundary, environment probe, steering guidance,
-    # and other stable behavior whenever the Claude bridge was selected.
+    # Reuse canonical assembly for every user/project/session-owned layer. The
+    # native stable tier also contains verbose generic tool-loop guidance
+    # (parallel calls, skills discovery, steering, provider hints, etc.).
+    # Claude's app-server already receives the exact live tool schemas plus an
+    # authoritative MCP contract, and forwarding that boilerplate duplicates
+    # the harness while making custom subscription requests large enough to be
+    # routed to extra usage. Keep only SOUL/persona in the globally cached
+    # prefix; all important Hermes context remains system-level below.
     parts = build_system_prompt_parts(
         agent,
         system_message=system_message,
-        app_server_persona_precedence=True,
     )
+    identity = build_app_server_identity_prompt(agent)
+    parts["stable"] = identity or DEFAULT_AGENT_IDENTITY
 
     # Native transports append this API-only block after their cached system
     # prompt. App-server system prompts are immutable for the resumed Claude

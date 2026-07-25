@@ -199,7 +199,7 @@ def test_app_server_prompt_keeps_persona_and_full_hermes_context():
     assert "terse, professional, or emotionally restrained" in identity
     assert "Session ID: session-123" in prompt
     assert "You are Hermes Agent" not in prompt
-    assert "You run on Hermes Agent" in prompt
+    assert "You run on Hermes Agent" not in prompt
 
 
 def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
@@ -246,7 +246,7 @@ def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
     assert context_files.call_args.kwargs["skip_soul"] is True
 
 
-def test_app_server_prompt_stays_in_parity_with_canonical_hermes_assembly():
+def test_app_server_prompt_keeps_canonical_context_but_omits_native_tool_loop_boilerplate():
     agent = _make_agent(
         valid_tool_names={"memory", "session_search"},
         _memory_store=_PromptMemoryStore(),
@@ -269,9 +269,13 @@ def test_app_server_prompt_stays_in_parity_with_canonical_hermes_assembly():
         canonical = build_system_prompt_parts(agent)
         app_server = build_app_server_system_prompt_parts(agent)
 
-    assert app_server["stable"] == (
-        canonical["stable"] + "\n\n" + APP_SERVER_PERSONA_PRECEDENCE
-    )
+    assert "# Operator-defined persona" in app_server["stable"]
+    assert "# Soul\nStay human." in app_server["stable"]
+    assert APP_SERVER_PERSONA_PRECEDENCE in app_server["stable"]
+    assert "environment" in canonical["stable"]
+    assert "environment" not in app_server["stable"]
+    assert "You run on Hermes Agent" in canonical["stable"]
+    assert "You run on Hermes Agent" not in app_server["stable"]
     assert app_server["context"] == (
         canonical["context"]
         + "\n\n"
