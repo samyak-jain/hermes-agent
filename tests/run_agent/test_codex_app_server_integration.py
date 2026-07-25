@@ -204,6 +204,7 @@ class TestRunConversationCodexPath:
         agent = _make_codex_agent()
         agent._memory_manager = MagicMock()
         agent._memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager.prefetch_all.return_value = ""
 
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
@@ -377,6 +378,96 @@ class TestRunConversationCodexPath:
             agent.run_conversation("hi")
 
         assert captured["cwd"] == str(tmp_path)
+
+    def test_cache_aware_system_prompt_parts_reach_the_transport(self, monkeypatch):
+        """Stable and session-specific system tiers must remain separate."""
+        captured: dict[str, object] = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-prompt-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-prompt-1",
+                thread_id="thread-prompt-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        with (
+            patch(
+                "agent.codex_runtime._codex_app_server_config",
+                return_value={"adapter": "claude_agent_sdk"},
+            ),
+            patch(
+                "agent.system_prompt.build_app_server_system_prompt_parts",
+                return_value={
+                    "stable": "SOUL and stable guidance",
+                    "context": "AGENTS project context",
+                    "volatile": "memory and session context",
+                },
+            ),
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent,
+                "_spawn_background_review",
+                return_value=None,
+            ):
+                agent.run_conversation("user-authored text")
+
+        assert captured["system_prompt_identity"] == "SOUL and stable guidance"
+        assert captured["system_prompt_append"] == (
+            "AGENTS project context\n\nmemory and session context"
+        )
+
+    def test_app_server_receives_api_only_gateway_turn_context(self, monkeypatch):
+        """Per-turn gateway notes must reach Claude without dirtying history."""
+        captured: dict[str, object] = {}
+
+        def fake_init(self, **kwargs):
+            self._thread_id = "thread-context-1"
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-context-1",
+                thread_id="thread-context-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        with patch(
+            "agent.codex_runtime._codex_app_server_config",
+            return_value={"adapter": "claude_agent_sdk"},
+        ):
+            agent = _make_codex_agent()
+            agent._gateway_turn_context_notes = (
+                "[Voice channel now: Samyak is speaking]"
+            )
+            with patch.object(
+                agent,
+                "_spawn_background_review",
+                return_value=None,
+            ):
+                result = agent.run_conversation("user-authored text")
+
+        assert captured["user_input"] == (
+            "user-authored text\n\n"
+            "[Voice channel now: Samyak is speaking]"
+        )
+        user_messages = [
+            message for message in result["messages"]
+            if message.get("role") == "user"
+        ]
+        assert user_messages[-1]["content"] == "user-authored text"
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
