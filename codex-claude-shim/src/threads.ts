@@ -23,9 +23,10 @@ export interface ThreadState {
   cwd?: string;
   model?: string;
   permissionMode?: string;
+  /** Session-specific system context (project instructions, memory, profile). */
   systemPromptAppend?: string;
+  /** Globally cacheable system prefix (SOUL and stable Hermes guidance). */
   systemPromptIdentity?: string;
-  hostContextDelivered?: boolean;
   tools: HostToolSchema[];
   usageTotal: Usage;
   activeTurn?: {
@@ -51,7 +52,6 @@ interface PersistedThread {
   model?: string;
   systemPromptAppend?: string;
   systemPromptIdentity?: string;
-  hostContextDelivered?: boolean;
 }
 
 const emptyUsage = (): Usage => ({
@@ -112,7 +112,6 @@ export class ThreadStore {
       this.threads.set(threadId, state);
     } else if (claudeSessionId && state.claudeSessionId !== claudeSessionId) {
       state.claudeSessionId = claudeSessionId;
-      state.hostContextDelivered = false;
     }
     this.persist();
     return state;
@@ -121,19 +120,6 @@ export class ThreadStore {
   bindClaudeSession(thread: ThreadState, claudeSessionId: string): void {
     if (thread.claudeSessionId === claudeSessionId) return;
     thread.claudeSessionId = claudeSessionId;
-    thread.hostContextDelivered = false;
-    this.persist();
-  }
-
-  markHostContextDelivered(thread: ThreadState): void {
-    if (thread.hostContextDelivered) return;
-    thread.hostContextDelivered = true;
-    this.persist();
-  }
-
-  resetHostContextDelivery(thread: ThreadState): void {
-    if (!thread.hostContextDelivered) return;
-    thread.hostContextDelivered = false;
     this.persist();
   }
 
@@ -157,12 +143,16 @@ export class ThreadStore {
         if (!persisted.threadId) continue;
         const state: ThreadState = {
           ...persisted,
-          // Version 1 sessions embedded the complete host context in the
-          // preset append. Versions before 3 also predate the persona output
-          // style. Start a fresh Claude session once so no cached conversation
-          // mixes the old and new system-prompt layouts.
-          ...(persistenceVersion < 3
-            ? { claudeSessionId: undefined, hostContextDelivered: false }
+          // Versions before 4 used Claude Code's preset, duplicated SOUL, and
+          // delivered the remaining Hermes prompt inside the first user
+          // message. Start a fresh Claude session once and discard those old
+          // prompt fields so create() installs the custom cache-aware layout.
+          ...(persistenceVersion < 4
+            ? {
+                claudeSessionId: undefined,
+                systemPromptAppend: undefined,
+                systemPromptIdentity: undefined,
+              }
             : {}),
           tools: [],
           usageTotal: emptyUsage(),
@@ -184,11 +174,10 @@ export class ThreadStore {
       model: thread.model,
       systemPromptAppend: thread.systemPromptAppend,
       systemPromptIdentity: thread.systemPromptIdentity,
-      hostContextDelivered: thread.hostContextDelivered,
     }));
     mkdirSync(dirname(this.persistencePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.persistencePath}.tmp-${process.pid}`;
-    writeFileSync(temporary, JSON.stringify({ version: 3, threads: records }), {
+    writeFileSync(temporary, JSON.stringify({ version: 4, threads: records }), {
       encoding: "utf8",
       mode: 0o600,
     });

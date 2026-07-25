@@ -19,7 +19,6 @@ test("host sessions resume their Claude session and original prompt snapshot", (
     tools: [],
   });
   firstStore.bindClaudeSession(first, "claude-session-1");
-  firstStore.markHostContextDelivered(first);
 
   const secondStore = new ThreadStore(persistence);
   const resumed = secondStore.create({
@@ -35,17 +34,16 @@ test("host sessions resume their Claude session and original prompt snapshot", (
   assert.equal(resumed.claudeSessionId, "claude-session-1");
   assert.equal(resumed.systemPromptAppend, "original memory snapshot");
   assert.equal(resumed.systemPromptIdentity, "original soul");
-  assert.equal(resumed.hostContextDelivered, true);
-  assert.equal(JSON.parse(readFileSync(persistence, "utf8")).version, 3);
+  assert.equal(JSON.parse(readFileSync(persistence, "utf8")).version, 4);
 });
 
-test("pre-persona threads start a fresh session for first-turn host context", () => {
+test("preset-prompt threads start a fresh session with the custom prompt", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-bridge-v1-"));
   const persistence = join(root, "threads.json");
   writeFileSync(
     persistence,
     JSON.stringify({
-      version: 2,
+      version: 3,
       threads: [
         {
           threadId: "thr_old",
@@ -65,11 +63,11 @@ test("pre-persona threads start a fresh session for first-turn host context", ()
     tools: [],
   });
   assert.equal(migrated.claudeSessionId, undefined);
-  assert.equal(migrated.hostContextDelivered, false);
   assert.equal(migrated.systemPromptIdentity, "SOUL");
+  assert.equal(migrated.systemPromptAppend, "new full context");
 });
 
-test("binding a replacement Claude session resets host context delivery", () => {
+test("binding a replacement Claude session keeps the frozen prompt snapshot", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-bridge-rebind-"));
   const store = new ThreadStore(join(root, "threads.json"));
   const state = store.create({
@@ -78,16 +76,12 @@ test("binding a replacement Claude session resets host context delivery", () => 
     tools: [],
   });
   store.bindClaudeSession(state, "claude-session-1");
-  store.markHostContextDelivered(state);
 
   store.bindClaudeSession(state, "claude-session-2");
 
   assert.equal(state.claudeSessionId, "claude-session-2");
-  assert.equal(state.hostContextDelivered, false);
-
-  store.markHostContextDelivered(state);
   store.resume(state.threadId, "claude-session-3");
 
   assert.equal(state.claudeSessionId, "claude-session-3");
-  assert.equal(state.hostContextDelivered, false);
+  assert.equal(state.systemPromptAppend, "persistent context");
 });

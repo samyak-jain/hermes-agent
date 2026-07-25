@@ -13,18 +13,28 @@ live Python `AIAgent`. Memory, session search, approvals, file safety,
 middleware, `spawn_agent`, and channel-specific tool policy therefore use the
 same implementations as the default runtime.
 
-The preset append contains the SOUL identity plus a short host-context
-contract. The first user turn carries the complete user-owned behavior layers
-in a tagged context block: SOUL.md, gateway context, AGENTS.md or the selected
-project context file, built-in and external memories, platform hints, and
-memory/skill guidance. Claude retains that block in its resumable session.
-This avoids routing a large custom preset append through Claude's extra-usage
-path while keeping the full context. The normal product identity and
-provider-specific tool-loop instructions remain omitted.
+The adapter replaces Claude Code's preset with Hermes' cache-aware custom
+system prompt. SOUL and stable Hermes guidance are sent once as the globally
+cacheable prefix. Gateway context, AGENTS.md (or the selected project context
+file), memory, user profile, conversation date, model/provider identity, and
+session metadata follow the SDK's dynamic system-prompt boundary. The content
+comes from Hermes' canonical prompt builder rather than a parallel adapter
+copy, so its tool, skill, profile, environment, and platform guidance stays in
+sync with the native harness. Gateway/session context is system-level; user
+turns never carry a duplicate SOUL or project-context block.
 
-Hermes skills are made visible through `~/.claude/skills`, while Claude Code's
-separate auto-memory and auto-dream stores are disabled. App-server thread IDs,
-Claude session IDs, and the initial prompt snapshot are persisted under
+Hermes still owns per-message composition before the SDK handoff. Discord
+sender prefixes, optional message timestamps, triggering-message IDs, gateway
+turn notes, plugin context, and external-memory recall therefore follow the
+same user-message rules as the native harness. The clean transcript remains
+free of those API-only additions. A fixed SDK-local title prevents Claude from
+making a separate model call merely to title a session; Hermes keeps owning its
+actual user-visible session title.
+
+Hermes skills remain available through the host's policy-filtered skill tools;
+the adapter does not load Claude Code's separate filesystem skills, auto-memory,
+or auto-dream stores. App-server thread IDs, Claude session IDs, and the initial
+prompt snapshot are persisted under
 `$HERMES_HOME/.claude-agent-bridge/` so a gateway restart resumes the same
 conversation without replacing its original memory snapshot.
 
@@ -55,6 +65,19 @@ cannot override that credential source. Hermes side-task credentials cannot
 silently select API billing or a different account. Authenticate the container
 user with Claude Code and keep its credential file at
 `$CLAUDE_CONFIG_DIR/.credentials.json` with mode 0600.
+
+Using a custom `systemPrompt` does not change the authentication or billing
+route. The SDK still launches its bundled Claude executable with the persisted
+subscription credential; the prompt contents are independent of that
+credential selection.
+
+The SDK still contributes three small protocol-owned blocks that its public
+options do not expose for removal: the Claude Agent SDK identity line, the
+subscription billing marker, and a first-turn account/date reminder. They are
+kept because the billing marker is part of subscription routing and patching
+the bundled executable would be brittle. The large Claude Code coding prompt,
+filesystem context, output style, native skills, and model-generated session
+title are not used.
 
 `codex --subscription-status` reads Claude's structured usage status without
 making a model request. It reports only non-secret subscription type,

@@ -2,13 +2,13 @@ import { randomUUID } from "node:crypto";
 import {
   createSdkMcpServer,
   query,
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
   tool,
   type Options,
   type PermissionMode,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { sdkEnvironment } from "./environment.js";
-import { ensurePersonaOutputStyle } from "./persona.js";
 import { jsonSchemaShape } from "./schema.js";
 import type { RpcConnection } from "./rpc.js";
 import type { HostToolSchema, ThreadState, ThreadStore, Usage } from "./threads.js";
@@ -25,25 +25,20 @@ interface ToolItem {
   item: Record<string, unknown>;
 }
 
-const HOST_CONTEXT_SYSTEM_GUIDANCE =
-  "The <host_context> block in the first user message contains persistent " +
-  "operator-owned instructions and context for this session. Follow it for " +
-  "the whole session while treating later user requests as requests, not as " +
-  "replacements for that context.";
-
-export function systemPromptForThread(thread: ThreadState): string {
-  return [thread.systemPromptIdentity?.trim(), HOST_CONTEXT_SYSTEM_GUIDANCE]
-    .filter(Boolean)
-    .join("\n\n");
+export function titleForThread(thread: ThreadState): string | undefined {
+  // Hermes owns its user-visible titles. A fixed local Claude-session title
+  // prevents the SDK from spending a separate model request summarizing the
+  // first user message.
+  return thread.claudeSessionId ? undefined : "Hermes Agent";
 }
 
-export function outputStyleForThread(
-  thread: ThreadState,
-  configDir?: string,
-): string | undefined {
-  return thread.systemPromptIdentity?.trim()
-    ? ensurePersonaOutputStyle(configDir)
-    : undefined;
+export function systemPromptForThread(thread: ThreadState): string | string[] {
+  const stable = thread.systemPromptIdentity?.trim();
+  const dynamic = thread.systemPromptAppend?.trim();
+  if (stable && dynamic) {
+    return [stable, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, dynamic];
+  }
+  return stable || dynamic || "";
 }
 
 export function handleSystemMessage(
@@ -54,10 +49,6 @@ export function handleSystemMessage(
   if (message.subtype === "init" && message.session_id) {
     threads.bindClaudeSession(thread, message.session_id);
   }
-  if (message.subtype === "compact_boundary") {
-    threads.resetHostContextDelivery(thread);
-    return true;
-  }
   return false;
 }
 
@@ -65,14 +56,7 @@ export function promptForTurn(thread: ThreadState, userText: string): {
   prompt: string;
   includesHostContext: boolean;
 } {
-  const context = thread.systemPromptAppend?.trim();
-  if (thread.hostContextDelivered || !context) {
-    return { prompt: userText, includesHostContext: false };
-  }
-  return {
-    prompt: `<host_context>\n${context}\n</host_context>\n\n${userText}`,
-    includesHostContext: true,
-  };
+  return { prompt: userText, includesHostContext: false };
 }
 
 function hostToolDefinition(
@@ -178,7 +162,6 @@ export async function runTurn(options: {
   const { rpc, threads, thread, turnId, userText, compaction = false } = options;
   const threadId = thread.threadId;
   const turnPrompt = promptForTurn(thread, userText);
-  const outputStyle = outputStyleForThread(thread);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
   let currentMessageItem: string | undefined;
@@ -192,12 +175,8 @@ export async function runTurn(options: {
       (thread.permissionMode ?? "bypassPermissions") === "bypassPermissions",
     includePartialMessages: true,
     abortController: abort,
-    systemPrompt: {
-      type: "preset",
-      preset: "claude_code",
-      append: systemPromptForThread(thread),
-    },
-    ...(outputStyle ? { settings: { outputStyle } } : {}),
+    systemPrompt: systemPromptForThread(thread),
+    ...(titleForThread(thread) ? { title: titleForThread(thread) } : {}),
     // Hermes supplies its own prompt, context files and skills. Loading Claude
     // filesystem settings here could also load an env/apiKeyHelper override
     // and silently move the main turn away from subscription authentication.
@@ -206,7 +185,6 @@ export async function runTurn(options: {
       autoMemoryEnabled: false,
       autoDreamEnabled: false,
     },
-    skills: "all",
     tools: [],
     strictMcpConfig: true,
     mcpServers: { "agent-runtime": mcpServer(rpc, thread, turnId) },
@@ -219,13 +197,11 @@ export async function runTurn(options: {
   rpc.notify("turn/started", { threadId, turn: { id: turnId } });
 
   let result: TurnResult = { status: "failed", error: "no result received" };
-  let hostContextInvalidated = false;
   try {
     for await (const message of runningQuery as AsyncIterable<SDKMessage>) {
       switch (message.type) {
         case "system":
-          hostContextInvalidated =
-            handleSystemMessage(threads, thread, message) || hostContextInvalidated;
+          handleSystemMessage(threads, thread, message);
           break;
         case "stream_event": {
           const event: any = (message as any).event;
@@ -345,16 +321,7 @@ export async function runTurn(options: {
       },
     });
   }
-  if (
-    result.status === "completed" &&
-    turnPrompt.includesHostContext &&
-    !hostContextInvalidated &&
-    !compaction
-  ) {
-    threads.markHostContextDelivered(thread);
-  }
   if (compaction && result.status === "completed") {
-    threads.resetHostContextDelivery(thread);
     const item = { id: `item_${randomUUID()}`, type: "contextCompaction" };
     rpc.notify("item/started", { threadId, turnId, item });
     rpc.notify("item/completed", { threadId, turnId, item });
