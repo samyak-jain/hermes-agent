@@ -89,13 +89,10 @@ function hostToolDefinition(
   );
 }
 
-function mcpServer(rpc: RpcConnection, thread: ThreadState, turnId: string) {
+export function mcpServer(rpc: RpcConnection, thread: ThreadState, turnId: string) {
   return createSdkMcpServer({
     name: "agent-runtime",
     version: "1.0.0",
-    instructions:
-      "These are the host runtime's policy-filtered tools. Use them for all actions; " +
-      "their results and approvals are authoritative.",
     tools: thread.tools.map((definition) =>
       hostToolDefinition(rpc, thread, turnId, definition),
     ),
