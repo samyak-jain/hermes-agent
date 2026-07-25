@@ -14,8 +14,8 @@ middleware, `spawn_agent`, and channel-specific tool policy therefore use the
 same implementations as the default runtime.
 
 The adapter replaces Claude Code's preset with Hermes' cache-aware custom
-system prompt. SOUL and its persona-precedence rule are sent once as the
-globally cacheable prefix. Gateway context, AGENTS.md (or the selected project
+system prompt. SOUL is sent once as the globally cacheable prefix. Gateway
+context, AGENTS.md (or the selected project
 context file), memory, user profile, conversation date, model/provider
 identity, and session metadata come from Hermes' canonical prompt builder and
 follow the SDK's dynamic system-prompt boundary. Gateway/session context is
