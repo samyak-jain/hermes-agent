@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import (
-    APP_SERVER_PERSONA_PRECEDENCE,
     build_app_server_identity_prompt,
     build_app_server_system_prompt,
     build_system_prompt,
@@ -535,6 +534,7 @@ def test_app_server_prompt_keeps_persona_and_full_hermes_context():
     assert "Messages can be prefixed" in prompt
     assert "# Operator-defined persona" in identity
     assert "# Soul\nBe warm and incisive." in identity
+    assert "# Persona precedence" not in identity
     assert "Session ID: session-123" in prompt
     assert "You are Hermes Agent" not in prompt
     assert "You run on Hermes Agent" not in prompt
@@ -609,7 +609,7 @@ def test_app_server_prompt_keeps_canonical_context_but_omits_native_tool_loop_bo
 
     assert "# Operator-defined persona" in app_server["stable"]
     assert "# Soul\nStay human." in app_server["stable"]
-    assert APP_SERVER_PERSONA_PRECEDENCE in app_server["stable"]
+    assert "# Persona precedence" not in app_server["stable"]
     assert "environment" in canonical["stable"]
     assert "environment" not in app_server["stable"]
     assert "You run on Hermes Agent" in canonical["stable"]
