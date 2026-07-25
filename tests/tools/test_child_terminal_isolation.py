@@ -37,6 +37,9 @@ def test_child_ssh_config_resolves_runtime_host_file(tmp_path: Path):
         "ssh_key": "/run/secrets/sandbox-key",
         "ssh_known_hosts_file": "/run/secrets/sandbox-known-hosts",
         "ssh_sync_files": False,
+        "ssh_systemd_run": False,
+        "ssh_command_memory_max_mb": 0,
+        "ssh_background_ttl_seconds": 86400,
     }
 
 
@@ -65,6 +68,27 @@ def test_child_ssh_file_sync_is_opt_in():
     )
 
     assert overrides["ssh_sync_files"] is False
+
+
+def test_child_ssh_supervisor_policy_is_propagated():
+    overrides = _get_child_terminal_overrides(
+        {
+            "child_terminal": {
+                "backend": "ssh",
+                "ssh_host": "10.233.1.2",
+                "ssh_user": "root",
+                "ssh_systemd_run": True,
+                "ssh_systemd_slice": "hermes-work.slice",
+                "ssh_command_memory_max_mb": 1024,
+                "ssh_background_ttl_seconds": 21600,
+            }
+        }
+    )
+
+    assert overrides["ssh_systemd_run"] is True
+    assert overrides["ssh_systemd_slice"] == "hermes-work.slice"
+    assert overrides["ssh_command_memory_max_mb"] == 1024
+    assert overrides["ssh_background_ttl_seconds"] == 21600
 
 
 def test_task_override_changes_child_not_parent(monkeypatch):
