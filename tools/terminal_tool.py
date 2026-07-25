@@ -1246,6 +1246,10 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - ssh_host/ssh_user/ssh_port/ssh_key: SSH connection settings
         - ssh_known_hosts_file: str -- Pinned SSH known-hosts file
         - ssh_sync_files: bool -- Whether to sync Hermes files to the remote
+        - ssh_systemd_run: bool -- Run commands in remote transient units
+        - ssh_systemd_slice: str -- Optional remote systemd slice
+        - ssh_command_memory_max_mb: int -- Per-command remote memory ceiling
+        - ssh_background_ttl_seconds: int -- Hard lease for background commands
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1475,6 +1479,10 @@ def get_task_env_config(task_id: Optional[str]) -> Dict[str, Any]:
         "ssh_key",
         "ssh_known_hosts_file",
         "ssh_sync_files",
+        "ssh_systemd_run",
+        "ssh_systemd_slice",
+        "ssh_command_memory_max_mb",
+        "ssh_background_ttl_seconds",
     }
     for key in supported:
         if key in overrides:
@@ -1692,6 +1700,16 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_systemd_run": os.getenv(
+            "TERMINAL_SSH_SYSTEMD_RUN", "false"
+        ).lower() in {"true", "1", "yes"},
+        "ssh_systemd_slice": os.getenv("TERMINAL_SSH_SYSTEMD_SLICE", ""),
+        "ssh_command_memory_max_mb": _parse_env_var(
+            "TERMINAL_SSH_COMMAND_MEMORY_MAX_MB", "0"
+        ),
+        "ssh_background_ttl_seconds": _parse_env_var(
+            "TERMINAL_SSH_BACKGROUND_TTL_SECONDS", "86400"
+        ),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1752,7 +1770,15 @@ def _ssh_config_from_config(config: Dict[str, Any]) -> dict:
         "user": config.get("ssh_user", ""),
         "port": config.get("ssh_port", 22),
         "key": config.get("ssh_key", ""),
+        "known_hosts_file": config.get("ssh_known_hosts_file", ""),
+        "sync_files": config.get("ssh_sync_files", True),
         "persistent": config.get("ssh_persistent", False),
+        "systemd_run": config.get("ssh_systemd_run", False),
+        "systemd_slice": config.get("ssh_systemd_slice", ""),
+        "command_memory_max_mb": config.get("ssh_command_memory_max_mb", 0),
+        "background_ttl_seconds": config.get(
+            "ssh_background_ttl_seconds", 86400
+        ),
     }
 
 
@@ -1967,6 +1993,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             sync_files=ssh_config.get("sync_files", True),
             cwd=cwd,
             timeout=timeout,
+            task_id=task_id,
+            systemd_run=ssh_config.get("systemd_run", False),
+            systemd_slice=ssh_config.get("systemd_slice", ""),
+            command_memory_max_mb=ssh_config.get("command_memory_max_mb", 0),
+            background_ttl_seconds=ssh_config.get("background_ttl_seconds", 86400),
         )
 
     else:

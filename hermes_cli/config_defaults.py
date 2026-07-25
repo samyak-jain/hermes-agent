@@ -485,6 +485,13 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # Optional remote command supervision for trusted SSH sandboxes.
+        # These config values are bridged to the internal terminal environment
+        # used by child processes; users configure them here, not in .env.
+        "ssh_systemd_run": False,
+        "ssh_systemd_slice": "",
+        "ssh_command_memory_max_mb": 0,
+        "ssh_background_ttl_seconds": 86400,
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in
