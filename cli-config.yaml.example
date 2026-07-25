@@ -238,6 +238,12 @@ terminal:
 #   ssh_user: "myuser"
 #   ssh_port: 22
 #   ssh_key: "~/.ssh/id_rsa"  # Optional - uses ssh-agent if not specified
+#   # For systemd-based remote sandboxes, supervise every command remotely so
+#   # gateway crashes cannot leave unbounded processes behind.
+#   ssh_systemd_run: true
+#   ssh_systemd_slice: "hermes-work.slice"
+#   ssh_command_memory_max_mb: 1024
+#   ssh_background_ttl_seconds: 21600  # Six-hour hard lease
 
 # -----------------------------------------------------------------------------
 # OPTION 3: Docker container

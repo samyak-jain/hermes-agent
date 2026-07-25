@@ -319,6 +319,11 @@ Runs commands on a remote server over SSH. Uses ControlMaster for connection reu
 terminal:
   backend: ssh
   persistent_shell: true           # Keep a long-lived bash session (default: true)
+  # Recommended for a trusted systemd-based sandbox:
+  ssh_systemd_run: true
+  ssh_systemd_slice: hermes-work.slice
+  ssh_command_memory_max_mb: 1024
+  ssh_background_ttl_seconds: 21600
 ```
 
 **Required environment variables:**
@@ -335,8 +340,19 @@ TERMINAL_SSH_USER=ubuntu
 | `TERMINAL_SSH_PORT` | `22` | SSH port |
 | `TERMINAL_SSH_KEY` | (system default) | Path to SSH private key |
 | `TERMINAL_SSH_PERSISTENT` | `true` | Enable persistent shell |
+| `TERMINAL_SSH_SYSTEMD_RUN` | `false` | Run commands in transient remote systemd services |
+| `TERMINAL_SSH_SYSTEMD_SLICE` | (none) | Place transient services in this remote slice |
+| `TERMINAL_SSH_COMMAND_MEMORY_MAX_MB` | `0` | Per-command cgroup memory ceiling; `0` disables it |
+| `TERMINAL_SSH_BACKGROUND_TTL_SECONDS` | `86400` | Hard remote lease for background processes |
 
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`. Persistent shell keeps a single `bash -l` process alive on the remote host, communicating via temporary files. Commands that need `stdin_data` or `sudo` automatically fall back to one-shot mode.
+
+When `ssh_systemd_run` is enabled, each foreground command receives a remote
+`RuntimeMaxSec` deadline and `KillMode=control-group`; killing or timing out the
+local SSH client also stops the remote unit. Background commands become leased
+transient services and are stopped when `ssh_background_ttl_seconds` elapses.
+This mode requires a remote systemd service manager and permission to create
+transient units.
 
 ### Modal Backend
 

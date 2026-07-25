@@ -108,6 +108,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    backend_id: str = ""                        # Remote supervisor identity (e.g. systemd unit)
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -866,12 +867,28 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
-        bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
-            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
-        )
+        bg_command = None
+        build_supervised = getattr(env, "build_background_command", None)
+        if callable(build_supervised):
+            supervised = build_supervised(
+                command=command,
+                log_path=log_path,
+                pid_path=pid_path,
+                exit_path=exit_path,
+                ttl_seconds=getattr(
+                    env, "background_ttl_seconds", MAX_ACTIVE_PROCESS_AGE
+                ),
+            )
+            if supervised is not None:
+                bg_command, session.backend_id = supervised
+
+        if bg_command is None:
+            bg_command = (
+                f"mkdir -p {quoted_temp_dir} && "
+                f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
+                f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
+                f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            )
 
         try:
             result = env.execute(
@@ -1024,6 +1041,11 @@ class ProcessRegistry:
                     session.exited = True
                     if session.completion_reason != "killed":
                         session.completion_reason = "exited"
+                    release_backend = getattr(
+                        env, "release_background_unit", None
+                    )
+                    if callable(release_backend) and session.backend_id:
+                        release_backend(session.backend_id)
                     self._move_to_finished(session)
                     return
 
@@ -1033,6 +1055,9 @@ class ProcessRegistry:
                 session.exit_code = -1
                 session.completion_reason = "lost"
                 session.termination_source = "backend_lost"
+                release_backend = getattr(env, "release_background_unit", None)
+                if callable(release_backend) and session.backend_id:
+                    release_backend(session.backend_id)
                 self._move_to_finished(session)
                 return
 
@@ -1546,9 +1571,22 @@ class ProcessRegistry:
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
+            elif session.env_ref and session.backend_id:
+                kill_backend = getattr(session.env_ref, "kill_background_unit", None)
+                if not callable(kill_backend):
+                    raise RuntimeError(
+                        "Remote background supervisor cannot be stopped by this backend"
+                    )
+                kill_backend(session.backend_id)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Prefer a process-group kill so grandchildren cannot escape
+                # when the backend launcher created a new session.
+                session.env_ref.execute(
+                    f"kill -TERM -- -{session.pid} 2>/dev/null || "
+                    f"kill {session.pid} 2>/dev/null",
+                    timeout=5,
+                )
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -1893,6 +1931,7 @@ class ProcessRegistry:
                             "command": s.command,
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
+                            "backend_id": s.backend_id,
                             "host_start_time": s.host_start_time,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
@@ -1973,6 +2012,7 @@ class ProcessRegistry:
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
+                backend_id=entry.get("backend_id", ""),
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill

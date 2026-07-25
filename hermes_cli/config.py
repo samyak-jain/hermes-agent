@@ -2338,6 +2338,15 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Optional remote command supervision for trusted SSH sandboxes.
+        # When enabled, foreground and background commands run in transient
+        # systemd units with remote deadlines and cgroup-wide cleanup. This
+        # prevents commands from surviving a gateway crash as unbounded
+        # orphans. Leave disabled for SSH targets without systemd.
+        "ssh_systemd_run": False,
+        "ssh_systemd_slice": "",
+        "ssh_command_memory_max_mb": 0,
+        "ssh_background_ttl_seconds": 86400,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -7337,6 +7346,10 @@ TERMINAL_CONFIG_ENV_MAP = {
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
     "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_systemd_run": "TERMINAL_SSH_SYSTEMD_RUN",
+    "ssh_systemd_slice": "TERMINAL_SSH_SYSTEMD_SLICE",
+    "ssh_command_memory_max_mb": "TERMINAL_SSH_COMMAND_MEMORY_MAX_MB",
+    "ssh_background_ttl_seconds": "TERMINAL_SSH_BACKGROUND_TTL_SECONDS",
     "container_cpu": "TERMINAL_CONTAINER_CPU",
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",

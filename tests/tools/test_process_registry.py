@@ -773,6 +773,37 @@ class TestSpawnEnvSanitization:
         args, kwargs = env.commands[0]
         assert kwargs.get("rewrite_compound_background") is False
 
+    def test_spawn_via_env_uses_remote_supervisor_and_records_identity(
+        self, registry,
+    ):
+        class FakeEnv:
+            background_ttl_seconds = 21600
+
+            def __init__(self):
+                self.commands = []
+                self.supervisor_args = None
+
+            def build_background_command(self, **kwargs):
+                self.supervisor_args = kwargs
+                return "supervised-launch", "hermes-bg-test"
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4321\n", "returncode": 0}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "echo hello")
+
+        assert env.commands[0][0] == "supervised-launch"
+        assert env.supervisor_args["ttl_seconds"] == 21600
+        assert session.backend_id == "hermes-bg-test"
+        assert session.pid == 4321
+        fake_thread.start.assert_called_once()
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False

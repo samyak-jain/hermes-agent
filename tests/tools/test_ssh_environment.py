@@ -230,6 +230,99 @@ class TestSSHPreflight:
         assert env.user == "alice"
 
 
+class TestSSHSystemdSupervision:
+    @pytest.fixture(autouse=True)
+    def _mock_connection(self, monkeypatch):
+        monkeypatch.setattr(ssh_env, "_ensure_ssh_available", lambda: None)
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment, "_establish_connection", lambda self: None
+        )
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/root"
+        )
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+
+    def test_foreground_command_has_remote_deadline_and_memory_cgroup(
+        self, monkeypatch,
+    ):
+        captured = {}
+        proc = MagicMock()
+
+        def fake_popen(cmd, stdin_data=None):
+            captured["cmd"] = cmd
+            return proc
+
+        monkeypatch.setattr(ssh_env, "_popen_bash", fake_popen)
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            task_id="subagent-123",
+            systemd_run=True,
+            systemd_slice="hermes-work.slice",
+            command_memory_max_mb=1024,
+        )
+
+        result = env._run_bash("nix search nixpkgs wacli --json", timeout=180)
+        remote = captured["cmd"][-1]
+
+        assert result is proc
+        assert "systemd-run" in remote
+        assert "--wait" in remote
+        assert "RuntimeMaxSec=185s" in remote
+        assert "MemoryHigh=819M" in remote
+        assert "MemoryMax=1024M" in remote
+        assert "--slice=hermes-work.slice" in remote
+        assert "nix search nixpkgs wacli --json" in remote
+        assert getattr(proc, "_hermes_remote_systemd_unit").startswith(
+            "hermes-cmd-"
+        )
+
+    def test_kill_stops_remote_unit_before_local_client(self, monkeypatch):
+        stopped = []
+        proc = MagicMock()
+        proc._hermes_remote_systemd_unit = "hermes-cmd-deadbeef"
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            systemd_run=True,
+        )
+        monkeypatch.setattr(env, "_stop_remote_units", lambda units: stopped.extend(units))
+
+        env._kill_process(proc)
+
+        assert stopped == ["hermes-cmd-deadbeef"]
+        proc.kill.assert_called_once()
+
+    def test_background_command_has_hard_lease(self):
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            task_id="subagent-123",
+            systemd_run=True,
+            systemd_slice="hermes-work.slice",
+            command_memory_max_mb=1024,
+            background_ttl_seconds=21600,
+        )
+
+        built = env.build_background_command(
+            command="python /data/worker.py",
+            log_path="/tmp/worker.log",
+            pid_path="/tmp/worker.pid",
+            exit_path="/tmp/worker.exit",
+        )
+
+        assert built is not None
+        command, unit = built
+        assert unit.startswith("hermes-bg-")
+        assert "RuntimeMaxSec=21600s" in command
+        assert "MemoryMax=1024M" in command
+        assert "printf" in command
+        assert "/tmp/worker.pid" in command
+
+
 def _setup_ssh_env(monkeypatch, persistent: bool):
     monkeypatch.setenv("TERMINAL_ENV", "ssh")
     monkeypatch.setenv("TERMINAL_SSH_HOST", _SSH_HOST)
