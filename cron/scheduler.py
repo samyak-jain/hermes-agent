@@ -10,6 +10,7 @@ runs at a time if multiple processes overlap.
 
 import asyncio
 import atexit
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
@@ -18,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -3917,10 +3919,87 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _run_job_script_in_task_env(
+    path: Path,
+    *,
+    task_id: str,
+    script_timeout: float,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str]:
+    """Stage and execute one validated cron script in its task environment.
+
+    Only the selected script crosses the environment boundary.  In
+    particular, an SSH-backed cron task does not gain access to the gateway's
+    complete HERMES_HOME merely so its wake-gate script can run.  The script is
+    transferred through stdin into a private remote temporary directory,
+    executed there, and removed by a shell trap.
+    """
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "Script cancelled because cron fire ownership was lost"
+        payload = base64.b64encode(path.read_bytes()).decode("ascii")
+
+        # _get_file_ops is the shared, lock-safe environment creation path for
+        # terminal and file tools.  Constructing it here ensures the exact
+        # task-scoped backend registered by _register_cron_terminal exists
+        # before we ask for the underlying environment.
+        from tools.file_tools import _get_file_ops
+        from tools.terminal_tool import get_active_env
+
+        _get_file_ops(task_id)
+        env = get_active_env(task_id)
+        if env is None:
+            return False, "Script execution failed: cron task environment unavailable"
+
+        suffix = path.suffix.lower()
+        interpreter = "/bin/bash" if suffix in {".sh", ".bash"} else "python3"
+        script_name = shlex.quote(path.name)
+        command = "\n".join(
+            (
+                'set +e',
+                '__hermes_cron_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermes-cron.XXXXXX") '
+                '|| exit 125',
+                'trap \'rm -rf -- "$__hermes_cron_dir"\' EXIT',
+                f'__hermes_cron_script="$__hermes_cron_dir"/{script_name}',
+                'base64 -d > "$__hermes_cron_script" || exit 126',
+                'chmod 700 "$__hermes_cron_script" || exit 126',
+                'builtin cd -- "$__hermes_cron_dir" || exit 126',
+                f'{shlex.quote(interpreter)} "$__hermes_cron_script"',
+            )
+        )
+        result = env.execute(
+            command,
+            timeout=max(1, int(script_timeout)),
+            stdin_data=payload,
+            rewrite_compound_background=False,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "Script cancelled because cron fire ownership was lost"
+        output = str(result.get("output") or "").strip()
+        returncode = int(result.get("returncode") or 0)
+
+        try:
+            from agent.redact import redact_sensitive_text
+
+            output = redact_sensitive_text(output)
+        except Exception as exc:
+            logger.warning("Failed to redact sensitive text from output: %s", exc)
+            output = "[REDACTED - redaction failed]"
+
+        if returncode != 0:
+            detail = f"\noutput:\n{output}" if output else ""
+            return False, f"Script exited with code {returncode}{detail}"
+        return True, output
+    except Exception as exc:
+        return False, f"Script execution failed in cron task environment: {exc}"
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *,
+    task_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3939,9 +4018,13 @@ def _run_job_script(
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
-    Subprocess environment is passed through ``_sanitize_subprocess_env`` so
-    provider credentials and other Hermes-managed secrets are not inherited
-    (SECURITY.md §2.3), matching terminal and MCP child processes.
+    When ``task_id`` names a registered task environment, the selected script
+    is staged and executed there.  This is how managed cron SSH backends keep
+    wake gates and ``no_agent`` watchdogs inside the same sandbox as direct
+    cron terminal/file/code tools.  With no task environment, legacy local
+    execution remains available and its subprocess environment is passed
+    through ``_sanitize_subprocess_env`` so provider credentials and other
+    Hermes-managed secrets are not inherited (SECURITY.md §2.3).
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
@@ -4005,6 +4088,14 @@ def _run_job_script(
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
+
+    if task_id:
+        return _run_job_script_in_task_env(
+            path,
+            task_id=task_id,
+            script_timeout=script_timeout,
+            cancel_event=cancel_event,
+        )
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4114,6 +4205,8 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *,
+    task_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4127,6 +4220,14 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    def _execute() -> tuple[bool, str]:
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            task_id=task_id,
+        )
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -4135,7 +4236,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _execute()
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4166,15 +4267,76 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _execute()
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _execute()
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
         # heartbeat is already waiting on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _cleanup_cron_task_environment(session_id: str) -> None:
+    """Tear down a short-lived cron script environment and its override."""
+    try:
+        from tools.terminal_tool import cleanup_vm
+
+        cleanup_vm(session_id)
+    except Exception:
+        logger.debug(
+            "Cron script task %s: failed to clean up environment",
+            session_id,
+            exc_info=True,
+        )
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+
+        clear_task_env_overrides(session_id)
+    except Exception:
+        logger.debug(
+            "Cron script task %s: failed to clear terminal override",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _run_cron_job_script(
+    job: dict,
+    script_path: str,
+    *,
+    session_id: str,
+    workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str]:
+    """Run a cron script through ``cron.terminal`` when it is configured.
+
+    The managed config overlay is included by ``load_config``.  A configured
+    but invalid sandbox fails closed: it must never silently fall back to the
+    gateway process and its credentials.
+    """
+    registered = False
+    try:
+        cfg = load_config() or {}
+        registered = _register_cron_terminal(session_id, cfg)
+    except Exception as exc:
+        return False, f"Cron script sandbox configuration failed: {exc}"
+
+    try:
+        run_kwargs: dict[str, Any] = {"workdir": workdir}
+        if cancel_event is not None:
+            run_kwargs["cancel_event"] = cancel_event
+        if registered:
+            run_kwargs["task_id"] = session_id
+        return _run_job_script_with_claim_heartbeat(
+            job,
+            script_path,
+            **run_kwargs,
+        )
+    finally:
+        if registered:
+            _cleanup_cron_task_environment(session_id)
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -5090,6 +5252,9 @@ def run_job(
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
+        _cron_script_session_id = (
+            f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        )
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is passed as the subprocess cwd so the
@@ -5104,8 +5269,12 @@ def run_job(
             _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+            ok, output = _run_cron_job_script(
+                job,
+                script_path,
+                session_id=_cron_script_session_id,
+                workdir=_job_workdir,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             logger.exception(
@@ -5309,15 +5478,23 @@ def run_job(
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
+    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
-    # the script is only executed once.
+    # the script is only executed once. The script gets its own short-lived
+    # use of this cron session's configured task environment; it is torn down
+    # before the model agent is constructed, then re-created under the same ID
+    # for direct terminal/file/code calls below.
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, cancel_event=cancel_event,
+        prerun_script = _run_cron_job_script(
+            job,
+            script_path,
+            session_id=_cron_session_id,
+            cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
@@ -5364,6 +5541,7 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    origin = _resolve_origin(job)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -6128,7 +6306,12 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            task_id=_cron_session_id,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:

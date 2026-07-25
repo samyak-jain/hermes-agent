@@ -179,6 +179,60 @@ class TestCronToolPolicy:
         assert overrides["cwd"] == "/data"
         assert overrides["ssh_sync_files"] is False
 
+    def test_cron_script_uses_registered_terminal_and_cleans_it_up(self):
+        import cron.scheduler as scheduler
+
+        cfg = {"cron": {"terminal": {"backend": "ssh"}}}
+        job = {"id": "watch", "schedule": "*/5 * * * *"}
+        with patch.object(scheduler, "load_config", return_value=cfg), patch.object(
+            scheduler,
+            "_register_cron_terminal",
+            return_value=True,
+        ) as register, patch.object(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+            return_value=(True, "ok"),
+        ) as run_script, patch.object(
+            scheduler,
+            "_cleanup_cron_task_environment",
+        ) as cleanup:
+            result = scheduler._run_cron_job_script(
+                job,
+                "watch.py",
+                session_id="cron_watch_1",
+            )
+
+        assert result == (True, "ok")
+        register.assert_called_once_with("cron_watch_1", cfg)
+        run_script.assert_called_once_with(
+            job,
+            "watch.py",
+            workdir=None,
+            task_id="cron_watch_1",
+        )
+        cleanup.assert_called_once_with("cron_watch_1")
+
+    def test_cron_script_sandbox_configuration_fails_closed(self):
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "load_config", return_value={}), patch.object(
+            scheduler,
+            "_register_cron_terminal",
+            side_effect=ValueError("missing SSH host"),
+        ), patch.object(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+        ) as run_script:
+            success, output = scheduler._run_cron_job_script(
+                {"id": "watch"},
+                "watch.py",
+                session_id="cron_watch_1",
+            )
+
+        assert success is False
+        assert "sandbox configuration failed" in output
+        run_script.assert_not_called()
+
     def test_prompt_archive_is_omitted_by_default_and_redacted_when_enabled(self):
         secret = "sk-" + ("x" * 30)
         assert _cron_archive_prompt(f"token {secret}", {}) == (
@@ -1502,10 +1556,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
+            assert task_id and task_id.startswith("cron_skill-env-job_")
             return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -1813,6 +1868,8 @@ class TestRunJobWakeGate:
         call_kwargs = agent.run_conversation.call_args
         prompt_arg = call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs.get("user_message", "")
         assert script_output in prompt_arg
+        assert call_kwargs.kwargs["task_id"] == agent_cls.call_args.kwargs["session_id"]
+        assert call_kwargs.kwargs["task_id"].startswith("cron_job_wake-gate-test_")
         assert success is True
         assert err is None
 
@@ -2897,7 +2954,6 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 class TestFailureStreakNudge:
     """Poke-inspired repeated-failure review nudge (_failure_streak_nudge)."""
 
