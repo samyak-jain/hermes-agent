@@ -14,6 +14,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -315,6 +316,90 @@ class TestRunJobScript:
         assert success is True
         parsed = json.loads(output)
         assert parsed["new_prs"][0]["number"] == 42
+
+    def test_registered_task_stages_and_executes_script_in_environment(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "sandboxed.py"
+        source = b'print("inside sandbox")\n'
+        script.write_bytes(source)
+        env = MagicMock()
+        env.execute.return_value = {
+            "returncode": 0,
+            "output": "inside sandbox\n",
+        }
+
+        with patch("tools.file_tools._get_file_ops") as ensure_env, patch(
+            "tools.terminal_tool.get_active_env",
+            return_value=env,
+        ):
+            success, output = _run_job_script(
+                str(script),
+                task_id="cron_job_20260725",
+            )
+
+        assert success is True
+        assert output == "inside sandbox"
+        ensure_env.assert_called_once_with("cron_job_20260725")
+        kwargs = env.execute.call_args.kwargs
+        assert kwargs["stdin_data"] != source.decode()
+        import base64
+
+        assert base64.b64decode(kwargs["stdin_data"]) == source
+        assert "python3" in env.execute.call_args.args[0]
+        assert str(script) not in env.execute.call_args.args[0]
+
+    def test_registered_task_reports_remote_nonzero_exit(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "sandboxed.sh"
+        script.write_text("exit 9\n")
+        env = MagicMock()
+        env.execute.return_value = {
+            "returncode": 9,
+            "output": "remote failure\n",
+        }
+
+        with patch("tools.file_tools._get_file_ops"), patch(
+            "tools.terminal_tool.get_active_env",
+            return_value=env,
+        ):
+            success, output = _run_job_script(
+                str(script),
+                task_id="cron_job_20260725",
+            )
+
+        assert success is False
+        assert "exited with code 9" in output
+        assert "remote failure" in output
+        assert "/bin/bash" in env.execute.call_args.args[0]
+
+    def test_registered_task_runs_through_real_environment(self, cron_env, tmp_path):
+        from cron.scheduler import _run_job_script
+        from tools.terminal_tool import (
+            cleanup_vm,
+            clear_task_env_overrides,
+            register_task_env_overrides,
+        )
+
+        script = cron_env / "scripts" / "where.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "print(Path(__file__).parent.name)\n"
+        )
+        task_id = "cron_real_environment"
+        register_task_env_overrides(
+            task_id,
+            {"env_type": "local", "cwd": str(tmp_path)},
+        )
+        try:
+            success, output = _run_job_script(str(script), task_id=task_id)
+        finally:
+            cleanup_vm(task_id)
+            clear_task_env_overrides(task_id)
+
+        assert success is True
+        assert output.startswith("hermes-cron.")
 
 
 class TestBuildJobPromptWithScript:

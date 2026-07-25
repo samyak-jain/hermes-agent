@@ -158,9 +158,17 @@ Interpreter choice is by file extension:
 | Extension | Interpreter |
 |-----------|-------------|
 | `.sh`, `.bash` | `/bin/bash` |
-| anything else | `sys.executable` (current Python) |
+| anything else | `sys.executable` locally, or `python3` in a configured task environment |
 
 We intentionally do NOT honour `#!/...` shebangs — keeping the interpreter set explicit and small reduces the surface the scheduler trusts.
+
+When an administrator configures `cron.terminal`, both script-only jobs and
+LLM pre-check scripts run in that task environment, just like the cron agent's
+terminal, file, and code tools. Hermes transfers only the selected script into
+a private temporary directory and deletes it after the run; it does not copy
+the rest of `HERMES_HOME` or gateway credentials. Put persistent script state
+under the task environment's configured working directory, and do not rely on
+sibling files from `~/.hermes/scripts/` being present there.
 
 ## Schedule Syntax
 
