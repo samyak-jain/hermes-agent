@@ -79,6 +79,8 @@ class TestControlSocketPath:
 
     @pytest.fixture(autouse=True)
     def _mock_connection(self, monkeypatch):
+        monkeypatch.setattr(ssh_env, "_control_dir", None)
+        monkeypatch.setattr(ssh_env, "_control_dir_identity", None)
         monkeypatch.setattr("tools.environments.ssh.subprocess.run",
                             lambda *a, **k: subprocess.CompletedProcess([], 0))
         monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
@@ -100,12 +102,14 @@ class TestControlSocketPath:
         # Simulate the macOS $TMPDIR shape from the issue traceback —
         # 48 bytes, the typical length of ``/var/folders/XX/YYYYYYYYY/T``.
         fake_tmp = "/var/folders/2t/wbkw5yb158jc3zhswgl7tz9c0000gn/T"
-        monkeypatch.setattr("tools.environments.ssh.tempfile.gettempdir",
-                            lambda: fake_tmp)
+        monkeypatch.setattr(
+            "tools.environments.ssh.tempfile.mkdtemp",
+            lambda prefix: f"{fake_tmp}/{prefix}12345678",
+        )
         # The simulated path doesn't exist on the test host — skip the
-        # real mkdir so __init__ can proceed.
+        # real chmod so __init__ can proceed.
         from pathlib import Path as _Path
-        monkeypatch.setattr(_Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(_Path, "chmod", lambda *a, **k: None)
 
         env = SSHEnvironment(
             host="9373:9b91:4480:558d:708e:e601:24e8:d8d0",
@@ -133,6 +137,31 @@ class TestControlSocketPath:
         assert SSHEnvironment(host="h", user="u", port=23).control_socket != base
         assert SSHEnvironment(host="h", user="v", port=22).control_socket != base
         assert SSHEnvironment(host="g", user="u", port=22).control_socket != base
+
+    def test_control_directory_is_private_and_isolated_by_effective_uid(
+        self, monkeypatch, tmp_path,
+    ):
+        """A root diagnostic process cannot poison the gateway socket path."""
+        created = []
+
+        def fake_mkdtemp(prefix):
+            path = tmp_path / f"{prefix}{len(created):08d}"
+            path.mkdir(mode=0o700)
+            created.append(path)
+            return str(path)
+
+        effective_uid = [0]
+        monkeypatch.setattr(ssh_env.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr(ssh_env.os, "geteuid", lambda: effective_uid[0])
+
+        root_env = SSHEnvironment(host="h", user="u")
+        effective_uid[0] = 10000
+        gateway_env = SSHEnvironment(host="h", user="u")
+
+        assert root_env.control_dir != gateway_env.control_dir
+        assert root_env.control_socket != gateway_env.control_socket
+        assert root_env.control_dir.stat().st_mode & 0o777 == 0o700
+        assert gateway_env.control_dir.stat().st_mode & 0o777 == 0o700
 
 
 class TestTerminalToolConfig:

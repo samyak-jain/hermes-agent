@@ -3242,6 +3242,22 @@ def run_job(
             session_id=_cron_session_id,
         )
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok:
+            # A formatter model successfully paraphrasing an infrastructure
+            # failure does not make the scheduled work successful.  Fail here
+            # so last_status records the script error, delivery uses the
+            # scheduler's failure path, and no inference call is spent merely
+            # restating an error the scheduler already has.
+            error = f"Cron pre-run script failed: {_script_output}"
+            failed_doc = (
+                f"# Cron Job: {job_name} (FAILED)\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Schedule:** {job.get('schedule_display', 'N/A')}\n\n"
+                "## Error\n\n"
+                f"```\n{error}\n```\n"
+            )
+            return False, failed_doc, "", error
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
