@@ -11,15 +11,20 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_RESULT_PAGE_CHARS = 12_000
+_MAX_RESULT_PAGE_CHARS = 20_000
 
 
 SPAWN_AGENT_SCHEMA = {
     "name": "spawn_agent",
     "description": (
-        "Spawn or cancel a background subagent. To spawn, provide a prompt; "
+        "Spawn, cancel, or retrieve the completed result of a background "
+        "subagent. To spawn, provide a prompt; "
         "the tool returns an id and a live_transcripts path immediately, and "
         "the result arrives later as a new message — do not wait or poll. You "
         "can read or tail -f the transcript path while the child works. The "
@@ -27,7 +32,10 @@ SPAWN_AGENT_SCHEMA = {
         "conversation, so the prompt must be self-contained (file paths, "
         "constraints, expected output). For parallel work, call this tool "
         "multiple times in one turn. To cancel one previously spawned by this "
-        "conversation, provide its returned id as cancel_id and omit prompt."
+        "conversation, provide its returned id as cancel_id and omit prompt. "
+        "When a delivered result says it was truncated, provide its id as "
+        "result_id and page through the full report using offset/limit; do not "
+        "spawn another subagent just to read the omitted text."
     ),
     "parameters": {
         "type": "object",
@@ -45,6 +53,31 @@ SPAWN_AGENT_SCHEMA = {
                 "description": (
                     "ID returned by an earlier spawn_agent call in this "
                     "conversation. Cancels that subagent; omit prompt."
+                ),
+            },
+            "result_id": {
+                "type": "string",
+                "description": (
+                    "ID of a completed spawn_agent result owned by this "
+                    "conversation. Retrieves a bounded page of its full report; "
+                    "omit prompt and cancel_id."
+                ),
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Zero-based character offset for result_id retrieval "
+                    "(default 0). Use next_offset from the previous page."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_RESULT_PAGE_CHARS,
+                "description": (
+                    "Maximum result characters to return (default 12000, "
+                    "maximum 20000)."
                 ),
             },
         },
@@ -98,25 +131,183 @@ def _delivery_route(parent_agent) -> tuple[str, str, Optional[str]]:
     return session_key, origin_ui_session_id, getattr(parent_agent, "session_id", None)
 
 
+def _owned_result_text(
+    result_id: str,
+    *,
+    parent_agent,
+    offset: int,
+    limit: int,
+) -> str:
+    """Return one redacted page from an owned, durable spawn result."""
+    from hermes_constants import get_hermes_dir
+    from tools.async_delegation import get_owned_durable_delegation
+    from tools.registry import tool_error
+
+    session_key, origin_ui_session_id, parent_session_id = _delivery_route(
+        parent_agent
+    )
+    record = get_owned_durable_delegation(
+        result_id,
+        session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+        completion_type="spawn_result",
+    )
+    if record is None:
+        return tool_error(
+            f"No spawn_agent result found with id '{result_id}' in this conversation."
+        )
+
+    state = str(record.get("state") or "unknown")
+    result = record.get("result")
+    if not isinstance(result, dict):
+        return json.dumps(
+            {
+                "id": result_id,
+                "status": state,
+                "content": "",
+                "has_more": False,
+                "message": (
+                    "The subagent is still running; its result will arrive "
+                    "automatically. Do not poll."
+                    if state in {"running", "finalizing"}
+                    else "No result text was recorded."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    summary = str(result.get("summary") or "")
+    full_path = result.get("summary_full_path")
+    full_result_available = False
+    unavailable_reason = ""
+    text = summary
+
+    if full_path:
+        try:
+            path = Path(str(full_path))
+            if path.is_symlink():
+                raise ValueError("result artifact is a symlink")
+            resolved = path.resolve(strict=True)
+            cache_root = get_hermes_dir(
+                "cache/delegation",
+                "delegation_cache",
+            ).resolve()
+            relative = resolved.relative_to(cache_root)
+            parts = relative.parts
+            is_legacy = (
+                len(parts) == 1
+                and resolved.name.startswith("subagent-summary-")
+                and resolved.suffix == ".txt"
+            )
+            is_owned_live_artifact = (
+                len(parts) == 3
+                and parts[0] == "live"
+                and parts[1] == result_id
+                and resolved.name.startswith("subagent-summary-")
+                and resolved.suffix == ".txt"
+            )
+            if not (is_legacy or is_owned_live_artifact) or not resolved.is_file():
+                raise ValueError("result artifact is outside the owned cache path")
+            text = resolved.read_text(encoding="utf-8")
+            full_result_available = True
+        except (OSError, UnicodeError, ValueError) as exc:
+            unavailable_reason = (
+                "The full result artifact is unavailable or expired; returning "
+                "the stored truncated summary."
+            )
+            logger.warning(
+                "Could not read owned spawn result %s from %s: %s",
+                result_id,
+                full_path,
+                exc,
+            )
+
+    total_chars = len(text)
+    page = text[offset:offset + limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < total_chars
+    try:
+        from agent.redact import redact_sensitive_text
+
+        page = redact_sensitive_text(page, force=True) or ""
+    except Exception:
+        logger.exception("Could not redact spawn result page for %s", result_id)
+        return tool_error("Result retrieval failed closed because redaction was unavailable.")
+
+    payload: Dict[str, Any] = {
+        "id": result_id,
+        "status": state,
+        "offset": offset,
+        "returned_chars": len(page),
+        "total_chars": total_chars,
+        "next_offset": next_offset if has_more else None,
+        "has_more": has_more,
+        "full_result_available": full_result_available,
+        "content": page,
+    }
+    if unavailable_reason:
+        payload["message"] = unavailable_reason
+    if result.get("error"):
+        payload["error"] = str(result["error"])
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def spawn_agent(
     prompt: Optional[str] = None,
     label: Optional[str] = None,
     cancel_id: Optional[str] = None,
+    result_id: Optional[str] = None,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
     parent_agent=None,
 ) -> str:
-    """Build one leaf child or cancel one previously dispatched by this parent."""
+    """Spawn, cancel, or retrieve one background child owned by this parent."""
     from tools.registry import tool_error
 
     if parent_agent is None:
         return tool_error("spawn_agent requires a parent agent context.")
 
+    supplied_actions = sum(
+        (
+            bool(isinstance(prompt, str) and prompt.strip()),
+            cancel_id is not None,
+            result_id is not None,
+        )
+    )
+    if supplied_actions != 1:
+        return tool_error(
+            "spawn_agent accepts exactly one of prompt, cancel_id, or result_id."
+        )
+
+    if result_id is not None:
+        if not isinstance(result_id, str) or not result_id.strip():
+            return tool_error("spawn_agent result_id must be a non-empty string.")
+        if offset is None:
+            offset = 0
+        if limit is None:
+            limit = _DEFAULT_RESULT_PAGE_CHARS
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return tool_error("spawn_agent result offset must be a non-negative integer.")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_RESULT_PAGE_CHARS
+        ):
+            return tool_error(
+                "spawn_agent result limit must be an integer between 1 and "
+                f"{_MAX_RESULT_PAGE_CHARS}."
+            )
+        return _owned_result_text(
+            result_id.strip(),
+            parent_agent=parent_agent,
+            offset=offset,
+            limit=limit,
+        )
+
     if cancel_id is not None:
         if not isinstance(cancel_id, str) or not cancel_id.strip():
             return tool_error("spawn_agent cancel_id must be a non-empty string.")
-        if isinstance(prompt, str) and prompt.strip():
-            return tool_error(
-                "spawn_agent accepts either prompt or cancel_id, not both."
-            )
 
         from tools.async_delegation import interrupt_delegation
 
@@ -243,7 +434,11 @@ def spawn_agent(
 
         try:
             result = _run_single_child(0, clean_prompt, child, parent_agent)
-            _apply_summary_budget([result], parent_agent)
+            _apply_summary_budget(
+                [result],
+                parent_agent,
+                retrieval_id=spawn_id,
+            )
             result.pop("_child_role", None)
             child_cost = result.pop("_child_cost_usd", 0.0)
             try:
@@ -333,6 +528,9 @@ registry.register(
         prompt=args.get("prompt"),
         label=args.get("label"),
         cancel_id=args.get("cancel_id"),
+        result_id=args.get("result_id"),
+        offset=args.get("offset"),
+        limit=args.get("limit"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

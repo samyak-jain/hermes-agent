@@ -227,7 +227,31 @@ response includes `live_transcripts`, stored under the returned spawn ID:
 tail -f ~/.hermes/cache/delegation/live/sa_12ab34/task-0.log
 ```
 
-Each line is timestamped and shows the child's assistant text, thinking snippets, tool calls (`-> tool_name({args})`), tool results, and a final status marker. A `manifest.json` in the same directory describes the batch (goals, task count, per-task status). The logs persist after completion — they double as the full-fidelity operational record alongside the summary — and directories older than 7 days are pruned automatically on new dispatches. Because they live under `cache/delegation`, they are also readable from remote terminal backends (Docker/Modal/SSH).
+Each line is timestamped and shows compact previews of the child's assistant
+text, thinking snippets, tool calls (`-> tool_name({args})`), tool results, and
+a final status marker. Individual events are truncated for readability, so
+the transcript is a progress and diagnostic view rather than a full-fidelity
+result. A `manifest.json` in the same directory describes the batch (goals,
+task count, per-task status). The logs persist after completion, and
+directories older than 7 days are pruned automatically on new dispatches.
+Because they live under `cache/delegation`, they are also readable from remote
+terminal backends (Docker/Modal/SSH).
+
+### Retrieving a truncated spawn result
+
+When a `spawn_agent` summary is too large for the parent's remaining context,
+Hermes returns a head-and-tail preview and retains the complete report beside
+the spawn's live transcript. Retrieve it through the same tool:
+
+```text
+spawn_agent(result_id="sa_12ab34", offset=0, limit=12000)
+```
+
+The response includes `next_offset` and `has_more`. Continue with the returned
+offset until `has_more` is false. Retrieval is conversation-owned and accepts
+only the server-recorded result ID, not a file path, so restricted coordinator
+agents do not need general filesystem access. The result artifact follows the
+same 7-day retention as the spawn transcript.
 
 ## Depth Limit and Nested Orchestration
 

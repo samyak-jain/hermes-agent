@@ -69,6 +69,41 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
             assert os.path.join("cache", "delegation") in path
 
 
+def test_spawn_overflow_uses_owned_retrieval_handle_and_retained_directory(
+    monkeypatch,
+):
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setenv("HERMES_HOME", os.path.join(td, ".hermes"))
+        big = "HEAD\n" + ("X" * 50_000) + "\nTAIL"
+        parent = _FakeParent(
+            context_length=131_000,
+            used_tokens=120_000,
+            max_tokens=8_000,
+        )
+        results = [
+            {"task_index": 0, "summary": big, "status": "completed"}
+        ]
+
+        dt._apply_summary_budget(
+            results,
+            parent,
+            retrieval_id="sa_owned1",
+        )
+
+        result = results[0]
+        path = result["summary_full_path"]
+        assert os.path.join(
+            "cache",
+            "delegation",
+            "live",
+            "sa_owned1",
+        ) in path
+        assert 'spawn_agent result_id="sa_owned1"' in result["summary"]
+        assert "read_file path=" not in result["summary"]
+        with open(path, encoding="utf-8") as fh:
+            assert fh.read() == big
+
+
 def test_dynamic_budget_shrinks_as_batch_grows():
     def cap_for(n):
         return dt._parent_summary_char_budget(
