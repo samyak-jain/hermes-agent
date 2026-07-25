@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _popen_bash
@@ -19,6 +20,43 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+_control_dir: Path | None = None
+_control_dir_identity: tuple[int, int | None] | None = None
+_control_dir_lock = threading.Lock()
+
+
+def _get_control_dir() -> Path:
+    """Return a private SSH control directory for this process identity.
+
+    A fixed shared ``/tmp/hermes-ssh`` directory can be created by a root
+    diagnostic process before the unprivileged gateway reaches it.  The
+    gateway can then read the directory but cannot create ControlMaster
+    sockets, breaking every SSH-backed cron or child environment until the
+    container restarts.  ``mkdtemp`` gives each process identity an
+    unpredictable, mode-0700 directory, so differently privileged processes
+    cannot poison one another.
+
+    Include the effective UID in the cache identity as well as the PID because
+    a process may construct an environment before and after dropping
+    privileges.  ``geteuid`` is unavailable on Windows, where the system temp
+    directory is already user-scoped.
+    """
+    global _control_dir, _control_dir_identity
+
+    get_euid = getattr(os, "geteuid", None)
+    identity = (os.getpid(), get_euid() if get_euid is not None else None)
+    with _control_dir_lock:
+        if _control_dir is not None and _control_dir_identity == identity:
+            return _control_dir
+
+        # Keep the prefix short: macOS has a 104-byte Unix-socket path limit
+        # and OpenSSH appends its own 17-byte temporary suffix.
+        control_dir = Path(tempfile.mkdtemp(prefix="h-"))
+        control_dir.chmod(0o700)
+        _control_dir = control_dir
+        _control_dir_identity = identity
+        return control_dir
 
 
 def _ensure_ssh_available() -> None:
@@ -52,8 +90,7 @@ class SSHEnvironment(BaseEnvironment):
         self.key_path = key_path
         self.known_hosts_path = known_hosts_path
 
-        self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
-        self.control_dir.mkdir(parents=True, exist_ok=True)
+        self.control_dir = _get_control_dir()
         # Keep the socket filename short and deterministic so the full path
         # stays under the 104-byte sun_path limit that macOS enforces on
         # Unix domain sockets. A raw ``user@host:port`` — especially with an
