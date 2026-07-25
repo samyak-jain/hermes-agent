@@ -200,6 +200,7 @@ def _get_child_terminal_overrides(cfg: Optional[dict] = None) -> Dict[str, Any]:
         "ssh_user",
         "ssh_key",
         "ssh_known_hosts_file",
+        "ssh_systemd_slice",
     ):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
@@ -226,6 +227,19 @@ def _get_child_terminal_overrides(cfg: Optional[dict] = None) -> Dict[str, Any]:
         overrides["ssh_sync_files"] = is_truthy_value(
             raw.get("ssh_sync_files"), default=False
         )
+        overrides["ssh_systemd_run"] = is_truthy_value(
+            raw.get("ssh_systemd_run"), default=False
+        )
+        for key, default in (
+            ("ssh_command_memory_max_mb", 0),
+            ("ssh_background_ttl_seconds", 86400),
+        ):
+            try:
+                overrides[key] = int(raw.get(key, default))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"delegation.child_terminal.{key} must be an integer"
+                ) from exc
 
         if not overrides.get("ssh_host") or not overrides.get("ssh_user"):
             raise ValueError(

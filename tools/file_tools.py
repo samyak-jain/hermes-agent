@@ -1065,6 +1065,14 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "known_hosts_file": config.get("ssh_known_hosts_file", ""),
                     "sync_files": config.get("ssh_sync_files", True),
                     "persistent": config.get("ssh_persistent", False),
+                    "systemd_run": config.get("ssh_systemd_run", False),
+                    "systemd_slice": config.get("ssh_systemd_slice", ""),
+                    "command_memory_max_mb": config.get(
+                        "ssh_command_memory_max_mb", 0
+                    ),
+                    "background_ttl_seconds": config.get(
+                        "ssh_background_ttl_seconds", 86400
+                    ),
                 }
 
             local_config = None
