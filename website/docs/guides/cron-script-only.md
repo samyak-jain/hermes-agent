@@ -170,6 +170,10 @@ the rest of `HERMES_HOME` or gateway credentials. Put persistent script state
 under the task environment's configured working directory, and do not rely on
 sibling files from `~/.hermes/scripts/` being present there.
 
+For an LLM-backed job, a pre-check script failure fails the cron run directly
+and follows the scheduler's error-delivery path. Hermes does not spend a model
+call asking the agent to paraphrase an error the scheduler already has.
+
 ## Schedule Syntax
 
 Same as all other cron jobs:

@@ -1873,6 +1873,63 @@ class TestRunJobWakeGate:
         assert success is True
         assert err is None
 
+    def test_script_runs_only_once_on_wake(self):
+        """Wake-true path must not re-run the script inside _build_job_prompt
+        (script would execute twice otherwise, wasting work and risking
+        double-side-effects)."""
+        import cron.scheduler as scheduler
+
+        call_count = 0
+        def _script_stub(path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return (True, "regular output")
+
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "ok", "messages": []
+        })
+        with patch.object(scheduler, "_run_job_script", side_effect=_script_stub), \
+             patch("run_agent.AIAgent", return_value=agent):
+            scheduler.run_job(self._make_job())
+
+        assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
+
+    def test_script_failure_fails_run_without_model_call(self):
+        """A pre-run infrastructure failure is a failed cron run.
+
+        A model successfully paraphrasing the failure must not turn the run
+        green or spend an inference call.
+        """
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(False, '{"wakeAgent": false}')), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job())
+
+        agent_cls.assert_not_called()
+        assert success is False
+        assert final == ""
+        assert "Cron pre-run script failed" in err
+        assert "Cron Job: wake-gate-test (FAILED)" in doc
+
+    def test_no_script_path_runs_agent_normally(self):
+        """Regression: jobs without a script still work."""
+        import cron.scheduler as scheduler
+
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "ok", "messages": []
+        })
+        job = self._make_job(script=None)
+        job.pop("script", None)
+        with patch.object(scheduler, "_run_job_script") as script_fn, \
+             patch("run_agent.AIAgent", return_value=agent) as agent_cls:
+            scheduler.run_job(job)
+
+        script_fn.assert_not_called()
+        agent_cls.assert_called_once()
 
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""
