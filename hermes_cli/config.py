@@ -7328,6 +7328,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     with config_write_lock(config_path):
         require_readable_config_before_write(config_path)
         atomic_yaml_write(config_path, data, **kwargs)
+        invalidate_config_caches(config_path)
 
 
 def load_config() -> Dict[str, Any]:
