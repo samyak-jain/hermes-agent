@@ -209,7 +209,11 @@ class TestBrowseShape:
         last_id = db.append_message(
             "actual_previous_dm",
             role="assistant",
-            content="Resume the wacli install after the sandbox recovers.",
+            content=(
+                "The sandbox is still unreachable after repeated SSH attempts. "
+                + ("Detailed diagnostic context. " * 20)
+                + "Resume the wacli install after the sandbox recovers."
+            ),
             timestamp=now - 240,
         )
 
