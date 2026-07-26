@@ -39,6 +39,9 @@ export function jsonSchemaToZod(schema: JsonSchema = {}): z.ZodTypeAny {
       case "boolean":
         result = z.boolean();
         break;
+      case "null":
+        result = z.null();
+        break;
       case "array":
         result = z.array(jsonSchemaToZod(schema.items ?? {}));
         break;
