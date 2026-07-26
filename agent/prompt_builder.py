@@ -183,7 +183,12 @@ MEMORY_GUIDANCE = (
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "asking them to repeat themselves. For requests such as 'the last session', "
+    "'the previous session', or 'pick up where we left off', first call "
+    "session_search with no query, choose the newest same-conversation interactive "
+    "session, then call session_search again with that session_id alone to read it. "
+    "Do not invent keyword queries for recency requests: query searches only sessions "
+    "containing those terms and can silently miss the actual previous session."
 )
 
 SKILLS_GUIDANCE = (
