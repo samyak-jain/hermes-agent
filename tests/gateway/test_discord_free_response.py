@@ -297,6 +297,126 @@ async def test_discord_free_response_channel_can_come_from_config_extra(adapter,
     assert event.text == "allowed from config"
 
 
+@pytest.mark.asyncio
+async def test_ambient_room_admits_unmentioned_message_without_threading(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter.config.extra["ambient_rooms"] = {
+        "789": {
+            "participants": ["default", "vegapunk"],
+            "roles": {"default": "companion", "vegapunk": "coding"},
+        }
+    }
+    adapter._hermes_profile_name = "vegapunk"
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="anyone have thoughts on this patch?",
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "789"
+    assert event.metadata["ambient_room_id"] == "789"
+    assert event.metadata["ambient_participants"] == ["default", "vegapunk"]
+    assert event.metadata["ambient_profile_role"] == "coding"
+    assert event.metadata["ambient_direct"] is False
+    assert event.metadata["ambient_quiet_surface"] is True
+
+
+@pytest.mark.asyncio
+async def test_ambient_history_is_full_room_window_including_bots(
+    adapter, monkeypatch
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    self_bot = adapter._client.user
+    self_bot.bot = True
+    other_bot = SimpleNamespace(
+        id=998, display_name="Vegapunk", name="Vegapunk", bot=True
+    )
+    human = SimpleNamespace(
+        id=42, display_name="Jezza", name="Jezza", bot=False
+    )
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="first", msg_id=100),
+            make_history_message(author=self_bot, content="second", msg_id=101),
+            make_history_message(author=other_bot, content="third", msg_id=102),
+        ],
+        channel_id=789,
+    )
+    adapter.config.extra["ambient_rooms"] = {
+        "789": {"participants": ["default", "vegapunk"]}
+    }
+    message = make_message(channel=channel, content="latest")
+    message.id = 103
+
+    await adapter._handle_message(message)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert "[Jezza] first" in event.channel_context
+    assert "[unknown [bot]] second" in event.channel_context
+    assert "[Vegapunk [bot]] third" in event.channel_context
+
+
+def test_ambient_room_invalid_numeric_tuning_falls_back_safely(adapter):
+    adapter.config.extra["ambient_rooms"] = {
+        "789": {
+            "participants": ["default", "vegapunk"],
+            "decision_window_seconds": "soon",
+            "min_confidence": "confident",
+            "max_agent_hops": "several",
+        }
+    }
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="hello room",
+    )
+
+    room = adapter._discord_ambient_room(message)
+
+    assert room["decision_window_seconds"] == 1.25
+    assert room["min_confidence"] == 0.55
+    assert room["max_agent_hops"] == 3
+
+
+def test_ambient_room_accepts_only_bots_registered_by_this_gateway(adapter):
+    from gateway.ambient_rooms import register_ambient_bot_id
+
+    adapter.config.extra["ambient_rooms"] = {
+        "789": {"participants": ["default", "vegapunk"]}
+    }
+    channel = FakeTextChannel(channel_id=789)
+    registered = SimpleNamespace(
+        id=770001, display_name="Vegapunk", name="Vegapunk", bot=True
+    )
+    unrelated = SimpleNamespace(
+        id=770002, display_name="Webhook", name="Webhook", bot=True
+    )
+    register_ambient_bot_id(registered.id)
+
+    registered_message = make_message(channel=channel, content="peer update")
+    registered_message.author = registered
+    unrelated_message = make_message(channel=channel, content="webhook update")
+    unrelated_message.id = 124
+    unrelated_message.author = unrelated
+    accepted, _ = adapter._discord_message_admission(
+        registered_message,
+        claim=False,
+    )
+    rejected, _ = adapter._discord_message_admission(
+        unrelated_message,
+        claim=False,
+    )
+
+    assert accepted is True
+    assert rejected is False
+
+
 def test_discord_free_response_channels_bare_int(adapter, monkeypatch):
     # YAML `discord.free_response_channels: 1491973769726791812` (single bare
     # integer) is loaded as an int and previously fell through the
@@ -1485,4 +1605,3 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_not_awaited()
-

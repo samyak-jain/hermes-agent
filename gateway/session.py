@@ -203,6 +203,12 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+    # Internal, wire-INVISIBLE trust signal stamped by the Discord adapter
+    # after it verifies that a bot-authored ambient-room event came from
+    # another bot adapter registered in this gateway process. This lets the
+    # gateway authorization layer admit only our configured peer agents
+    # without opening DISCORD_ALLOW_BOTS to unrelated webhooks or bots.
+    ambient_authorized_bot: bool = False
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`

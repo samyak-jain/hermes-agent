@@ -194,12 +194,83 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+def _profile_name_from_home(hermes_home: Path) -> str:
+    home = Path(hermes_home)
+    if home.parent.name == "profiles":
+        return home.name
+    return "default"
+
+
+def _profile_env_prefix(profile_name: str) -> str:
+    normalized = "".join(
+        ch if ch.isalnum() else "_" for ch in str(profile_name).upper()
+    )
+    return f"HERMES_PROFILE_{normalized}__"
+
+
+def build_profile_secret_scope(
+    hermes_home: Path,
+    *,
+    profile_name: Optional[str] = None,
+) -> Dict[str, str]:
     """Build a profile's secret mapping from its ``<home>/.env``.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
-    """
-    return load_env_file(Path(hermes_home) / ".env")
+    When callers explicitly identify the default profile, it owns the
+    deployment's ordinary process credentials. Omitting ``profile_name``
+    preserves the legacy helper contract of reading only the local ``.env``.
+    Named profiles inherit credentials that were resolved from an explicitly
+    configured external secret source (for example Bitwarden), then receive
+    explicitly namespaced host credentials using
+    ``HERMES_PROFILE_<PROFILE>__<SECRET_NAME>``. For example,
+    ``HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN`` becomes
+    ``DISCORD_BOT_TOKEN`` inside the Vegapunk scope. Shared vault credentials
+    cover common services such as Browserbase; namespaced values keep platform
+    identities and provider accounts isolated without plaintext profile
+    ``.env`` files.
 
+    A profile-local ``.env`` remains supported and wins over the host mapping.
+    Genuinely global vars need not be copied because ``get_secret`` reads them
+    directly from ``os.environ``.
+    """
+    home = Path(hermes_home)
+    explicit_profile = profile_name is not None
+    name = str(profile_name or _profile_name_from_home(home))
+    secrets: Dict[str, str] = {}
+    if name == "default" and explicit_profile:
+        secrets.update(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if not _is_global_env(key)
+                and not key.startswith("HERMES_PROFILE_")
+            }
+        )
+    else:
+        # External secret sources are an explicit host-level sharing boundary:
+        # their values are not owned by any one profile. Process credentials
+        # from shell/SSM remain private unless they use the profile prefix.
+        try:
+            from hermes_cli.env_loader import get_secret_source
+
+            secrets.update(
+                {
+                    key: value
+                    for key, value in os.environ.items()
+                    if get_secret_source(key) is not None
+                    and not _is_global_env(key)
+                }
+            )
+        except Exception:
+            # Secret-source provenance is optional. Failing to inspect it must
+            # fail closed rather than unioning the process environment.
+            pass
+        prefix = _profile_env_prefix(name)
+        secrets.update(
+            {
+                key[len(prefix):]: value
+                for key, value in os.environ.items()
+                if key.startswith(prefix) and len(key) > len(prefix)
+            }
+        )
+    secrets.update(load_env_file(home / ".env"))
+    return secrets
