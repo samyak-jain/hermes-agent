@@ -296,6 +296,23 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
         assert "not available" in result["error"]
 
+    @pytest.mark.parametrize("action", [None, "", "read"])
+    def test_read_returns_latest_bounded_inventory(self, store, action):
+        store.add("memory", "fact A")
+        # Simulate a second process writing after this store was constructed.
+        other = MemoryStore(memory_char_limit=500, user_char_limit=300)
+        other.load_from_disk()
+        other.add("memory", "fact B")
+
+        result = json.loads(
+            memory_tool(action=action, target="memory", store=store)
+        )
+        assert result["success"] is True
+        assert result["entries"] == ["fact A", "fact B"]
+        assert result["current_chars"] > 0
+        assert result["limit_chars"] == 500
+        assert result["usage"].endswith("/500")
+
 
     def test_replace_missing_content_still_distinct_error(self, store):
         # When old_text IS present but content is missing, keep the original
