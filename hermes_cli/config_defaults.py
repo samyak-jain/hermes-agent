@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "agent_config": {
         "enabled": False,
         "ownership_mode": "allowlist",
+        # Operators may allow validated agent-owned changes to apply directly.
+        "require_approval": True,
         "editable_paths": [],
         "guarded_paths": [],
     },

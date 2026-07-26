@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Any, Optional
 
 from hermes_cli.agent_config import (
     AgentConfigError,
+    approval_required,
     apply_change,
     apply_rollback,
     broker_enabled,
@@ -27,6 +27,8 @@ def check_config_requirements() -> bool:
 
 
 def _approval(prepared: dict) -> dict:
+    import hashlib
+
     from tools.approval import request_tool_approval
 
     operation = prepared["operation"]
@@ -83,29 +85,33 @@ def config_tool(
                 value=value,
                 reason=reason or "",
             )
-            approval = _approval(prepared)
-            if not approval.get("approved"):
-                return json.dumps(
-                    {
-                        "success": False,
-                        "status": approval.get("status", "blocked"),
-                        "error": approval.get("message") or "Configuration change was not approved.",
-                    },
-                    ensure_ascii=False,
-                )
+            if approval_required():
+                approval = _approval(prepared)
+                if not approval.get("approved"):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "status": approval.get("status", "blocked"),
+                            "error": approval.get("message")
+                            or "Configuration change was not approved.",
+                        },
+                        ensure_ascii=False,
+                    )
             return json.dumps(apply_change(prepared, actor=actor), ensure_ascii=False)
         if action == "rollback":
             prepared = prepare_rollback(revision or "", reason=reason or "")
-            approval = _approval(prepared)
-            if not approval.get("approved"):
-                return json.dumps(
-                    {
-                        "success": False,
-                        "status": approval.get("status", "blocked"),
-                        "error": approval.get("message") or "Configuration rollback was not approved.",
-                    },
-                    ensure_ascii=False,
-                )
+            if approval_required():
+                approval = _approval(prepared)
+                if not approval.get("approved"):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "status": approval.get("status", "blocked"),
+                            "error": approval.get("message")
+                            or "Configuration rollback was not approved.",
+                        },
+                        ensure_ascii=False,
+                    )
             return json.dumps(apply_rollback(prepared, actor=actor), ensure_ascii=False)
         return tool_error(
             "Unknown action. Use inspect, set, unset, history, or rollback.",
@@ -122,8 +128,8 @@ CONFIG_SCHEMA = {
     "description": (
         "Inspect or update Hermes's agent-owned, non-secret configuration through "
         "a validated gateway broker. Use inspect before changing anything. Set, "
-        "unset, and rollback always request fresh human approval, apply atomically, "
-        "and cannot modify Kumo-managed policy, credentials, or the broker policy. "
+        "unset, and rollback follow the operator's approval policy, apply atomically, "
+        "and cannot modify administrator-managed policy, credentials, or the broker policy. "
         "The result reports whether the change applies next turn, next session, "
         "or requires a drained gateway restart. "
         "Never use this tool merely because you prefer a different setting; mutate "
