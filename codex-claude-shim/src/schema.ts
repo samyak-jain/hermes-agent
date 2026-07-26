@@ -43,7 +43,21 @@ export function jsonSchemaToZod(schema: JsonSchema = {}): z.ZodTypeAny {
         result = z.array(jsonSchemaToZod(schema.items ?? {}));
         break;
       case "object":
-        result = z.object(jsonSchemaShape(schema));
+        {
+          const objectSchema = z.object(jsonSchemaShape(schema));
+          if (
+            schema.additionalProperties
+            && typeof schema.additionalProperties === "object"
+          ) {
+            result = objectSchema.catchall(
+              jsonSchemaToZod(schema.additionalProperties),
+            );
+          } else if (schema.additionalProperties === true) {
+            result = objectSchema.catchall(z.any());
+          } else {
+            result = objectSchema;
+          }
+        }
         break;
       default:
         result = z.any();
