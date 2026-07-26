@@ -255,6 +255,33 @@ def test_rollback_restores_originally_absent_config(broker_home: Path):
     assert not path.exists()
 
 
+def test_rollback_of_absent_file_rollback_restores_changed_file(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    path.unlink()
+    invalidate_config_caches(path)
+    changed = apply_change(
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="pastel",
+            reason="operator requested pastel",
+        )
+    )
+    rollback = apply_rollback(
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+    )
+    assert not path.exists()
+
+    apply_rollback(
+        prepare_rollback(
+            rollback["revision"], reason="operator requested undoing rollback"
+        )
+    )
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["display"]["skin"] == "pastel"
+
+
 def test_noop_set_is_rejected(broker_home: Path):
     with pytest.raises(AgentConfigError, match="already has"):
         prepare_change(
