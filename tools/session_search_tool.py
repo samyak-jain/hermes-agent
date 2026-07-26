@@ -2,21 +2,24 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Single-shape tool with three calling modes (inferred from args, no explicit
+Single-shape tool with four calling modes (inferred from args, no explicit
 mode parameter):
 
-  1. DISCOVERY — pass ``query``. Runs FTS5, dedupes hits by session lineage,
+  1. BROWSE — no args. Returns recent sessions, prioritizing the current
+     conversation key and interactive sources, with opening and ending
+     previews. This is the correct first call for "last session" requests.
+
+  2. READ — pass ``session_id`` alone. Returns a bounded transcript view.
+
+  3. DISCOVERY — pass ``query``. Runs FTS5, dedupes hits by session lineage,
      returns top N sessions each with: snippet, ±5 message window around the
      match, plus bookend_start (first 3 user+assistant msgs of session) and
      bookend_end (last 3). Zero LLM cost.
 
-  2. SCROLL — pass ``session_id`` + ``around_message_id``. Returns a window
+  4. SCROLL — pass ``session_id`` + ``around_message_id``. Returns a window
      of ±window messages centered on the anchor, no FTS5, no bookends. To
      scroll forward / backward, re-anchor on the last / first message id of
      the returned window.
-
-  3. BROWSE — no args. Returns recent sessions chronologically (titles,
-     previews, timestamps).
 
 All three modes operate on the SQLite session DB via the FTS5 index and
 the get_anchored_view / get_messages_around primitives in hermes_state.
@@ -49,11 +52,26 @@ _HIDDEN_SESSION_SOURCES = ("subagent", "tool")
 # always win when both match.
 _DEMOTED_SESSION_SOURCES = ("cron",)
 
+# Sources that should remain browsable but must not displace the user's latest
+# interactive conversation. API sessions are commonly synthetic deployment
+# probes; cron sessions are unattended automation.
+_BROWSE_AUTOMATION_SOURCES = ("cron", "api", "api_server")
+
 # How many FTS rows discover scans before dedup-by-lineage. The interactive
 # vs automation split below only helps if enough rows are in hand to find
 # interactive matches buried under a wall of cron hits, so this is well above
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
+
+# Claude Code persists large MCP results to a private file and substitutes a
+# short preview. Restricted main turns cannot read that file, so session recall
+# must remain self-contained. These budgets keep the JSON comfortably below
+# the host's persistence threshold while preserving both the start and end of
+# long message bodies.
+_DISCOVERY_TEXT_BUDGET = 18_000
+_READ_TEXT_BUDGET = 30_000
+_SCROLL_TEXT_BUDGET = 30_000
+_MAX_DISCOVERY_SNIPPET_CHARS = 600
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -120,18 +138,68 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     )
 
 
-def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
+def _truncate_value(value: Any, max_chars: Optional[int]) -> Any:
+    """Bound a value for an inline tool response, preserving its head and tail."""
+    if max_chars is None or value is None:
+        return value
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+    if len(text) <= max_chars:
+        return value
+
+    marker = f"\n… [{len(text) - max_chars:,} chars omitted] …\n"
+    available = max(24, max_chars - len(marker))
+    head = max(1, int(available * 0.7))
+    tail = max(1, available - head)
+    return text[:head] + marker + text[-tail:]
+
+
+def _compact_tool_calls(tool_calls: Any) -> Dict[str, Any]:
+    """Summarize tool-call metadata without returning arbitrarily large args."""
+    calls = tool_calls if isinstance(tool_calls, list) else [tool_calls]
+    names: List[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        name = name or call.get("name")
+        if name:
+            names.append(str(name))
+    return {
+        "count": len(calls),
+        "names": names[:8],
+        "truncated": True,
+    }
+
+
+def _shape_message(
+    m: Dict[str, Any],
+    anchor_id: Optional[int] = None,
+    *,
+    content_limit: Optional[int] = None,
+    compact_tool_calls: bool = False,
+) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": _truncate_value(m.get("content"), content_limit),
         "timestamp": m.get("timestamp"),
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        entry["tool_calls"] = (
+            _compact_tool_calls(m.get("tool_calls"))
+            if compact_tool_calls
+            else m.get("tool_calls")
+        )
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
@@ -230,10 +298,18 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
         logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
 
-    shaped = [_shape_message(m) for m in rows]
-    total = len(shaped)
+    total = len(rows)
     truncated = total > head + tail
-    window = shaped[:head] + shaped[-tail:] if truncated else shaped
+    selected = rows[:head] + rows[-tail:] if truncated else rows
+    content_limit = max(240, min(4_000, _READ_TEXT_BUDGET // max(1, len(selected))))
+    window = [
+        _shape_message(
+            m,
+            content_limit=content_limit,
+            compact_tool_calls=True,
+        )
+        for m in selected
+    ]
 
     response = {
         "success": True,
@@ -258,18 +334,34 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+    """Return recent sessions with the same conversation ranked first."""
     try:
+        # Fetch a broad but bounded recency window before applying conversation
+        # affinity and source class. A nearby cron/API probe must not displace
+        # the immediately preceding Discord/Telegram conversation.
         sessions = db.list_sessions_rich(
-            limit=limit + 5,
+            limit=max(50, limit + 10),
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            compact_rows=True,
         )  # fetch extra so we can skip current
 
         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+        current_meta = db.get_session(current_root or current_session_id) if current_session_id else {}
+        current_session_key = (current_meta or {}).get("session_key")
+
+        def browse_rank(session: Dict[str, Any]) -> tuple:
+            same_conversation = bool(
+                current_session_key
+                and session.get("session_key") == current_session_key
+            )
+            automated = (session.get("source") or "") in _BROWSE_AUTOMATION_SOURCES
+            # Python's sort is stable, so last_active ordering survives within
+            # each class.
+            return (0 if same_conversation else 1, 1 if automated else 0)
 
         results = []
-        for s in sessions:
+        for s in sorted(sessions, key=browse_rank):
             sid = s.get("id", "")
             if current_root and (sid == current_root or sid == current_session_id):
                 continue
@@ -284,6 +376,11 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
+                "ending_preview": s.get("ending_preview", ""),
+                "same_conversation": bool(
+                    current_session_key
+                    and s.get("session_key") == current_session_key
+                ),
             })
             if len(results) >= limit:
                 break
@@ -293,7 +390,12 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             "mode": "browse",
             "results": results,
             "count": len(results),
-            "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
+            "message": (
+                f"Showing {len(results)} recent sessions, with the current "
+                "conversation first. To resume one, pass session_id alone to "
+                "read it. Use query only for topic search; add "
+                "around_message_id only when scrolling."
+            ),
         }, ensure_ascii=False)
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
@@ -403,6 +505,10 @@ def _scroll(
             success=False,
         )
 
+    content_limit = max(
+        240,
+        min(4_000, _SCROLL_TEXT_BUDGET // max(1, len(messages))),
+    )
     response = {
         "success": True,
         "mode": "scroll",
@@ -415,7 +521,15 @@ def _scroll(
             "title": session_meta.get("title"),
         },
         "window": window,
-        "messages": [_shape_message(m, anchor_id=around_message_id) for m in messages],
+        "messages": [
+            _shape_message(
+                m,
+                anchor_id=around_message_id,
+                content_limit=content_limit,
+                compact_tool_calls=True,
+            )
+            for m in messages
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", 0),
     }
@@ -433,6 +547,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    content_limit: int,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -484,9 +599,31 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [
+            _shape_message(
+                m,
+                content_limit=content_limit,
+                compact_tool_calls=True,
+            )
+            for m in (view.get("bookend_start") or messages[:3])
+        ],
+        "messages": [
+            _shape_message(
+                m,
+                anchor_id=anchor_id,
+                content_limit=content_limit,
+                compact_tool_calls=True,
+            )
+            for m in (view.get("window") or messages[:5])
+        ],
+        "bookend_end": [
+            _shape_message(
+                m,
+                content_limit=content_limit,
+                compact_tool_calls=True,
+            )
+            for m in (view.get("bookend_end") or messages[-3:])
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
         "_lineage_root": lineage_root,
@@ -507,7 +644,18 @@ def _discover(
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    # Each result can contain up to 17 shaped messages (3 + 11 + 3). Allocate
+    # one shared text budget so even limit=10 stays inline in Claude Code.
+    content_limit = max(
+        96,
+        min(1_200, _DISCOVERY_TEXT_BUDGET // max(1, 17 * limit)),
+    )
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        content_limit,
+    )
 
     try:
         raw_results = db.search_messages(
@@ -595,10 +743,35 @@ def _discover(
             "title": session_meta.get("title") or None,
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
-            "snippet": match_info.get("snippet") or "",
-            "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
-            "messages": [_shape_message(m, anchor_id=msg_id) for m in (view.get("window") or [])],
-            "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
+            "snippet": _truncate_value(
+                match_info.get("snippet") or "",
+                _MAX_DISCOVERY_SNIPPET_CHARS,
+            ),
+            "bookend_start": [
+                _shape_message(
+                    m,
+                    content_limit=content_limit,
+                    compact_tool_calls=True,
+                )
+                for m in (view.get("bookend_start") or [])
+            ],
+            "messages": [
+                _shape_message(
+                    m,
+                    anchor_id=msg_id,
+                    content_limit=content_limit,
+                    compact_tool_calls=True,
+                )
+                for m in (view.get("window") or [])
+            ],
+            "bookend_end": [
+                _shape_message(
+                    m,
+                    content_limit=content_limit,
+                    compact_tool_calls=True,
+                )
+                for m in (view.get("bookend_end") or [])
+            ],
             "messages_before": view.get("messages_before", 0),
             "messages_after": view.get("messages_after", 0),
         }
@@ -767,7 +940,20 @@ SESSION_SEARCH_SCHEMA = {
         "or 'no prior correspondence' from session_search alone when a direct source "
         "was provided.\n\n"
         "FOUR CALLING SHAPES\n\n"
-        "  1) DISCOVERY — pass `query`:\n"
+        "  1) BROWSE — no args:\n"
+        "     session_search()\n"
+        "     Returns recent sessions with the current conversation key first, then "
+        "other interactive sessions, then automation. Each result includes both an "
+        "opening preview and ending_preview. For \"last session\", \"previous "
+        "session\", or \"pick up where we left off\", ALWAYS start here; do not "
+        "guess topic keywords.\n\n"
+        "  2) READ — pass `session_id` only (no around_message_id):\n"
+        "     session_search(session_id=\"...\")\n"
+        "     Reads that session directly. After browsing, use this shape on the "
+        "selected session before claiming you are caught up. Large transcripts return "
+        "a bounded first-20 + last-10 view with instructions for scrolling the "
+        "middle. This also resolves an `@session:<profile>/<id>` link.\n\n"
+        "  3) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
         "Each result carries:\n"
@@ -782,7 +968,7 @@ SESSION_SEARCH_SCHEMA = {
         "       - match_message_id, messages_before, messages_after\n"
         "     Bookends + window together let you reconstruct goal → match → resolution "
         "without paying for the whole transcript.\n\n"
-        "  2) SCROLL — pass `session_id` + `around_message_id`:\n"
+        "  4) SCROLL — pass `session_id` + `around_message_id`:\n"
         "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
         "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
         "no bookends — just the slice. Use after a discovery call when you need more "
@@ -792,16 +978,6 @@ SESSION_SEARCH_SCHEMA = {
         "       - The boundary message appears in both windows — orientation marker.\n"
         "       - When messages_before or messages_after is < window, you're at the "
         "start or end of the session.\n\n"
-        "  3) READ — pass `session_id` only (no around_message_id):\n"
-        "     session_search(session_id=\"...\", profile=\"work\")\n"
-        "     Dumps the whole session by id (first 20 + last 10 messages when "
-        "large). This is how you resolve an `@session:<profile>/<id>` link the "
-        "user dropped into the chat: split the value on `/` into profile + id "
-        "and call session_search(session_id=id, profile=profile).\n\n"
-        "  4) BROWSE — no args:\n"
-        "     session_search()\n"
-        "     Returns recent sessions chronologically: titles, previews, timestamps. "
-        "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
         "FTS5 SYNTAX\n\n"
         "  AND is the default — multi-word queries require all terms. Use OR explicitly "
         "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
@@ -830,7 +1006,7 @@ SESSION_SEARCH_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Discovery shape only. Max sessions to return (default 3, max 10). "
+                    "Browse/discovery shapes. Max sessions to return (default 3, max 10). "
                     "Bump to 5–10 when the topic likely spans several sessions and you "
                     "want to pick the right one to scroll into."
                 ),
@@ -851,9 +1027,10 @@ SESSION_SEARCH_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
-                    "from a prior discovery call. Must be paired with "
-                    "around_message_id."
+                    "Read or scroll shape. Pass session_id ALONE to read the selected "
+                    "session. Pair it with around_message_id only to scroll around a "
+                    "specific message. Use the session_id returned by browse or "
+                    "discovery."
                 ),
             },
             "around_message_id": {

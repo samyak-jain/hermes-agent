@@ -525,13 +525,31 @@ For deeper analytics — token usage, cost estimates, tool breakdown, and activi
 
 ## Session Search Tool
 
-The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls, no summarization, no truncation. Every shape returns actual messages from the DB.
+The agent has a built-in `session_search` tool that browses and reads past conversations, performs topic search using SQLite's FTS5 index, and scrolls through any session it finds. It makes no LLM calls and returns actual messages from the database. Long message bodies and tool-call arguments are bounded in tool responses so restricted model harnesses can consume the result inline; truncation markers retain both the beginning and ending text.
 
-### Three calling shapes
+### Four calling shapes
 
 The tool infers what you want from which arguments you set. There's no `mode` parameter.
 
-**1. Discovery — pass `query`:**
+**1. Browse — no args:**
+
+```python
+session_search()
+```
+
+Returns recent sessions with the current platform conversation first, followed by other interactive sessions and then automation. Results include an opening `preview` and `ending_preview`.
+
+For requests such as "the last session", "the previous session", or "pick up where we left off", browse first instead of guessing keywords. A keyword query can only return sessions containing those words and may miss the immediately preceding conversation.
+
+**2. Read — pass `session_id` only:**
+
+```python
+session_search(session_id="20260510_174648_805cc2")
+```
+
+Reads the selected session directly. Small sessions are returned in full; large sessions return the first 20 and last 10 messages, with message IDs that can be used to scroll through the omitted middle.
+
+**3. Discovery — pass `query`:**
 
 ```python
 session_search(query="auth refactor", limit=3)
@@ -548,7 +566,7 @@ Runs FTS5, dedupes hits by session lineage, returns the top N sessions. Each res
 
 Bookends + window together reconstruct goal → match → resolution without paying for the whole transcript. Typical wall time: 15–50ms on a real session DB.
 
-**2. Scroll — pass `session_id` + `around_message_id`:**
+**4. Scroll — pass `session_id` + `around_message_id`:**
 
 ```python
 session_search(session_id="20260510_174648_805cc2", around_message_id=590803, window=10)
@@ -562,14 +580,6 @@ Returns a window of ±`window` messages centered on the anchor. No FTS5, no book
 - When `messages_before` or `messages_after` is less than `window`, you're at the start or end of the session
 
 Typical wall time: 1–2ms per scroll call.
-
-**3. Browse — no args:**
-
-```python
-session_search()
-```
-
-Returns recent sessions chronologically (titles, previews, timestamps). Useful when the user asks "what was I working on" without naming a topic.
 
 ### FTS5 query syntax
 
@@ -589,7 +599,7 @@ The keyword mode supports standard FTS5 query syntax:
 
 The agent is prompted to use session search automatically:
 
-> *"When the user references something from a past conversation or you suspect relevant prior context exists, use session_search to recall it before asking them to repeat themselves."*
+> *"For requests such as 'the last session', 'the previous session', or 'pick up where we left off', first call session_search with no query, choose the newest same-conversation interactive session, then call session_search again with that session_id alone to read it."*
 
 Typical triggers: "we did this before", "remember when", "last time", "as I mentioned", or any reference to a project/person/concept that isn't in the current window.
 

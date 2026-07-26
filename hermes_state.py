@@ -3852,10 +3852,11 @@ class SessionDB:
         search_query: str = None,
         compact_rows: bool = False,
     ) -> List[Dict[str, Any]]:
-        """List sessions with preview (first user message) and last active timestamp.
+        """List sessions with opening/ending previews and last active timestamp.
 
         Returns dicts with keys: id, source, model, title, started_at, ended_at,
         message_count, preview (first 60 chars of first user message),
+        ending_preview (last 240 chars of user/assistant conversation),
         last_active (timestamp of last message).
 
         Uses a single query with correlated subqueries instead of N+2 queries.
@@ -4040,6 +4041,16 @@ class SessionDB:
                         ''
                     ) AS _preview_raw,
                     COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                         FROM messages m3
+                         WHERE m3.session_id = s.id
+                           AND m3.role IN ('user', 'assistant')
+                           AND m3.content IS NOT NULL
+                           AND TRIM(m3.content) != ''
+                         ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                        ''
+                    ) AS _ending_preview_raw,
+                    COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active,
@@ -4065,6 +4076,16 @@ class SessionDB:
                         ''
                     ) AS _preview_raw,
                     COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                         FROM messages m3
+                         WHERE m3.session_id = s.id
+                           AND m3.role IN ('user', 'assistant')
+                           AND m3.content IS NOT NULL
+                           AND TRIM(m3.content) != ''
+                         ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                        ''
+                    ) AS _ending_preview_raw,
+                    COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active
@@ -4087,6 +4108,12 @@ class SessionDB:
                 s["preview"] = text + ("..." if len(raw) > 60 else "")
             else:
                 s["preview"] = ""
+            ending_raw = s.pop("_ending_preview_raw", "").strip()
+            if ending_raw:
+                text = ending_raw[:240]
+                s["ending_preview"] = text + ("..." if len(ending_raw) > 240 else "")
+            else:
+                s["ending_preview"] = ""
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -4117,6 +4144,7 @@ class SessionDB:
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
+                    "ending_preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
@@ -4212,6 +4240,16 @@ class SessionDB:
                     ''
                 ) AS _preview_raw,
                 COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                     FROM messages m3
+                     WHERE m3.session_id = s.id
+                       AND m3.role IN ('user', 'assistant')
+                       AND m3.content IS NOT NULL
+                       AND TRIM(m3.content) != ''
+                     ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                    ''
+                ) AS _ending_preview_raw,
+                COALESCE(
                     (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
                 ) AS last_active
@@ -4230,6 +4268,12 @@ class SessionDB:
             s["preview"] = text + ("..." if len(raw) > 60 else "")
         else:
             s["preview"] = ""
+        ending_raw = s.pop("_ending_preview_raw", "").strip()
+        if ending_raw:
+            text = ending_raw[:240]
+            s["ending_preview"] = text + ("..." if len(ending_raw) > 240 else "")
+        else:
+            s["ending_preview"] = ""
         return s
 
     # =========================================================================

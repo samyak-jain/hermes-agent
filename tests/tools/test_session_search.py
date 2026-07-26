@@ -1,9 +1,10 @@
 """Tests for the single-shape session_search tool.
 
-Three calling shapes:
-  1. DISCOVERY — pass query → FTS5 + anchored window + bookends per hit
-  2. SCROLL    — pass session_id + around_message_id → just the window
-  3. BROWSE    — no args → recent sessions chronologically
+Four calling shapes:
+  1. BROWSE    — no args → recent sessions, same conversation first
+  2. READ      — pass session_id → bounded transcript
+  3. DISCOVERY — pass query → FTS5 + anchored window + bookends per hit
+  4. SCROLL    — pass session_id + around_message_id → just the window
 
 All run zero LLM calls.
 """
@@ -93,6 +94,16 @@ class TestSchema:
         # Must explain how to scroll
         assert "scroll FORWARD" in desc or "messages[-1]" in desc
 
+    def test_schema_teaches_recency_browse_then_direct_read(self):
+        desc = SESSION_SEARCH_SCHEMA["description"]
+        session_id_desc = SESSION_SEARCH_SCHEMA["parameters"]["properties"][
+            "session_id"
+        ]["description"]
+        assert "ALWAYS start here" in desc
+        assert "do not guess topic keywords" in desc
+        assert "session_id ALONE" in session_id_desc
+        assert "Must be paired" not in session_id_desc
+
     def test_no_llm_promise_in_description(self):
         # The new design never calls an LLM
         desc = SESSION_SEARCH_SCHEMA["description"].lower()
@@ -148,6 +159,117 @@ class TestBrowseShape:
         result = json.loads(session_search(db=db))
         titles = [r.get("title") for r in result["results"]]
         assert any("Modpack" in (t or "") for t in titles)
+
+    def test_browse_returns_ending_preview(self, db):
+        _seed_modpack_sessions(db)
+        result = json.loads(session_search(db=db))
+        newest = next(r for r in result["results"] if r["session_id"] == "s_newest")
+        assert "ending_preview" in newest
+        assert "alternator nerfed" in newest["ending_preview"]
+
+    def test_previous_session_uses_conversation_affinity_not_keyword_guess(self, db):
+        """Regression: the latest DM omitted guessed terms used by the model.
+
+        A cron probe and API verification ran after it. Browsing must still put
+        the preceding session from this Discord DM first, and a direct read must
+        expose its real ending.
+        """
+        now = time.time()
+        dm_key = "agent:main:discord:dm:42"
+
+        db.create_session(
+            "current_dm",
+            source="discord",
+            session_key=dm_key,
+            user_id="42",
+        )
+        db.append_message(
+            "current_dm",
+            role="user",
+            content="pick up where we left off",
+            timestamp=now,
+        )
+
+        db.create_session(
+            "actual_previous_dm",
+            source="discord",
+            session_key=dm_key,
+            user_id="42",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (now - 300, "actual_previous_dm"),
+        )
+        first_id = db.append_message(
+            "actual_previous_dm",
+            role="user",
+            content="Compare GOWA with wacli and install the better option.",
+            timestamp=now - 300,
+        )
+        last_id = db.append_message(
+            "actual_previous_dm",
+            role="assistant",
+            content="Resume the wacli install after the sandbox recovers.",
+            timestamp=now - 240,
+        )
+
+        db.create_session("nightly_probe", source="cron")
+        db.append_message(
+            "nightly_probe",
+            role="assistant",
+            content="Nightly audit complete.",
+            timestamp=now - 30,
+        )
+        db.create_session("deployment_probe", source="api_server")
+        db.append_message(
+            "deployment_probe",
+            role="assistant",
+            content="REQUEST_LOG_OK",
+            timestamp=now - 20,
+        )
+
+        db.create_session(
+            "older_keyword_match",
+            source="discord",
+            session_key="agent:main:discord:dm:other",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (now - 86_400, "older_keyword_match"),
+        )
+        db.append_message(
+            "older_keyword_match",
+            role="user",
+            content="The operator fix for the broken sandbox.",
+            timestamp=now - 86_400,
+        )
+        db._conn.commit()
+
+        browse = json.loads(
+            session_search(db=db, current_session_id="current_dm", limit=3)
+        )
+        assert browse["results"][0]["session_id"] == "actual_previous_dm"
+        assert browse["results"][0]["same_conversation"] is True
+        assert "Resume the wacli install" in browse["results"][0]["ending_preview"]
+
+        direct = json.loads(
+            session_search(db=db, session_id=browse["results"][0]["session_id"])
+        )
+        assert [m["id"] for m in direct["messages"]] == [first_id, last_id]
+        assert "sandbox recovers" in direct["messages"][-1]["content"]
+
+        guessed = json.loads(
+            session_search(
+                db=db,
+                query="operator fix",
+                sort="newest",
+                current_session_id="current_dm",
+            )
+        )
+        assert guessed["results"][0]["session_id"] == "older_keyword_match"
+        assert all(
+            r["session_id"] != "actual_previous_dm" for r in guessed["results"]
+        )
 
 
 # =========================================================================
@@ -253,6 +375,43 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_large_discovery_stays_inline_for_claude_harness(self, db):
+        """The Claude host must not replace recall with a private file pointer."""
+        now = time.time()
+        huge = "needle " + ("x" * 40_000)
+        for idx in range(10):
+            sid = f"large_{idx}"
+            db.create_session(sid, source="discord")
+            for msg_idx in range(11):
+                role = "user" if msg_idx % 2 == 0 else "assistant"
+                db.append_message(
+                    sid,
+                    role=role,
+                    content=f"{huge} session={idx} message={msg_idx}",
+                    tool_calls=(
+                        [{
+                            "id": f"call_{idx}_{msg_idx}",
+                            "type": "function",
+                            "function": {
+                                "name": "large_fixture",
+                                "arguments": "y" * 40_000,
+                            },
+                        }]
+                        if role == "assistant"
+                        else None
+                    ),
+                    timestamp=now - idx * 100 + msg_idx,
+                )
+        db._conn.commit()
+
+        raw = session_search(query="needle", limit=10, db=db)
+        result = json.loads(raw)
+
+        assert result["count"] == 10
+        assert len(raw.encode("utf-8")) < 45_000
+        assert "chars omitted" in raw
+        assert "y" * 1_000 not in raw
 
 
 class TestDiscoverySort:
@@ -487,6 +646,37 @@ class TestReadShape:
         assert result["message_count"] == 50
         assert result["truncated"] is True
         assert len(result["messages"]) == 30  # head 20 + tail 10
+
+    def test_large_read_stays_inline_for_claude_harness(self, db):
+        db.create_session("s_huge", source="discord")
+        for i in range(50):
+            db.append_message(
+                "s_huge",
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"message {i} " + ("z" * 40_000),
+                tool_calls=(
+                    [{
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": "large_fixture",
+                            "arguments": "a" * 40_000,
+                        },
+                    }]
+                    if i % 2
+                    else None
+                ),
+            )
+
+        raw = session_search(session_id="s_huge", db=db)
+        result = json.loads(raw)
+
+        assert result["mode"] == "read"
+        assert result["truncated"] is True
+        assert len(result["messages"]) == 30
+        assert len(raw.encode("utf-8")) < 45_000
+        assert "chars omitted" in raw
+        assert "a" * 1_000 not in raw
 
 
 # =========================================================================
