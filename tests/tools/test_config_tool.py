@@ -21,6 +21,26 @@ from hermes_cli.agent_config import (
 from tools import config_tool as config_tool_module
 
 
+FIRECRAWL_TOOL_NAMES = [
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_search",
+    "firecrawl_search_feedback",
+    "firecrawl_crawl",
+    "firecrawl_check_crawl_status",
+    "firecrawl_extract",
+    "firecrawl_agent",
+    "firecrawl_agent_status",
+    "firecrawl_interact",
+    "firecrawl_interact_stop",
+    "firecrawl_research_search_papers",
+    "firecrawl_research_inspect_paper",
+    "firecrawl_research_related_papers",
+    "firecrawl_research_read_paper",
+    "firecrawl_research_search_github",
+]
+
+
 @pytest.fixture()
 def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
@@ -193,6 +213,83 @@ def test_mcp_env_reference_map_is_structured_and_approval_free(
     assert raw["mcp_servers"]["firecrawl"]["env"] == {
         "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
     }
+
+
+def test_json_encoded_mcp_env_reference_map_is_recovered(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
+    )
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value=json.dumps({"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"}),
+        reason="operator requested environment reference wiring",
+    )
+
+    assert result["success"] is True
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["mcp_servers"]["firecrawl"]["env"] == {
+        "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
+    }
+
+
+def test_archived_json_encoded_mcp_list_is_repaired_to_native_list(
+    broker_home: Path,
+):
+    path = broker_home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    encoded = json.dumps(FIRECRAWL_TOOL_NAMES)
+    raw["mcp_servers"] = {
+        "firecrawl": {"tools": {"include": encoded}},
+    }
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(path)
+
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=encoded,
+        reason="operator requested repair of the typed tool filter",
+    )
+
+    assert result["success"] is True
+    stored = yaml.safe_load(path.read_text(encoding="utf-8"))
+    include = stored["mcp_servers"]["firecrawl"]["tools"]["include"]
+    assert include == FIRECRAWL_TOOL_NAMES
+    assert isinstance(include, list)
+
+
+def test_native_mcp_list_stays_typed_and_rejects_non_string_items(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=FIRECRAWL_TOOL_NAMES,
+        reason="operator requested a typed tool filter",
+    )
+    assert result["success"] is True
+    repeated = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=FIRECRAWL_TOOL_NAMES,
+        reason="operator repeated the same typed tool filter",
+    )
+    assert repeated["success"] is False
+    assert "already has" in repeated["error"]
+
+    rejected = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.exclude",
+        value=["firecrawl_scrape", 7],
+        reason="operator requested an invalid tool filter",
+    )
+    assert rejected["success"] is False
+    assert "only string list items" in rejected["error"]
 
 
 @pytest.mark.parametrize(
@@ -487,6 +584,18 @@ def test_policy_filtered_config_schema_reaches_app_server_bridge(broker_home: Pa
     agent = SimpleNamespace(tools=tools, valid_tool_names={"config"})
     bridged = _app_server_tool_schemas(agent)
     assert [item["name"] for item in bridged] == ["config"]
+    value_schema = bridged[0]["inputSchema"]["properties"]["value"]
+    variants = value_schema["anyOf"]
+    assert {variant.get("type") for variant in variants} == {
+        "string",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "null",
+    }
+    object_schema = next(item for item in variants if item.get("type") == "object")
+    assert object_schema["additionalProperties"] == {"type": "string"}
 
 
 def test_config_mutation_approval_cannot_be_permanent_or_bypassed_by_yolo(
