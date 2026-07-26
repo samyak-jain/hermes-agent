@@ -618,6 +618,7 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
             "before_hash": actual_hash,
             "after_hash": _file_hash(after),
             "before_exists": bool(prepared.get("before_exists")),
+            "after_exists": config_path.exists(),
         }
         try:
             _append_audit(record)
@@ -729,7 +730,11 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
     effective = load_config()
     _assert_enabled(effective)
     current = _read_raw_bytes(get_config_path())
-    if _file_hash(current) != target.get("after_hash"):
+    current_exists = get_config_path().exists()
+    if (
+        _file_hash(current) != target.get("after_hash")
+        or current_exists != bool(target.get("after_exists", True))
+    ):
         raise AgentConfigError(
             "Rollback refused because config.yaml has changed since that revision. "
             "This prevents an old rollback from erasing later operator changes."
@@ -740,7 +745,7 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
         "path": target.get("path"),
         "reason": reason[:500],
         "expected_hash": _file_hash(current),
-        "expected_exists": get_config_path().exists(),
+        "expected_exists": current_exists,
         "restore_bytes": before,
         "restore_exists": bool(target.get("before_exists", True)),
         "apply": target.get("apply") or "next_session",
@@ -786,6 +791,7 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
                     "before_hash": prepared["expected_hash"],
                     "after_hash": _file_hash(after),
                     "before_exists": current_exists,
+                    "after_exists": config_path.exists(),
                 }
             )
         except Exception as audit_exc:
