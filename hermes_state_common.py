@@ -68,6 +68,11 @@ _PREVIEW_RAW_SELECT = (
 )
 
 
+_ENDING_PREVIEW_RAW_SELECT = (
+    "SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)"
+)
+
+
 def _shape_preview(raw: Any) -> str:
     """Turn a ``_preview_raw`` column into the short preview callers show."""
     text = str(raw or "").strip()
@@ -78,6 +83,12 @@ def _shape_preview(raw: Any) -> str:
     if len(text) > _PREVIEW_MAX_CHARS:
         return text[:_PREVIEW_MAX_CHARS] + "..."
     return text
+
+
+def _shape_ending_preview(raw: Any) -> str:
+    """Turn an ``_ending_preview_raw`` column into a compact tail preview."""
+    text = str(raw or "").strip()
+    return text[:240] + ("..." if len(text) > 240 else "")
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
