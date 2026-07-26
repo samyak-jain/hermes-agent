@@ -6659,43 +6659,39 @@ def _update_config_for_provider(
     # Update config.yaml model section
     config_path = get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    require_readable_config_before_write(config_path)
+    from hermes_cli.config import clear_model_endpoint_credentials, config_write_lock
 
-    config = read_raw_config()
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        config = read_raw_config()
 
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    elif isinstance(current_model, str) and current_model.strip():
-        model_cfg = {"default": current_model.strip()}
-    else:
-        model_cfg = {}
+        current_model = config.get("model")
+        if isinstance(current_model, dict):
+            model_cfg = dict(current_model)
+        elif isinstance(current_model, str) and current_model.strip():
+            model_cfg = {"default": current_model.strip()}
+        else:
+            model_cfg = {}
 
-    model_cfg["provider"] = provider_id
-    if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
-    else:
-        # Clear stale base_url to prevent contamination when switching providers
-        model_cfg.pop("base_url", None)
+        model_cfg["provider"] = provider_id
+        if inference_base_url and inference_base_url.strip():
+            model_cfg["base_url"] = inference_base_url.rstrip("/")
+        else:
+            # Clear stale base_url to prevent contamination when switching providers
+            model_cfg.pop("base_url", None)
 
-    # Clear stale endpoint credentials left over from a previous custom provider.
-    # Built-in providers resolve credentials from env/auth state, not inline
-    # model.api_key.
-    from hermes_cli.config import clear_model_endpoint_credentials
+        # Built-in providers resolve credentials from env/auth state, not
+        # inline model.api_key.
+        clear_model_endpoint_credentials(model_cfg)
 
-    clear_model_endpoint_credentials(model_cfg)
+        # Ensure an OpenRouter-formatted name is not sent to a direct provider.
+        if default_model:
+            cur_default = model_cfg.get("default", "")
+            if not cur_default or "/" in cur_default:
+                model_cfg["default"] = default_model
 
-    # When switching to a non-OpenRouter provider, ensure model.default is
-    # valid for the new provider.  An OpenRouter-formatted name like
-    # "anthropic/claude-opus-4.6" will fail on direct-API providers.
-    if default_model:
-        cur_default = model_cfg.get("default", "")
-        if not cur_default or "/" in cur_default:
-            model_cfg["default"] = default_model
-
-    config["model"] = model_cfg
-
-    atomic_yaml_write(config_path, config, sort_keys=False)
+        config["model"] = model_cfg
+        atomic_yaml_write(config_path, config, sort_keys=False)
     return config_path
 
 
@@ -6750,20 +6746,22 @@ def _logout_default_provider_from_config() -> Optional[str]:
 def _reset_config_provider() -> Path:
     """Reset config.yaml provider back to auto after logout."""
     config_path = get_config_path()
-    if not config_path.exists():
-        return config_path
-    require_readable_config_before_write(config_path)
+    from hermes_cli.config import config_write_lock
 
-    config = read_raw_config()
-    if not config:
-        return config_path
+    with config_write_lock(config_path):
+        if not config_path.exists():
+            return config_path
+        require_readable_config_before_write(config_path)
+        config = read_raw_config()
+        if not config:
+            return config_path
 
-    model = config.get("model")
-    if isinstance(model, dict):
-        model["provider"] = "auto"
-        if "base_url" in model:
-            model["base_url"] = OPENROUTER_BASE_URL
-    atomic_yaml_write(config_path, config, sort_keys=False)
+        model = config.get("model")
+        if isinstance(model, dict):
+            model["provider"] = "auto"
+            if "base_url" in model:
+                model["base_url"] = OPENROUTER_BASE_URL
+        atomic_yaml_write(config_path, config, sort_keys=False)
     return config_path
 
 
