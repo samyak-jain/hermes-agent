@@ -559,6 +559,23 @@ class TestMemoryToolDispatcher:
         result = json.loads(memory_tool(action="unknown", store=store))
         assert result["success"] is False
 
+    @pytest.mark.parametrize("action", [None, "", "read"])
+    def test_read_returns_latest_bounded_inventory(self, store, action):
+        store.add("memory", "fact A")
+        # Simulate another process writing after this store was constructed.
+        other = MemoryStore(memory_char_limit=500, user_char_limit=300)
+        other.load_from_disk()
+        other.add("memory", "fact B")
+
+        result = json.loads(memory_tool(action=action, target="memory", store=store))
+
+        assert result["success"] is True
+        assert result["target"] == "memory"
+        assert result["entries"] == ["fact A", "fact B"]
+        assert result["current_chars"] > 0
+        assert result["limit_chars"] == 500
+        assert result["usage"].endswith("/500")
+
     def test_add_via_tool(self, store):
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True

@@ -343,6 +343,25 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the latest bounded on-disk inventory for explicit review."""
+        with self._file_lock(self._path_for(target)):
+            # Refresh under the same lock used by mutations so a tool-only
+            # agent (cron, background maintenance) does not audit a stale
+            # construction-time snapshot.
+            self._reload_target(target, skip_drift=True)
+            entries = list(self._entries_for(target))
+            current = self._char_count(target)
+            limit = self._char_limit(target)
+        return {
+            "success": True,
+            "target": target,
+            "entries": entries,
+            "usage": f"{current:,}/{limit:,}",
+            "current_chars": current,
+            "limit_chars": limit,
+        }
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -996,6 +1015,12 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # ``action`` has historically been optional in the schema. Treat an
+    # omitted/null/empty action as a read so tool-only maintenance agents can
+    # inspect the current files without relying on automatic prompt injection.
+    if action in (None, "", "read") and not operations:
+        return json.dumps(store.read(target), ensure_ascii=False)
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):
@@ -1074,7 +1099,8 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
+        "Read and update durable facts in persistent memory that survive across sessions. "
+        "Use action='read' before an audit or targeted correction. Memory is "
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
@@ -1100,8 +1126,12 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform (single-op shape). Omit when using 'operations'."
+                "enum": ["read", "add", "replace", "remove"],
+                "description": (
+                    "Use 'read' to inspect current entries. For writes, use the "
+                    "single-op action. Omit when using 'operations'; an omitted "
+                    "action with no operations is also treated as read."
+                ),
             },
             "target": {
                 "type": "string",
@@ -1156,7 +1186,4 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
 
