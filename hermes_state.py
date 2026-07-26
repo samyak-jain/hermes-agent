@@ -55,11 +55,13 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
+    _ENDING_PREVIEW_RAW_SELECT,
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
+    _shape_ending_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
@@ -8826,10 +8828,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_key: str = None,
         include_hidden: bool = False,
     ) -> List[Dict[str, Any]]:
-        """List sessions with preview (first user message) and last active timestamp.
+        """List sessions with opening/ending previews and last active timestamp.
 
         Returns dicts with keys: id, source, model, title, started_at, ended_at,
         message_count, preview (first 60 chars of first user message),
+        ending_preview (last 240 chars of user/assistant conversation),
         last_active (freshest of last_activity_at heartbeat and latest
         message timestamp, else started_at).
 
@@ -9043,6 +9046,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT {_ENDING_PREVIEW_RAW_SELECT}
+                         FROM messages m3
+                         WHERE m3.session_id = s.id
+                           AND m3.role IN ('user', 'assistant')
+                           AND m3.content IS NOT NULL
+                           AND TRIM(m3.content) != ''
+                         ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                        ''
+                    ) AS _ending_preview_raw,
                     {_sql_session_last_active("s")} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
@@ -9066,6 +9079,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT {_ENDING_PREVIEW_RAW_SELECT}
+                         FROM messages m3
+                         WHERE m3.session_id = s.id
+                           AND m3.role IN ('user', 'assistant')
+                           AND m3.content IS NOT NULL
+                           AND TRIM(m3.content) != ''
+                         ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                        ''
+                    ) AS _ending_preview_raw,
                     {_sql_session_last_active("s")} AS last_active
                 FROM sessions s
                 {prompt_join}
@@ -9081,6 +9104,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for row in rows:
             s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            s["ending_preview"] = _shape_ending_preview(
+                s.pop("_ending_preview_raw", "")
+            )
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -9106,6 +9132,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ''
                     ) AS _preview_raw,
                     COALESCE(
+                        (SELECT {_ENDING_PREVIEW_RAW_SELECT}
+                         FROM messages m3
+                         WHERE m3.session_id = s.id
+                           AND m3.role IN ('user', 'assistant')
+                           AND m3.content IS NOT NULL
+                           AND TRIM(m3.content) != ''
+                         ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                        ''
+                    ) AS _ending_preview_raw,
+                    COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active
@@ -9122,6 +9158,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if s["id"] in seen_ids:
                     continue
                 s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+                s["ending_preview"] = _shape_ending_preview(
+                    s.pop("_ending_preview_raw", "")
+                )
                 seen_ids.add(s["id"])
                 sessions.append(s)
 
@@ -9166,6 +9205,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
+                    "ending_preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
