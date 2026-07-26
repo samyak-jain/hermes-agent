@@ -15,6 +15,7 @@ from cron.scheduler import (
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _cron_archive_prompt,
+    _attach_cron_memory_store,
     _register_cron_terminal,
     _resolve_cron_enabled_toolsets,
     _resolve_cron_tool_policy,
@@ -92,6 +93,25 @@ class TestPerJobToolsetMcpMerge:
 
 
 class TestCronToolPolicy:
+    def test_memory_store_attached_only_when_memory_tool_is_authorized(self):
+        store = object()
+        agent = MagicMock(
+            valid_tool_names={"memory", "session_search"},
+            _memory_store=None,
+        )
+        with patch("tools.memory_tool.load_on_disk_store", return_value=store) as load:
+            assert _attach_cron_memory_store(agent) is True
+        assert agent._memory_store is store
+        load.assert_called_once_with()
+
+        no_memory_agent = MagicMock(
+            valid_tool_names={"session_search"},
+            _memory_store=None,
+        )
+        with patch("tools.memory_tool.load_on_disk_store") as denied_load:
+            assert _attach_cron_memory_store(no_memory_agent) is False
+        denied_load.assert_not_called()
+
     def test_broad_denylist_keeps_noninteractive_tools(self):
         policy = _resolve_cron_tool_policy({
             "cron": {

@@ -297,6 +297,31 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _attach_cron_memory_store(agent) -> bool:
+    """Attach built-in on-disk memory without enabling cron memory ingestion.
+
+    Cron agents intentionally use ``skip_memory=True`` so their synthetic
+    prompts and responses never enter an external memory provider or get
+    injected with the user's memory automatically.  That flag also leaves
+    ``_memory_store`` unset, however, even when the exact tool policy exposes
+    the built-in ``memory`` tool.  In that state every explicit memory call
+    fails with "Memory is not available".
+
+    Attach only when the fully resolved/filtered tool surface actually contains
+    ``memory``.  The agent's ``_memory_enabled`` and
+    ``_user_profile_enabled`` flags remain false, so system-prompt assembly,
+    nudges, and external provider lifecycle stay disabled.  The model can read
+    or update the files only by deliberately calling the authorized tool.
+    """
+    if "memory" not in (getattr(agent, "valid_tool_names", None) or set()):
+        return False
+    if getattr(agent, "_memory_store", None) is None:
+        from tools.memory_tool import load_on_disk_store
+
+        agent._memory_store = load_on_disk_store()
+    return True
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -3799,6 +3824,7 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        _attach_cron_memory_store(agent)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
