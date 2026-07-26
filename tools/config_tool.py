@@ -150,7 +150,31 @@ CONFIG_SCHEMA = {
                 ),
             },
             "value": {
-                "description": "Typed JSON value for set. Do not put secrets here.",
+                "description": (
+                    "Typed JSON value for set. Send arrays and mappings as native "
+                    "JSON values, never as JSON-encoded strings. Do not put secrets here."
+                ),
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "number"},
+                                {"type": "boolean"},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    {"type": "null"},
+                ],
             },
             "reason": {
                 "type": "string",

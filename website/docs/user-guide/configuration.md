@@ -117,6 +117,10 @@ The one structured exception is `mcp_servers.<name>.env`: an operator-directed
 change may store a name-preserving environment reference such as
 `{"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"}`. The referenced value must
 already be injected by the host; plaintext credentials remain rejected.
+Structured leaves are transported and stored as their native JSON/YAML types.
+For compatibility with older tool bridges, the broker repairs JSON-encoded
+strings only when the destination is known to require a list or the approved
+MCP environment-reference mapping. It does not reinterpret ordinary strings.
 
 ## Environment Variable Substitution
 

@@ -111,6 +111,27 @@ class TestSignatureFromSchema:
         assert annots["a"] == list
         assert annots["o"] == dict
 
+    def test_anyof_preserves_structured_transport_types(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                        {"type": "array"},
+                        {"type": "object"},
+                        {"type": "null"},
+                    ]
+                }
+            },
+        }
+        _sig, annots = _signature_from_schema(schema)
+
+        value_types = set(get_args(annots["value"])) - {type(None)}
+        assert value_types == {str, float, bool, list, dict}
+
     def test_empty_schema(self):
         """Empty schema returns empty signature."""
         sig, annots = _signature_from_schema(None)
