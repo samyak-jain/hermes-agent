@@ -35,3 +35,34 @@ test("JSON schema conversion handles nested arrays and objects", () => {
     { name: "memory", enabled: true },
   ]);
 });
+
+test("JSON schema conversion preserves typed config arrays and reference maps", () => {
+  const schema = jsonSchemaToZod({
+    anyOf: [
+      { type: "string" },
+      {
+        type: "array",
+        items: {
+          anyOf: [
+            { type: "string" },
+            { type: "number" },
+            { type: "boolean" },
+            { type: "null" },
+          ],
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: { type: "string" },
+      },
+    ],
+  });
+
+  const names = Array.from({ length: 16 }, (_, index) => `firecrawl_${index}`);
+  assert.deepEqual(schema.parse(names), names);
+  assert.deepEqual(
+    schema.parse({ FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY}" }),
+    { FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY}" },
+  );
+  assert.throws(() => schema.parse({ FIRECRAWL_API_KEY: 7 }));
+});

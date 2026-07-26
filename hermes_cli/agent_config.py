@@ -7,8 +7,8 @@ expose the file or the managed overlay.  Instead it:
 * exposes either an operator allowlist or every schema-known/existing,
   non-secret setting that is not pinned by the managed overlay;
 * reports effective values together with their source and apply semantics;
-* rejects managed, credential-shaped, container-valued, internal, or absent
-  unknown leaves;
+* rejects managed, credential-shaped, unapproved container-valued, internal,
+  or absent unknown leaves;
 * applies optimistic concurrency plus a cross-process advisory lock;
 * snapshots the prior file, writes atomically, and appends a metadata-only
   audit record that can be used for a fail-closed rollback.
@@ -109,6 +109,9 @@ _OBVIOUS_SECRET_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _MCP_ENV_PATH_RE = re.compile(r"^mcp_servers\.[^.]+\.env$")
+_MCP_LIST_PATH_RE = re.compile(
+    r"^mcp_servers\.[^.]+\.(?:args|tools\.(?:include|exclude))$"
+)
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_REFERENCE_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
@@ -264,6 +267,55 @@ def _is_mcp_env_reference_map(path: str, value: Any) -> bool:
         if match is None or match.group(1) != key:
             return False
     return True
+
+
+def _expected_structured_type(path: str, effective: dict) -> type | None:
+    """Return the structured type a leaf must retain across tool transports."""
+    if _MCP_ENV_PATH_RE.fullmatch(path):
+        return dict
+    if _MCP_LIST_PATH_RE.fullmatch(path):
+        return list
+
+    from hermes_cli.config import _default_value_for_key
+
+    default = _default_value_for_key(path)
+    if isinstance(default, list):
+        return list
+
+    marker = object()
+    current = _nested(effective, path, marker)
+    if isinstance(current, list):
+        return list
+    return None
+
+
+def _normalize_structured_input(path: str, value: Any, effective: dict) -> Any:
+    """Recover JSON text emitted by transports for known structured leaves.
+
+    Older or weakly typed tool bridges may serialize an array or mapping into
+    a JSON string. Decode only when the destination has a known structured
+    type, so legitimate string-valued configuration is never reinterpreted.
+    """
+    expected = _expected_structured_type(path, effective)
+    if expected is None or not isinstance(value, str):
+        return value
+
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise AgentConfigError(
+            f"'{path}' expects a JSON {expected.__name__}, not a string."
+        ) from exc
+    if type(decoded) is not expected:
+        raise AgentConfigError(
+            f"'{path}' expects {expected.__name__}, got {type(decoded).__name__}."
+        )
+    return decoded
+
+
+def _same_typed_value(left: Any, right: Any) -> bool:
+    """Compare configuration leaves without collapsing distinct JSON types."""
+    return type(left) is type(right) and left == right
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -455,6 +507,10 @@ def _validate_value(path: str, value: Any) -> None:
     elif isinstance(value, list):
         if len(value) > 256 or any(isinstance(item, (dict, list)) for item in value):
             raise AgentConfigError("Lists are limited to 256 scalar values.")
+        if _MCP_LIST_PATH_RE.fullmatch(path) and any(
+            not isinstance(item, str) for item in value
+        ):
+            raise AgentConfigError(f"'{path}' accepts only string list items.")
     elif value is not None and not isinstance(value, (bool, int, float)):
         raise AgentConfigError(f"Unsupported configuration value type: {type(value).__name__}.")
 
@@ -552,6 +608,7 @@ def prepare_change(
     if _value_looks_secret(reason):
         raise AgentConfigError("The change reason appears to contain credential material.")
     if operation == "set":
+        value = _normalize_structured_input(path, value, effective)
         _validate_value(path, value)
         if _value_looks_secret(value) and not _is_mcp_env_reference_map(path, value):
             raise AgentConfigError(
@@ -568,7 +625,11 @@ def prepare_change(
     old_value = _nested(raw, path, marker)
     if operation == "unset" and old_value is marker:
         raise AgentConfigError(f"'{path}' is not explicitly set in the user config.")
-    if operation == "set" and old_value is not marker and old_value == value:
+    if (
+        operation == "set"
+        and old_value is not marker
+        and _same_typed_value(old_value, value)
+    ):
         raise AgentConfigError(f"'{path}' already has the requested user value.")
     return {
         "operation": operation,
