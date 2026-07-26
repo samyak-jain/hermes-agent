@@ -38,3 +38,8 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
 
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_schema_exposes_inventory_read():
+    actions = MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert actions == ["read", "add", "replace", "remove"]
