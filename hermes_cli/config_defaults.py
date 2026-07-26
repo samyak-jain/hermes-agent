@@ -10,6 +10,13 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Service-gated, policy-filtered configuration broker for conversational
+    # agents. Disabled until an operator explicitly supplies path allowlists.
+    "agent_config": {
+        "enabled": False,
+        "editable_paths": [],
+        "guarded_paths": [],
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; use DELETE or TRUNCATE for weak-fsync/shared filesystems
     # after an offline migration. TRUNCATE avoids a directory mutation per commit.
@@ -55,6 +62,8 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Global effort when no per-session or per-model override is present.
+        "reasoning_effort": "",
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

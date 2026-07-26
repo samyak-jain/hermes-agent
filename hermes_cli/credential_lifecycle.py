@@ -124,54 +124,56 @@ def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> List[st
     from utils import atomic_yaml_write, fast_safe_load
 
     from hermes_cli.config import (
+        config_write_lock,
         get_config_path,
         require_readable_config_before_write,
     )
 
     config_path = get_config_path()
-    if not config_path.exists():
-        return []
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            user_config = fast_safe_load(f) or {}
-    except Exception:
-        return []
-    if not isinstance(user_config, dict):
-        return []
+    with config_write_lock(config_path):
+        if not config_path.exists():
+            return []
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                user_config = fast_safe_load(f) or {}
+        except Exception:
+            return []
+        if not isinstance(user_config, dict):
+            return []
 
-    touched: List[str] = []
+        touched: List[str] = []
 
-    def _fix(section: Any, key_path: str) -> None:
-        if not isinstance(section, dict):
-            return
-        # "api" is the legacy alias for model.api_key kept by older configs.
-        for field in ("api_key", "api"):
-            current = section.get(field)
-            if isinstance(current, str) and current == old_value:
-                if new_value:
-                    section[field] = new_value
-                else:
-                    section.pop(field, None)
-                touched.append(f"{key_path}.{field}")
+        def _fix(section: Any, key_path: str) -> None:
+            if not isinstance(section, dict):
+                return
+            # "api" is the legacy alias for model.api_key kept by older configs.
+            for field in ("api_key", "api"):
+                current = section.get(field)
+                if isinstance(current, str) and current == old_value:
+                    if new_value:
+                        section[field] = new_value
+                    else:
+                        section.pop(field, None)
+                    touched.append(f"{key_path}.{field}")
 
-    _fix(user_config.get("model"), "model")
+        _fix(user_config.get("model"), "model")
 
-    aux = user_config.get("auxiliary")
-    if isinstance(aux, dict):
-        for task, slot_cfg in aux.items():
-            _fix(slot_cfg, f"auxiliary.{task}")
+        aux = user_config.get("auxiliary")
+        if isinstance(aux, dict):
+            for task, slot_cfg in aux.items():
+                _fix(slot_cfg, f"auxiliary.{task}")
 
-    custom = user_config.get("custom_providers")
-    if isinstance(custom, list):
-        for idx, entry in enumerate(custom):
-            _fix(entry, f"custom_providers.{idx}")
-    elif isinstance(custom, dict):
-        for name, entry in custom.items():
-            _fix(entry, f"custom_providers.{name}")
+        custom = user_config.get("custom_providers")
+        if isinstance(custom, list):
+            for idx, entry in enumerate(custom):
+                _fix(entry, f"custom_providers.{idx}")
+        elif isinstance(custom, dict):
+            for name, entry in custom.items():
+                _fix(entry, f"custom_providers.{name}")
 
-    if touched:
-        require_readable_config_before_write(config_path)
-        atomic_yaml_write(config_path, user_config, sort_keys=False)
+        if touched:
+            require_readable_config_before_write(config_path)
+            atomic_yaml_write(config_path, user_config, sort_keys=False)
     return touched
 
 
