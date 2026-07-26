@@ -113,6 +113,10 @@ execution sandbox.
 
 Secrets remain outside this surface. The broker rejects credential-shaped
 paths and values; use the relevant authentication or secret-management flow.
+The one structured exception is `mcp_servers.<name>.env`: an operator-directed
+change may store a name-preserving environment reference such as
+`{"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"}`. The referenced value must
+already be injected by the host; plaintext credentials remain rejected.
 
 ## Environment Variable Substitution
 

@@ -173,6 +173,61 @@ def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
         )
 
 
+def test_mcp_env_reference_map_is_structured_and_approval_free(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
+    )
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value={"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"},
+        reason="operator requested environment reference wiring",
+    )
+
+    assert result["success"] is True
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["mcp_servers"]["firecrawl"]["env"] == {
+        "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"FIRECRAWL_API_KEY": "plaintext"},
+        {"FIRECRAWL_API_KEY": "${OTHER_KEY}"},
+        {"bad-key": "${bad-key}"},
+        {},
+    ],
+)
+def test_mcp_env_map_rejects_plaintext_or_mismatched_references(
+    broker_home: Path, value: dict
+):
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value=value,
+        reason="operator requested environment wiring",
+    )
+    assert result["success"] is False
+    assert "KEY: ${KEY}" in result["error"]
+
+
+def test_arbitrary_mapping_remains_rejected(broker_home: Path):
+    result = _result(
+        action="set",
+        path="display.skin",
+        value={"theme": "pastel"},
+        reason="operator requested mapping",
+    )
+    assert result["success"] is False
+    assert "Mappings are not agent-editable" in result["error"]
+
+
 def test_autonomous_policy_skips_approval_and_writes_atomically(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
