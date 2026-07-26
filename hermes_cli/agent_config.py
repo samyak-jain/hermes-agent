@@ -4,9 +4,11 @@ This module is the narrow write boundary between a sandboxed conversational
 agent and the gateway-owned ``config.yaml``.  It deliberately does *not*
 expose the file or the managed overlay.  Instead it:
 
-* exposes only operator-enabled paths from a built-in non-secret policy;
+* exposes either an operator allowlist or every schema-known/existing,
+  non-secret setting that is not pinned by the managed overlay;
 * reports effective values together with their source and apply semantics;
-* rejects managed, credential-shaped, container-valued, or unknown leaves;
+* rejects managed, credential-shaped, container-valued, internal, or absent
+  unknown leaves;
 * applies optimistic concurrency plus a cross-process advisory lock;
 * snapshots the prior file, writes atomically, and appends a metadata-only
   audit record that can be used for a fail-closed rollback.
@@ -116,10 +118,12 @@ _APPLY_MODE_EXACT = {
 _NEXT_SESSION_PREFIXES = (
     "agent.",
     "compression.",
+    "display.",
     "memory.",
     "prompt_caching.",
     "session_reset.",
     "skills.",
+    "streaming.",
 )
 
 
@@ -155,7 +159,27 @@ def broker_enabled(config: Optional[dict] = None) -> bool:
     return bool(isinstance(block, dict) and block.get("enabled") is True)
 
 
+def _ownership_mode(config: dict) -> str:
+    block = config.get("agent_config") if isinstance(config, dict) else None
+    mode = (
+        str(block.get("ownership_mode") or "allowlist").strip().lower()
+        if isinstance(block, dict)
+        else "allowlist"
+    )
+    return mode if mode in {"allowlist", "unmanaged"} else "allowlist"
+
+
 def _path_class(path: str, config: dict) -> Optional[str]:
+    if _ownership_mode(config) == "unmanaged":
+        from hermes_cli import managed_scope
+        from hermes_cli.config import _validate_config_key
+
+        known, _suggestion = _validate_config_key(path)
+        marker = object()
+        if not known and _nested(config, path, marker) is marker:
+            return None
+        return "operator_managed" if managed_scope.is_key_managed(path) else "agent_owned"
+
     safe_policy = _configured_patterns(config, "editable_paths")
     guarded_policy = _configured_patterns(config, "guarded_paths")
     if _matches_any(path, SAFE_BUILTIN_PATTERNS) and _matches_any(path, safe_policy):
@@ -236,11 +260,11 @@ def _apply_mode(path: str) -> str:
         return _APPLY_MODE_EXACT[path]
     if path.startswith(_NEXT_SESSION_PREFIXES):
         return "next_session"
-    # Conservative default: Hermes caches agents, adapters, prompt identity,
-    # and tool schemas at different layers. A new session is always the safe
-    # point at which an otherwise-unclassified preference is guaranteed to be
-    # reconstructed without mutating the current cached prompt.
-    return "next_session"
+    # Settings outside the explicitly understood live/session surfaces may be
+    # consumed by gateway adapters, provider clients, MCP discovery, or other
+    # startup-only components. Persist them, but report the real conservative
+    # boundary instead of falsely promising that a new chat is sufficient.
+    return "restart_required"
 
 
 def _assert_enabled(config: dict) -> None:
@@ -254,6 +278,8 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
     path = str(path or "").strip()
     if not path or path.startswith(".") or path.endswith(".") or ".." in path:
         raise AgentConfigError("A valid dotted configuration leaf is required.")
+    if path.split(".", 1)[0].startswith("_"):
+        raise AgentConfigError("Internal configuration metadata is not agent-editable.")
     if path == "agent_config" or path.startswith("agent_config."):
         raise AgentConfigError("The configuration broker policy cannot edit itself.")
     if _secret_shaped_path(path):
@@ -264,12 +290,13 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
     classification = _path_class(path, config)
     if classification is None:
         raise AgentConfigError(
-            f"'{path}' is not in the operator-approved agent configuration surface."
+            f"'{path}' is not a recognized or operator-authorized agent "
+            "configuration leaf."
         )
     if for_write:
         from hermes_cli import managed_scope
 
-        if managed_scope.is_key_managed(path):
+        if classification == "operator_managed" or managed_scope.is_key_managed(path):
             raise AgentConfigError(
                 f"'{path}' is managed by Kumo/your administrator and cannot be "
                 "changed through the agent-owned configuration."
@@ -311,6 +338,9 @@ def inspect_config(path: Optional[str] = None) -> dict:
 
     settings = []
     for dotted in sorted(effective_flat):
+        top = dotted.split(".", 1)[0]
+        if top.startswith("_") or top == "agent_config":
+            continue
         classification = _path_class(dotted, effective)
         if classification is None or _secret_shaped_path(dotted):
             continue
@@ -356,11 +386,19 @@ def _load_yaml_bytes(data: bytes) -> dict:
 
 
 def _validate_value(path: str, value: Any) -> None:
-    from hermes_cli.config import DEFAULT_CONFIG, _default_value_for_key, _validate_config_key
+    from hermes_cli.config import (
+        DEFAULT_CONFIG,
+        _default_value_for_key,
+        _validate_config_key,
+        load_config,
+    )
 
     known, _suggestion = _validate_config_key(path)
     if not known:
-        raise AgentConfigError(f"'{path}' is not recognized by this Hermes version.")
+        marker = object()
+        current = _nested(load_config(), path, marker)
+        if current is marker:
+            raise AgentConfigError(f"'{path}' is not recognized by this Hermes version.")
     if isinstance(value, dict):
         raise AgentConfigError("Set one configuration leaf at a time, not a mapping.")
     if isinstance(value, str):
@@ -392,6 +430,8 @@ def _validate_value(path: str, value: Any) -> None:
         return
 
     default = _default_value_for_key(path)
+    if default is None and not known:
+        default = current
     if default is None:
         # A known dynamically-shaped leaf has no concrete type information.
         return
@@ -656,7 +696,13 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
                 "The current conversation keeps its cached prompt; this applies "
                 "from the next session."
                 if prepared["apply"] == "next_session"
-                else "No gateway restart is required."
+                else (
+                    "The setting is persisted but requires a drained gateway "
+                    "restart before every runtime component is guaranteed to "
+                    "observe it."
+                    if prepared["apply"] == "restart_required"
+                    else "No gateway restart is required."
+                )
             )
         ),
     }

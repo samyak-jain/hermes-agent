@@ -124,6 +124,8 @@ CONFIG_SCHEMA = {
         "a validated gateway broker. Use inspect before changing anything. Set, "
         "unset, and rollback always request fresh human approval, apply atomically, "
         "and cannot modify Kumo-managed policy, credentials, or the broker policy. "
+        "The result reports whether the change applies next turn, next session, "
+        "or requires a drained gateway restart. "
         "Never use this tool merely because you prefer a different setting; mutate "
         "configuration only in response to an explicit operator request."
     ),

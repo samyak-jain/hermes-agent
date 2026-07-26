@@ -71,12 +71,13 @@ cannot override, via a system-level managed directory. See
 
 ### Agent configuration broker
 
-Managed deployments can expose a narrow, service-gated `config` tool to the
-conversational agent:
+Managed deployments can expose a service-gated `config` tool to the
+conversational agent. The default mode is an explicit allowlist:
 
 ```yaml
 agent_config:
   enabled: true
+  ownership_mode: allowlist
   editable_paths:
     - display.*
     - memory.memory_char_limit
@@ -84,11 +85,22 @@ agent_config:
     - model.default
 ```
 
-The configured lists only narrow Hermes's built-in non-secret candidate
-surface; they cannot widen it to credential paths or let the broker edit its
-own policy. The tool reports effective values and whether each came from
-defaults, user config, or the administrator-managed overlay. Managed leaves
-remain read-only.
+Alternatively, an operator can derive ownership from the managed overlay:
+
+```yaml
+agent_config:
+  enabled: true
+  ownership_mode: unmanaged
+```
+
+In `unmanaged` mode, every schema-known or existing effective, non-secret
+configuration leaf is agent-owned unless the administrator-managed overlay
+pins it. In `allowlist` mode, the configured lists only narrow Hermes's
+built-in non-secret candidate surface. Neither mode can expose credential
+paths, internal metadata, absent unknown paths, or let the broker edit its own
+policy. The tool reports effective values and whether each came from defaults,
+user config, or the administrator-managed overlay. Managed leaves remain
+read-only.
 
 Every set, unset, or rollback requires fresh human approval. Writes use
 optimistic concurrency, a cross-process lock, atomic replacement, protected
