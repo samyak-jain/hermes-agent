@@ -91,6 +91,7 @@ Alternatively, an operator can derive ownership from the managed overlay:
 agent_config:
   enabled: true
   ownership_mode: unmanaged
+  require_approval: false
 ```
 
 In `unmanaged` mode, every schema-known or existing effective, non-secret
@@ -102,11 +103,13 @@ policy. The tool reports effective values and whether each came from defaults,
 user config, or the administrator-managed overlay. Managed leaves remain
 read-only.
 
-Every set, unset, or rollback requires fresh human approval. Writes use
-optimistic concurrency, a cross-process lock, atomic replacement, protected
-pre-change snapshots, and metadata-only audit history. Delegated children and
-cron should deny the `config` tool. No raw configuration file needs to be
-mounted into their execution sandbox.
+Set `require_approval: false` only when the operator wants validated
+agent-owned mutations to apply autonomously. It defaults to `true`; either
+policy retains optimistic concurrency, a cross-process lock, atomic
+replacement, protected pre-change snapshots, and metadata-only audit history.
+The broker policy cannot edit itself. Delegated children and cron should deny
+the `config` tool. No raw configuration file needs to be mounted into their
+execution sandbox.
 
 Secrets remain outside this surface. The broker rejects credential-shaped
 paths and values; use the relevant authentication or secret-management flow.
