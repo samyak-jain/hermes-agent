@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             {
                 "display": {"skin": "default", "compact": False},
                 "memory": {"memory_char_limit": 2200},
+                "code_execution": {"timeout": 120},
             },
             sort_keys=False,
         ),
@@ -42,12 +44,7 @@ def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             {
                 "agent_config": {
                     "enabled": True,
-                    "editable_paths": [
-                        "display.*",
-                        "memory.memory_char_limit",
-                        "agent.reasoning_effort",
-                    ],
-                    "guarded_paths": ["model.default"],
+                    "ownership_mode": "unmanaged",
                 },
                 "model": {"default": "managed-model"},
             },
@@ -84,13 +81,71 @@ def test_inspect_reports_effective_source_without_exposing_policy(broker_home: P
         "value": "default",
         "source": "user",
         "editable": True,
-        "classification": "safe",
+        "classification": "agent_owned",
         "apply": "next_session",
     }
     assert by_path["model.default"]["value"] == "managed-model"
     assert by_path["model.default"]["source"] == "managed"
     assert by_path["model.default"]["editable"] is False
+    assert by_path["model.default"]["classification"] == "operator_managed"
     assert not any(item["path"].startswith("agent_config.") for item in result["settings"])
+
+
+def test_unmanaged_mode_exposes_every_recognized_non_secret_leaf(
+    broker_home: Path,
+):
+    result = inspect_config()
+    by_path = {item["path"]: item for item in result["settings"]}
+
+    # This is intentionally outside the legacy curated preference allowlist.
+    inspected = inspect_config("code_execution.timeout")
+    assert inspected["editable"] is True
+    assert inspected["classification"] == "agent_owned"
+    assert inspected["apply"] == "restart_required"
+    assert by_path["display.skin"]["editable"] is True
+    prepared = prepare_change(
+        operation="set",
+        path="code_execution.timeout",
+        value=121,
+        reason="operator asked",
+    )
+    assert prepared["classification"] == "agent_owned"
+
+
+def test_unmanaged_mode_rejects_internal_metadata(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="Internal configuration metadata"):
+        prepare_change(
+            operation="set",
+            path="_config_version",
+            value=99,
+            reason="operator asked",
+        )
+
+
+def test_allowlist_mode_remains_backward_compatible(
+    broker_home: Path,
+):
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent_config": {
+                    "enabled": True,
+                    "editable_paths": ["display.*"],
+                    "guarded_paths": ["model.default"],
+                },
+                "model": {"default": "managed-model"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    assert inspect_config("display.skin")["classification"] == "safe"
+    with pytest.raises(AgentConfigError, match="not a recognized or operator-authorized"):
+        inspect_config("code_execution.timeout")
 
 
 def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
@@ -349,7 +404,9 @@ def test_config_tool_is_blocked_from_delegated_children():
     assert "config" in DELEGATE_BLOCKED_TOOLS
 
 
-def test_policy_filtered_config_schema_reaches_app_server_bridge(broker_home: Path):
+def test_policy_filtered_config_schema_reaches_app_server_tool_search_bridge(
+    broker_home: Path,
+):
     from types import SimpleNamespace
 
     import model_tools
@@ -357,13 +414,19 @@ def test_policy_filtered_config_schema_reaches_app_server_bridge(broker_home: Pa
     from tools.registry import invalidate_check_fn_cache
 
     invalidate_check_fn_cache()
+    eager = model_tools.get_tool_definitions(
+        enabled_toolsets=["config"],
+        skip_tool_search_assembly=True,
+    )
+    assert {item["function"]["name"] for item in eager} == {"config"}
+
     tools = model_tools.get_tool_definitions(enabled_toolsets=["config"])
     names = {item["function"]["name"] for item in tools}
-    assert names == {"config"}
+    assert names == {"tool_search", "tool_describe", "tool_call"}
 
-    agent = SimpleNamespace(tools=tools, valid_tool_names={"config"})
+    agent = SimpleNamespace(tools=tools, valid_tool_names=names)
     bridged = _app_server_tool_schemas(agent)
-    assert [item["name"] for item in bridged] == ["config"]
+    assert {item["name"] for item in bridged} == names
 
 
 def test_config_mutation_approval_cannot_be_permanent_or_bypassed_by_yolo(

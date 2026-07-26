@@ -11,9 +11,12 @@ DEFAULT_CONFIG = {
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Service-gated, policy-filtered configuration broker for conversational
-    # agents. Disabled until an operator explicitly supplies path allowlists.
+    # agents. ``allowlist`` preserves narrow explicit ownership; ``unmanaged``
+    # permits schema-known or existing non-secret leaves unless an overlay
+    # pins them.
     "agent_config": {
         "enabled": False,
+        "ownership_mode": "allowlist",
         "editable_paths": [],
         "guarded_paths": [],
     },
