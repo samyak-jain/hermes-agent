@@ -55,6 +55,7 @@ test("JSON schema conversion preserves typed config arrays and reference maps", 
         type: "object",
         additionalProperties: { type: "string" },
       },
+      { type: "null" },
     ],
   });
 
@@ -64,5 +65,7 @@ test("JSON schema conversion preserves typed config arrays and reference maps", 
     schema.parse({ FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY}" }),
     { FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY}" },
   );
+  assert.equal(schema.parse(null), null);
   assert.throws(() => schema.parse({ FIRECRAWL_API_KEY: 7 }));
+  assert.throws(() => schema.parse(["firecrawl_map", { nested: true }]));
 });
