@@ -108,6 +108,9 @@ _OBVIOUS_SECRET_VALUE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_MCP_ENV_PATH_RE = re.compile(r"^mcp_servers\.[^.]+\.env$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_REFERENCE_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 _APPLY_MODE_EXACT = {
     "agent.reasoning_effort": "next_turn",
@@ -237,6 +240,30 @@ def _value_looks_secret(value: Any) -> bool:
             for key, item in value.items()
         )
     return False
+
+
+def _is_mcp_env_reference_map(path: str, value: Any) -> bool:
+    """Accept only name-preserving environment references, never plaintext.
+
+    MCP environment configuration is structurally a mapping, but its values
+    should point at credentials already present in the gateway environment.
+    Requiring ``KEY: ${KEY}`` keeps secret material out of config.yaml and
+    prevents this narrow structured exception from becoming a generic mapping
+    write escape hatch.
+    """
+    if not _MCP_ENV_PATH_RE.fullmatch(path) or not isinstance(value, dict):
+        return False
+    if not value or len(value) > 128:
+        return False
+    for key, reference in value.items():
+        if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
+            return False
+        if not isinstance(reference, str):
+            return False
+        match = _ENV_REFERENCE_RE.fullmatch(reference)
+        if match is None or match.group(1) != key:
+            return False
+    return True
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -416,7 +443,12 @@ def _validate_value(path: str, value: Any) -> None:
         if current is marker:
             raise AgentConfigError(f"'{path}' is not recognized by this Hermes version.")
     if isinstance(value, dict):
-        raise AgentConfigError("Set one configuration leaf at a time, not a mapping.")
+        if not _is_mcp_env_reference_map(path, value):
+            raise AgentConfigError(
+                "Mappings are not agent-editable except mcp_servers.<name>.env, "
+                "whose values must use exact KEY: ${KEY} environment references."
+            )
+        return
     if isinstance(value, str):
         if len(value) > 4096 or "\x00" in value:
             raise AgentConfigError("String configuration values must be under 4096 characters.")
@@ -521,7 +553,7 @@ def prepare_change(
         raise AgentConfigError("The change reason appears to contain credential material.")
     if operation == "set":
         _validate_value(path, value)
-        if _value_looks_secret(value):
+        if _value_looks_secret(value) and not _is_mcp_env_reference_map(path, value):
             raise AgentConfigError(
                 "The proposed value resembles credential material. Use the "
                 "secret-management or authentication workflow instead."
