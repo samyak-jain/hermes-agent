@@ -13,9 +13,9 @@ expose the file or the managed overlay.  Instead it:
 * snapshots the prior file, writes atomically, and appends a metadata-only
   audit record that can be used for a fail-closed rollback.
 
-Human approval belongs to ``tools/config_tool.py`` so this module remains
-usable from CLI tests and future non-model clients without smuggling UI state
-into the persistence layer.
+Interactive approval policy belongs to ``tools/config_tool.py`` so this module
+remains usable from CLI tests and future non-model clients without smuggling
+UI state into the persistence layer.
 """
 
 from __future__ import annotations
@@ -157,6 +157,22 @@ def broker_enabled(config: Optional[dict] = None) -> bool:
         config = load_config_readonly()
     block = config.get("agent_config") if isinstance(config, dict) else None
     return bool(isinstance(block, dict) and block.get("enabled") is True)
+
+
+def approval_required(config: Optional[dict] = None) -> bool:
+    """Return the operator-owned mutation approval policy.
+
+    Missing or malformed policy fails closed to the historical behavior.
+    ``agent_config`` cannot edit itself, so an agent cannot weaken this gate.
+    """
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    block = config.get("agent_config") if isinstance(config, dict) else None
+    if not isinstance(block, dict):
+        return True
+    return block.get("require_approval", True) is not False
 
 
 def _ownership_mode(config: dict) -> str:
@@ -490,7 +506,7 @@ def prepare_change(
     value: Any = None,
     reason: str,
 ) -> dict:
-    """Build an optimistic, approval-safe set/unset change preview."""
+    """Build an optimistic set/unset change preview."""
     from hermes_cli.config import get_config_path, load_config
 
     effective = load_config()
@@ -613,7 +629,7 @@ def _restore_bytes_after_failed_audit(
 
 
 def apply_change(prepared: dict, *, actor: str = "") -> dict:
-    """Apply an approved preview if config.yaml has not changed meanwhile."""
+    """Apply a prepared preview if config.yaml has not changed meanwhile."""
     from hermes_cli.config import (
         _set_nested,
         atomic_config_write,
@@ -630,8 +646,8 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
             or config_path.exists() != bool(prepared.get("before_exists"))
         ):
             raise AgentConfigError(
-                "config.yaml changed while approval was pending. Nothing was written; "
-                "inspect the current value and request approval again."
+                "config.yaml changed after this change was prepared. Nothing was "
+                "written; inspect the current value and retry."
             )
         raw = _load_yaml_bytes(before)
         if prepared["operation"] == "set":
@@ -639,7 +655,7 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
         else:
             if not _unset_nested(raw, prepared["path"]):
                 raise AgentConfigError(
-                    f"'{prepared['path']}' changed before the approved unset was applied."
+                    f"'{prepared['path']}' changed before the prepared unset was applied."
                 )
         _validate_candidate(raw)
         revision = _new_revision()
@@ -677,7 +693,7 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
                     f"restore error: {restore_exc}"
                 ) from restore_exc
             raise AgentConfigError(
-                "Configuration audit persistence failed, so the approved change "
+                "Configuration audit persistence failed, so the prepared change "
                 "was automatically rolled back."
             ) from audit_exc
         from hermes_cli.config import invalidate_config_caches
@@ -810,7 +826,7 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
             or current_exists != bool(prepared.get("expected_exists", True))
         ):
             raise AgentConfigError(
-                "config.yaml changed while rollback approval was pending. Nothing was written."
+                "config.yaml changed after the rollback was prepared. Nothing was written."
             )
         restored = _load_yaml_bytes(prepared["restore_bytes"])
         _validate_candidate(restored)
