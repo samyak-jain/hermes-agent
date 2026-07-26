@@ -69,6 +69,36 @@ cannot override, via a system-level managed directory. See
 [Managed Scope](/user-guide/managed-scope).
 :::
 
+### Agent configuration broker
+
+Managed deployments can expose a narrow, service-gated `config` tool to the
+conversational agent:
+
+```yaml
+agent_config:
+  enabled: true
+  editable_paths:
+    - display.*
+    - memory.memory_char_limit
+  guarded_paths:
+    - model.default
+```
+
+The configured lists only narrow Hermes's built-in non-secret candidate
+surface; they cannot widen it to credential paths or let the broker edit its
+own policy. The tool reports effective values and whether each came from
+defaults, user config, or the administrator-managed overlay. Managed leaves
+remain read-only.
+
+Every set, unset, or rollback requires fresh human approval. Writes use
+optimistic concurrency, a cross-process lock, atomic replacement, protected
+pre-change snapshots, and metadata-only audit history. Delegated children and
+cron should deny the `config` tool. No raw configuration file needs to be
+mounted into their execution sandbox.
+
+Secrets remain outside this surface. The broker rejects credential-shaped
+paths and values; use the relevant authentication or secret-management flow.
+
 ## Environment Variable Substitution
 
 You can reference environment variables in `config.yaml` using `${VAR_NAME}` syntax:

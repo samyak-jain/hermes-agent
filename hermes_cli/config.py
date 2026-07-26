@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -257,6 +258,7 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_STATE = threading.local()
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -1001,6 +1003,14 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Service-gated, policy-filtered configuration broker for conversational
+    # agents. Disabled unless an operator explicitly enables it and supplies
+    # path allowlists (normally through the administrator-managed overlay).
+    "agent_config": {
+        "enabled": False,
+        "editable_paths": [],
+        "guarded_paths": [],
+    },
     # SQLite defaults to WAL on local filesystems. Network-filesystem
     # deployments can explicitly select a rollback journal for every Hermes
     # connection (TRUNCATE avoids a directory-entry mutation per commit).
@@ -1020,6 +1030,9 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Global reasoning effort used when no per-session or per-model
+        # override is present.
+        "reasoning_effort": "",
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -7237,6 +7250,59 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
+@contextmanager
+def config_write_lock(config_path: Optional[Path] = None):
+    """Serialize configuration transactions across threads and processes.
+
+    The in-process ``_CONFIG_LOCK`` protects libyaml and the caches. A POSIX
+    advisory lock beside ``config.yaml`` extends that invariant to the gateway,
+    WebUI, CLI helpers, and agent broker when they share a profile filesystem.
+    The context is re-entrant in one thread so a transaction can hold the lock
+    across read/compare/write while calling :func:`atomic_config_write`.
+    """
+    path = config_path or get_config_path()
+    with _CONFIG_LOCK:
+        depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0))
+        if depth:
+            active_path = getattr(_CONFIG_FILE_LOCK_STATE, "path", None)
+            if active_path != str(path):
+                raise RuntimeError(
+                    "Cannot nest Hermes configuration transactions for different profiles."
+                )
+            _CONFIG_FILE_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _CONFIG_FILE_LOCK_STATE.depth -= 1
+            return
+
+        lock_path = path.with_name(f".{path.name}.write.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if sys.platform != "win32":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _CONFIG_FILE_LOCK_STATE.depth = 1
+            _CONFIG_FILE_LOCK_STATE.handle = handle
+            _CONFIG_FILE_LOCK_STATE.path = str(path)
+            try:
+                yield
+            finally:
+                _CONFIG_FILE_LOCK_STATE.depth = 0
+                _CONFIG_FILE_LOCK_STATE.handle = None
+                _CONFIG_FILE_LOCK_STATE.path = None
+                if sys.platform != "win32":
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
 
@@ -7259,8 +7325,9 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """
     from utils import atomic_yaml_write
 
-    require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        atomic_yaml_write(config_path, data, **kwargs)
 
 
 def load_config() -> Dict[str, Any]:
@@ -7301,6 +7368,22 @@ def load_config_readonly() -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+def invalidate_config_caches(config_path: Optional[Path] = None) -> None:
+    """Invalidate cached user/effective config for one profile.
+
+    Normal writers replace ``config.yaml`` atomically, which changes its file
+    signature and therefore invalidates lazily. Control-plane writers use this
+    explicit hook after a committed transaction so a same-process read can
+    never observe an old value on filesystems with coarse or delayed metadata.
+    """
+    path = config_path or get_config_path()
+    path_key = str(path)
+    with _CONFIG_LOCK:
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
 
 
 def write_platform_config_field(
@@ -7667,7 +7750,9 @@ def save_config(
     Full-document replacement callers (dashboard raw YAML editor, callers that
     already deep-merge) must leave this False so intentional deletions survive.
     """
-    with _CONFIG_LOCK:
+    ensure_hermes_home()
+    config_path = get_config_path()
+    with config_write_lock(config_path):
         if is_managed():
             managed_error("save configuration")
             return
@@ -7687,10 +7772,6 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
-        from utils import atomic_yaml_write
-
-        ensure_hermes_home()
-        config_path = get_config_path()
         require_readable_config_before_write(config_path)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
@@ -7752,7 +7833,7 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
+        atomic_config_write(
             config_path,
             normalized,
             extra_content="".join(parts) if parts else None,
@@ -8900,24 +8981,6 @@ def set_config_value(key: str, value: str, force: bool = False):
     # "did you mean" hint, without blocking legitimate unknown keys.
     is_known, suggestion = _validate_config_key(key)
 
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
-    config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
-    # Handle nested keys (e.g., "tts.provider") including numeric list
-    # indices (e.g., "custom_providers.0.api_key").  Delegates to
-    # _set_nested which preserves list-typed nodes; before #17876 the
-    # inline navigation here silently overwrote lists with dicts.
-
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
@@ -8933,20 +8996,31 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
-    _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
     # ignored. Mirrors the load-time migration in _normalize_root_model_keys.
     _alias_norm = key.strip().lower()
     if _alias_norm in ("model.api_base", "api_base"):
-        user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
+
+    # Read, mutate, and write under one cross-process transaction. This keeps a
+    # simultaneous dashboard or agent-broker update from being overwritten by
+    # a stale CLI read.
+    config_path = get_config_path()
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        user_config = {}
+        if config_path.exists():
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = fast_safe_load(f) or {}
+            except Exception:
+                user_config = {}
+        _set_nested(user_config, key, value)
+        atomic_config_write(config_path, user_config, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
@@ -9031,16 +9105,20 @@ def unset_config_value(key: str):
         return
 
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
+    ensure_hermes_home()
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        user_config = {}
+        if config_path.exists():
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = fast_safe_load(f) or {}
+            except Exception:
+                user_config = {}
+        removed = _unset_nested(user_config, key)
 
-    removed = _unset_nested(user_config, key)
+        if removed:
+            atomic_config_write(config_path, user_config, sort_keys=False)
 
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
@@ -9051,9 +9129,6 @@ def unset_config_value(key: str):
         print(f"Config key not set: {key}", file=sys.stderr)
         sys.exit(1)
 
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
     print(f"✓ Unset {key} from {config_path}")
 
 
