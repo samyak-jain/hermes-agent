@@ -45,6 +45,7 @@ def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 "agent_config": {
                     "enabled": True,
                     "ownership_mode": "unmanaged",
+                    "require_approval": False,
                 },
                 "model": {"default": "managed-model"},
             },
@@ -172,11 +173,13 @@ def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
         )
 
 
-def test_set_requires_approval_and_writes_atomically(
+def test_autonomous_policy_skips_approval_and_writes_atomically(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(
-        config_tool_module, "_approval", lambda _prepared: {"approved": True}
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
     )
     result = _result(
         action="set",
@@ -204,9 +207,17 @@ def test_set_requires_approval_and_writes_atomically(
     assert oct(backup.stat().st_mode & 0o777) == "0o600"
 
 
-def test_denied_approval_changes_nothing(
+def test_required_approval_denial_changes_nothing(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    policy = yaml.safe_load((managed / "config.yaml").read_text(encoding="utf-8"))
+    policy["agent_config"]["require_approval"] = True
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(policy, sort_keys=False), encoding="utf-8"
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
     before = (broker_home / "config.yaml").read_bytes()
     monkeypatch.setattr(
         config_tool_module,
@@ -235,7 +246,7 @@ def test_approval_race_does_not_clobber_external_change(broker_home: Path):
     raw["display"]["compact"] = True
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(AgentConfigError, match="changed while approval"):
+    with pytest.raises(AgentConfigError, match="changed after this change was prepared"):
         apply_change(prepared)
     after = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert after["display"]["skin"] == "default"
@@ -364,7 +375,9 @@ def test_rollback_only_applies_to_current_revision(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(
-        config_tool_module, "_approval", lambda _prepared: {"approved": True}
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous rollback must not request approval"),
     )
     changed = _result(
         action="set",
@@ -384,7 +397,7 @@ def test_rollback_only_applies_to_current_revision(
         prepare_rollback(changed["revision"], reason="operator requested rollback")
 
     # The already-prepared rollback also has a final optimistic check.
-    with pytest.raises(AgentConfigError, match="approval was pending"):
+    with pytest.raises(AgentConfigError, match="rollback was prepared"):
         apply_rollback(prepared)
 
 
