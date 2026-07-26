@@ -4041,7 +4041,7 @@ class SessionDB:
                         ''
                     ) AS _preview_raw,
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), -243, 243)
                          FROM messages m3
                          WHERE m3.session_id = s.id
                            AND m3.role IN ('user', 'assistant')
@@ -4076,7 +4076,7 @@ class SessionDB:
                         ''
                     ) AS _preview_raw,
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                        (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), -243, 243)
                          FROM messages m3
                          WHERE m3.session_id = s.id
                            AND m3.role IN ('user', 'assistant')
@@ -4110,8 +4110,8 @@ class SessionDB:
                 s["preview"] = ""
             ending_raw = s.pop("_ending_preview_raw", "").strip()
             if ending_raw:
-                text = ending_raw[:240]
-                s["ending_preview"] = text + ("..." if len(ending_raw) > 240 else "")
+                text = ending_raw[-240:]
+                s["ending_preview"] = ("..." if len(ending_raw) > 240 else "") + text
             else:
                 s["ending_preview"] = ""
             # Drop the internal ordering column so callers see a clean dict.
@@ -4240,7 +4240,7 @@ class SessionDB:
                     ''
                 ) AS _preview_raw,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 243)
+                    (SELECT SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), -243, 243)
                      FROM messages m3
                      WHERE m3.session_id = s.id
                        AND m3.role IN ('user', 'assistant')
@@ -4270,8 +4270,8 @@ class SessionDB:
             s["preview"] = ""
         ending_raw = s.pop("_ending_preview_raw", "").strip()
         if ending_raw:
-            text = ending_raw[:240]
-            s["ending_preview"] = text + ("..." if len(ending_raw) > 240 else "")
+            text = ending_raw[-240:]
+            s["ending_preview"] = ("..." if len(ending_raw) > 240 else "") + text
         else:
             s["ending_preview"] = ""
         return s
