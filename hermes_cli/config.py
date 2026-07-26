@@ -7331,6 +7331,55 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
         invalidate_config_caches(config_path)
 
 
+def atomic_config_bytes_write(config_path: Path, data: bytes) -> None:
+    """Restore exact ``config.yaml`` bytes under the shared write lock.
+
+    Revision rollback and audit-failure compensation must preserve comments,
+    quoting, whitespace, and an empty file exactly. Normal configuration
+    mutation remains schema-aware YAML; this helper is intentionally limited
+    to previously captured, already-validated snapshots.
+    """
+    from utils import atomic_replace
+
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            current_stat = config_path.stat()
+        except OSError:
+            current_stat = None
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(config_path.parent),
+            prefix=f".{config_path.stem}_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            real_path = Path(atomic_replace(tmp_path, config_path))
+            try:
+                os.chmod(
+                    real_path,
+                    (current_stat.st_mode & 0o777) if current_stat else 0o600,
+                )
+            except OSError:
+                pass
+            if current_stat is not None and hasattr(os, "chown"):
+                try:
+                    os.chown(real_path, current_stat.st_uid, current_stat.st_gid)
+                except OSError:
+                    pass
+            invalidate_config_caches(config_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
