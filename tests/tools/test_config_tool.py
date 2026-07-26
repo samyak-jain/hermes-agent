@@ -11,6 +11,7 @@ from hermes_cli import managed_scope
 from hermes_cli.agent_config import (
     AgentConfigError,
     apply_change,
+    apply_rollback,
     history,
     inspect_config,
     prepare_change,
@@ -208,6 +209,62 @@ def test_failed_audit_restores_original_config(
     assert history()["count"] == 0
 
 
+def test_rollback_restores_exact_bytes_including_comments(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    original = b"# operator comment\ndisplay:\n  skin: default  # keep this\n"
+    path.write_bytes(original)
+    invalidate_config_caches(path)
+
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    changed = apply_change(prepared)
+    rollback = prepare_rollback(
+        changed["revision"], reason="operator requested rollback"
+    )
+    apply_rollback(rollback)
+
+    assert path.read_bytes() == original
+
+
+def test_rollback_restores_originally_absent_config(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    path.unlink()
+    invalidate_config_caches(path)
+
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    changed = apply_change(prepared)
+    assert path.exists()
+    rollback = prepare_rollback(
+        changed["revision"], reason="operator requested rollback"
+    )
+    apply_rollback(rollback)
+
+    assert not path.exists()
+
+
+def test_noop_set_is_rejected(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="already has"):
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="default",
+            reason="operator requested default",
+        )
+
+
 def test_shared_config_lock_is_reentrant_for_one_profile(broker_home: Path):
     from hermes_cli.config import atomic_config_write, config_write_lock
 
@@ -245,8 +302,6 @@ def test_rollback_only_applies_to_current_revision(
         prepare_rollback(changed["revision"], reason="operator requested rollback")
 
     # The already-prepared rollback also has a final optimistic check.
-    from hermes_cli.agent_config import apply_rollback
-
     with pytest.raises(AgentConfigError, match="approval was pending"):
         apply_rollback(prepared)
 

@@ -480,6 +480,8 @@ def prepare_change(
     old_value = _nested(raw, path, marker)
     if operation == "unset" and old_value is marker:
         raise AgentConfigError(f"'{path}' is not explicitly set in the user config.")
+    if operation == "set" and old_value is not marker and old_value == value:
+        raise AgentConfigError(f"'{path}' already has the requested user value.")
     return {
         "operation": operation,
         "path": path,
@@ -490,6 +492,7 @@ def prepare_change(
         "classification": classification,
         "apply": _apply_mode(path),
         "expected_hash": _file_hash(before),
+        "before_exists": config_path.exists(),
     }
 
 
@@ -548,18 +551,25 @@ def _new_revision() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
 
 
-def _restore_bytes_after_failed_audit(config_path: Path, before: bytes) -> None:
-    """Compensate a committed write when its mandatory audit append fails."""
-    from hermes_cli.config import atomic_config_write, invalidate_config_caches
+def _restore_snapshot(config_path: Path, before: bytes, *, existed: bool) -> None:
+    """Restore an exact validated snapshot, including prior non-existence."""
+    from hermes_cli.config import atomic_config_bytes_write, invalidate_config_caches
 
-    if before:
-        atomic_config_write(config_path, _load_yaml_bytes(before), sort_keys=False)
+    if existed:
+        atomic_config_bytes_write(config_path, before)
     else:
         try:
             config_path.unlink()
         except FileNotFoundError:
             pass
-    invalidate_config_caches(config_path)
+        invalidate_config_caches(config_path)
+
+
+def _restore_bytes_after_failed_audit(
+    config_path: Path, before: bytes, *, existed: bool
+) -> None:
+    """Compensate a committed write when its mandatory audit append fails."""
+    _restore_snapshot(config_path, before, existed=existed)
 
 
 def apply_change(prepared: dict, *, actor: str = "") -> dict:
@@ -575,7 +585,10 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
     with config_write_lock(config_path):
         before = _read_raw_bytes(config_path)
         actual_hash = _file_hash(before)
-        if actual_hash != prepared.get("expected_hash"):
+        if (
+            actual_hash != prepared.get("expected_hash")
+            or config_path.exists() != bool(prepared.get("before_exists"))
+        ):
             raise AgentConfigError(
                 "config.yaml changed while approval was pending. Nothing was written; "
                 "inspect the current value and request approval again."
@@ -604,12 +617,17 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
             "actor": str(actor or "")[:200],
             "before_hash": actual_hash,
             "after_hash": _file_hash(after),
+            "before_exists": bool(prepared.get("before_exists")),
         }
         try:
             _append_audit(record)
         except Exception as audit_exc:
             try:
-                _restore_bytes_after_failed_audit(config_path, before)
+                _restore_bytes_after_failed_audit(
+                    config_path,
+                    before,
+                    existed=bool(prepared.get("before_exists")),
+                )
             except Exception as restore_exc:
                 raise AgentConfigError(
                     "Configuration was written but its audit record failed, and "
@@ -722,18 +740,24 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
         "path": target.get("path"),
         "reason": reason[:500],
         "expected_hash": _file_hash(current),
+        "expected_exists": get_config_path().exists(),
         "restore_bytes": before,
+        "restore_exists": bool(target.get("before_exists", True)),
         "apply": target.get("apply") or "next_session",
     }
 
 
 def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
-    from hermes_cli.config import atomic_config_write, config_write_lock, get_config_path
+    from hermes_cli.config import config_write_lock, get_config_path
 
     config_path = get_config_path()
     with config_write_lock(config_path):
         current = _read_raw_bytes(config_path)
-        if _file_hash(current) != prepared.get("expected_hash"):
+        current_exists = config_path.exists()
+        if (
+            _file_hash(current) != prepared.get("expected_hash")
+            or current_exists != bool(prepared.get("expected_exists", True))
+        ):
             raise AgentConfigError(
                 "config.yaml changed while rollback approval was pending. Nothing was written."
             )
@@ -741,7 +765,11 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
         _validate_candidate(restored)
         rollback_revision = _new_revision()
         _write_backup(rollback_revision, current)
-        atomic_config_write(config_path, restored, sort_keys=False)
+        _restore_snapshot(
+            config_path,
+            prepared["restore_bytes"],
+            existed=bool(prepared.get("restore_exists", True)),
+        )
         after = _read_raw_bytes(config_path)
         try:
             _append_audit(
@@ -757,11 +785,14 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
                     "rolled_back_revision": prepared["revision"],
                     "before_hash": prepared["expected_hash"],
                     "after_hash": _file_hash(after),
+                    "before_exists": current_exists,
                 }
             )
         except Exception as audit_exc:
             try:
-                _restore_bytes_after_failed_audit(config_path, current)
+                _restore_bytes_after_failed_audit(
+                    config_path, current, existed=current_exists
+                )
             except Exception as restore_exc:
                 raise AgentConfigError(
                     "Rollback was written but its audit record failed, and "
