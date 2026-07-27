@@ -14664,11 +14664,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         metadata = event.metadata
         source = event.source
         profile = str(source.profile or self._active_profile_name() or "default")
-        participants = tuple(
-            str(item)
-            for item in (metadata.get("ambient_participants") or ("default",))
-            if str(item)
-        )
         if (
             bool(getattr(source, "is_bot", False))
             and int(metadata.get("ambient_hop", 0))
@@ -14686,7 +14681,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         elif metadata.get("ambient_other_bot_mentioned"):
             return False
         else:
-            score = 0.0
             try:
                 user_config = _load_gateway_config()
                 model, runtime = self._resolve_session_agent_runtime(
@@ -14695,12 +14689,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 main_runtime = dict(runtime or {})
                 main_runtime["model"] = model
-                from gateway.ambient_rooms import (
-                    ambient_arbiter,
-                    score_ambient_participation,
-                )
+                from gateway.ambient_rooms import decide_ambient_participation
 
-                score = await score_ambient_participation(
+                decision = await decide_ambient_participation(
                     profile=profile,
                     role=str(metadata.get("ambient_profile_role") or ""),
                     trigger_text=event.text or "",
@@ -14708,20 +14699,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     author_is_bot=bool(getattr(source, "is_bot", False)),
                     main_runtime=main_runtime,
                 )
-                if score < float(metadata.get("ambient_min_confidence", 0.55)):
-                    score = 0.0
-                selected = await ambient_arbiter().choose(
-                    message_id=str(event.message_id or id(event)),
-                    profile=profile,
-                    participants=participants,
-                    score=score,
-                    decision_window_seconds=float(
-                        metadata.get("ambient_decision_window_seconds", 1.25)
-                    ),
+                logger.info(
+                    "Ambient profile decision: profile=%s action=%s "
+                    "confidence=%.3f room=%s message=%s",
+                    profile,
+                    decision.action,
+                    decision.confidence,
+                    metadata.get("ambient_room_id"),
+                    event.message_id or "",
                 )
+                if decision.action == "silent":
+                    return False
+                if decision.action == "react":
+                    raw_message = getattr(event, "raw_message", None)
+                    add_reaction = getattr(raw_message, "add_reaction", None)
+                    if not callable(add_reaction):
+                        logger.warning(
+                            "Ambient profile %s selected reaction %s but "
+                            "the platform event cannot add reactions",
+                            profile,
+                            decision.reaction,
+                        )
+                        return False
+                    try:
+                        await add_reaction(decision.reaction)
+                    except Exception:
+                        logger.warning(
+                            "Ambient reaction failed for profile=%s room=%s "
+                            "message=%s reaction=%s",
+                            profile,
+                            metadata.get("ambient_room_id"),
+                            event.message_id or "",
+                            decision.reaction,
+                            exc_info=True,
+                        )
+                    return False
+                selected = True
             except Exception:
                 logger.warning(
-                    "Ambient attention decision failed for profile=%s room=%s",
+                    "Ambient profile decision failed for profile=%s room=%s",
                     profile,
                     metadata.get("ambient_room_id"),
                     exc_info=True,
@@ -14751,9 +14767,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         role = str(metadata.get("ambient_profile_role") or "").strip()
         room_note = (
             "You are speaking in a shared Discord room with a human and other "
-            "independent agent profiles. Reply naturally as yourself. Do not "
-            "repeat room history, narrate your participation decision, or "
-            "address every participant unless useful."
+            "independent agent profiles. Your private participation decision "
+            "selected a text reply. Reply naturally as yourself. Do not repeat "
+            "room history, narrate your participation decision, or address "
+            "every participant unless useful."
         )
         if role:
             room_note += f" Your role in this room is: {role}"
