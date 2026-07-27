@@ -1412,30 +1412,39 @@ def load_gateway_config() -> GatewayConfig:
                     if _plat not in _shared_loop_targets:
                         _shared_loop_targets.append(_plat)
 
+            def _effective_platform_block(platform_name: str) -> tuple[dict, bool]:
+                """Merge the three accepted platform shapes by field."""
+                merged: dict = {}
+                for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                    if isinstance(_src, dict):
+                        _candidate = _src.get(platform_name)
+                        if isinstance(_candidate, dict):
+                            merged.update(_candidate)
+                root_candidate = yaml_cfg.get(platform_name)
+                root_is_explicit = isinstance(root_candidate, dict)
+                if root_is_explicit:
+                    merged.update(root_candidate)
+                return merged, root_is_explicit
+
             for plat in _shared_loop_targets:
                 if plat == Platform.LOCAL:
                     continue
-                platform_cfg = yaml_cfg.get(plat.value)
-                _cfg_toplevel = isinstance(platform_cfg, dict)
-                # Fall back to the platform's block under ``platforms`` /
-                # ``gateway.platforms`` so shared-key bridging (allow_from,
-                # require_mention, free_response_channels, …) still runs when
-                # the user configured the platform only under those nested paths
-                # and not via a top-level block.  Mirrors the identical fallback
-                # already applied to the apply_yaml_config_fn dispatch below
-                # (#44f3e51).
-                # Note: ``enabled`` is only written to plat_data from a
-                # top-level block (``_cfg_toplevel``); for nested-only configs
-                # ``_merge_platform_map`` already merged it with the correct
-                # precedence, so re-applying it here would overwrite that.
-                if not _cfg_toplevel:
-                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
-                        if isinstance(_src, dict):
-                            _candidate = _src.get(plat.value)
-                            if isinstance(_candidate, dict):
-                                platform_cfg = _candidate
-                                break
-                if not isinstance(platform_cfg, dict):
+                # Shared bridge keys may be split across all three accepted
+                # platform shapes. Merge them at field granularity with the
+                # same precedence as _merge_platform_map plus the legacy root:
+                #
+                #   gateway.platforms < platforms < root platform block
+                #
+                # Previously, the mere presence of a root ``discord:`` block
+                # discarded every distinct key under ``platforms.discord``.
+                # That made a normal root block (require_mention, history,
+                # etc.) silently disable managed nested keys such as
+                # ambient_rooms. Nested-only configs were covered, but the
+                # mixed shape used in production was not.
+                platform_cfg, _cfg_toplevel = _effective_platform_block(
+                    plat.value
+                )
+                if not platform_cfg:
                     continue
                 # Collect bridgeable keys from this platform section
                 bridged = {}
@@ -1544,20 +1553,11 @@ def load_gateway_config() -> GatewayConfig:
                 for entry in _pr.all_entries():
                     if entry.apply_yaml_config_fn is None:
                         continue
-                    platform_cfg = yaml_cfg.get(entry.name)
-                    # Fall back to the platform's block under ``platforms`` /
-                    # ``gateway.platforms`` so adapter hooks still run when the
-                    # user configured the platform only under those nested paths
-                    # (e.g. ``platforms.discord.extra.allow_from``) and not via a
-                    # top-level ``discord:`` block.
-                    if not isinstance(platform_cfg, dict):
-                        for _src in (gateway_platforms, yaml_cfg.get("platforms")):
-                            if isinstance(_src, dict):
-                                _candidate = _src.get(entry.name)
-                                if isinstance(_candidate, dict):
-                                    platform_cfg = _candidate
-                                    break
-                    if not isinstance(platform_cfg, dict):
+                    # Hooks receive the same effective field-level merge as
+                    # the shared bridge above. A root block must not erase
+                    # distinct nested plugin settings either.
+                    platform_cfg, _ = _effective_platform_block(entry.name)
+                    if not platform_cfg:
                         continue
                     try:
                         seeded = entry.apply_yaml_config_fn(yaml_cfg, platform_cfg)
