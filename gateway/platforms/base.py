@@ -5010,7 +5010,10 @@ class BasePlatformAdapter(ABC):
         typing_task: Optional[asyncio.Task] = None
         if (
             getattr(self.config, "typing_indicator", True)
-            and not event.metadata.get("ambient_quiet_surface", False)
+            and not (
+                isinstance(event.metadata, dict)
+                and event.metadata.get("ambient_quiet_surface", False)
+            )
         ):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
@@ -5244,6 +5247,7 @@ class BasePlatformAdapter(ABC):
                     if (
                         getattr(result, "success", False)
                         and getattr(result, "message_id", None)
+                        and isinstance(event.metadata, dict)
                         and event.metadata.get("ambient_room_id")
                     ):
                         try:

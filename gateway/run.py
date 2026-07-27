@@ -10429,7 +10429,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile observes the same room event, explicit mentions always reach
         # the named bot, and unaddressed chatter is admitted only for the one
         # profile selected by the shared attention arbiter.
-        if event.metadata.get("ambient_room_id"):
+        if (
+            isinstance(event.metadata, dict)
+            and event.metadata.get("ambient_room_id")
+        ):
             if not await self._admit_ambient_room_turn(event):
                 return None
         
@@ -11901,7 +11904,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
         if getattr(event, "channel_context", None):
-            if event.metadata.get("ambient_room_id"):
+            if (
+                isinstance(event.metadata, dict)
+                and event.metadata.get("ambient_room_id")
+            ):
                 # Discord remains the shared-room source of truth. Feed the
                 # current window to this turn, but persist only the triggering
                 # message so every later turn does not duplicate the same room
