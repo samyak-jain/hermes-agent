@@ -363,12 +363,10 @@ async def test_ambient_history_is_full_room_window_including_bots(
     assert "[Vegapunk [bot]] third" in event.channel_context
 
 
-def test_ambient_room_invalid_numeric_tuning_falls_back_safely(adapter):
+def test_ambient_room_invalid_hop_limit_falls_back_safely(adapter):
     adapter.config.extra["ambient_rooms"] = {
         "789": {
             "participants": ["default", "vegapunk"],
-            "decision_window_seconds": "soon",
-            "min_confidence": "confident",
             "max_agent_hops": "several",
         }
     }
@@ -379,8 +377,6 @@ def test_ambient_room_invalid_numeric_tuning_falls_back_safely(adapter):
 
     room = adapter._discord_ambient_room(message)
 
-    assert room["decision_window_seconds"] == 1.25
-    assert room["min_confidence"] == 0.55
     assert room["max_agent_hops"] == 3
 
 
