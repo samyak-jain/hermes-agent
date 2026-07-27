@@ -14,6 +14,60 @@ from gateway.run import _get_channel_override, _resolve_tool_policy_for_source, 
 from gateway.session import SessionSource
 
 
+def test_profile_model_override_routes_multiplexed_agent_runtime():
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.config = GatewayConfig()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="roundtable",
+        chat_type="group",
+        user_id="operator",
+        profile="vegapunk",
+    )
+    user_config = {
+        "model": {
+            "default": "claude-fable-5",
+            "provider": "anthropic",
+        },
+        "agent": {
+            "profile_models": {
+                "vegapunk": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "api_mode": "codex_responses",
+                }
+            }
+        },
+    }
+    with patch(
+        "gateway.run._resolve_gateway_model",
+        return_value="claude-fable-5",
+    ), patch(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        return_value={
+            "provider": "anthropic",
+            "api_key": "claude-oauth",
+            "api_mode": "chat_completions",
+        },
+    ), patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "provider": "openai-codex",
+            "credential_pool": object(),
+            "api_mode": "codex_responses",
+        },
+    ):
+        model, runtime = runner._resolve_session_agent_runtime(
+            source=source,
+            user_config=user_config,
+        )
+
+    assert model == "gpt-5.6-sol"
+    assert runtime["provider"] == "openai-codex"
+    assert runtime["api_mode"] == "codex_responses"
+
+
 class TestGetChannelOverride:
     def test_no_override_when_empty_config(self):
         config = GatewayConfig()

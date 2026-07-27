@@ -2211,6 +2211,10 @@ _RETRYABLE_ERROR_PATTERNS = (
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
 # ``None`` when the response was already delivered (e.g. via streaming).
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+DrainMessageHandler = Callable[
+    [MessageEvent],
+    Awaitable[Tuple[bool, Optional[Union[str, "EphemeralReply"]]]],
+]
 
 
 def resolve_channel_prompt(
@@ -2439,6 +2443,11 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Optional gateway-lifecycle interceptor. It runs before a new inbound
+        # turn is placed in the adapter's in-memory busy-session queue, so a
+        # deployment drain can persist the event durably before the process is
+        # replaced. The callback returns ``(handled, response)``.
+        self._drain_message_handler: Optional[DrainMessageHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2893,6 +2902,49 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_drain_message_handler(
+        self,
+        handler: Optional[DrainMessageHandler],
+    ) -> None:
+        """Install the lifecycle-drain interceptor for real inbound turns."""
+        self._drain_message_handler = handler
+
+    async def _dispatch_drain_message_if_needed(
+        self,
+        event: MessageEvent,
+    ) -> bool:
+        """Persist and acknowledge a turn consumed by an active drain."""
+        handler = getattr(self, "_drain_message_handler", None)
+        if handler is None:
+            return False
+        try:
+            handled, response = await handler(event)
+        except Exception:
+            logger.error("[%s] Drain-message handler failed", self.name, exc_info=True)
+            return False
+        if not handled:
+            return False
+
+        text, ephemeral_ttl = self._unwrap_ephemeral(response)
+        if text:
+            thread_metadata = _thread_metadata_for_source(
+                event.source,
+                _reply_anchor_for_event(event),
+            )
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=text,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_metadata),
+            )
+            if ephemeral_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(
+                    chat_id=event.source.chat_id,
+                    message_id=result.message_id,
+                    ttl_seconds=ephemeral_ttl,
+                )
+        return True
 
     def set_topic_recovery_fn(
         self,
@@ -4792,6 +4844,18 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
 
+        # A new turn that arrives after an external drain starts must reach
+        # durable storage before the adapter can put it in its process-local
+        # busy-session queue. Commands and clarify replies are handled below:
+        # those may be needed to inspect/cancel/unblock the in-flight turn that
+        # the drain is waiting for.
+        if (
+            session_key not in self._active_sessions
+            and not event.get_command()
+            and await self._dispatch_drain_message_if_needed(event)
+        ):
+            return
+
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
             # Certain commands must bypass the active-session guard and be
@@ -4906,6 +4970,9 @@ class BasePlatformAdapter(ABC):
                             self.name, e, exc_info=True,
                         )
                     return
+
+            if not cmd and await self._dispatch_drain_message_if_needed(event):
+                return
 
             if self._busy_session_handler is not None:
                 try:
