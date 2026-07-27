@@ -17089,7 +17089,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Shared Discord room events are observed by every configured profile.
         # Direct mentions are deterministic; unaddressed chatter goes through
         # the shared attention arbiter so at most one profile responds.
-        if event.metadata.get("ambient_room_id"):
+        if (
+            isinstance(event.metadata, dict)
+            and event.metadata.get("ambient_room_id")
+        ):
             if not await self._admit_ambient_room_turn(event):
                 return None
 
@@ -18505,6 +18508,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
         if getattr(event, "channel_context", None):
+            if (
+                isinstance(event.metadata, dict)
+                and event.metadata.get("ambient_room_id")
+            ):
+                # Discord remains the shared-room source of truth. Feed the
+                # current window to this turn, but persist only the triggering
+                # message so every later turn does not duplicate the same room
+                # transcript and destroy prefix-cache efficiency.
+                setattr(event, "_ambient_persist_user_text", message_text)
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
@@ -20441,11 +20453,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
-        if event.metadata.get("ambient_room_id"):
-            # Discord remains the shared-room source of truth. Feed the full
-            # current window to this turn, but persist only the trigger text so
-            # later turns do not duplicate room history or bust cached prefixes.
-            setattr(event, "_ambient_persist_user_text", message_text)
 
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
