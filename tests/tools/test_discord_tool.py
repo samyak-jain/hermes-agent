@@ -68,6 +68,18 @@ class TestCheckRequirements:
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
         assert _get_bot_token() is None
 
+    def test_get_bot_token_uses_active_profile_scope(self, monkeypatch):
+        from agent import secret_scope
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "default-profile-token")
+        token = secret_scope.set_secret_scope(
+            {"DISCORD_BOT_TOKEN": "vegapunk-profile-token"}
+        )
+        try:
+            assert _get_bot_token() == "vegapunk-profile-token"
+        finally:
+            secret_scope.reset_secret_scope(token)
+
 
 # ---------------------------------------------------------------------------
 # Channel type names

@@ -72,8 +72,16 @@ def _read_limited_response_body(source: Any, limit: int, *, label: str) -> bytes
 
 
 def _get_bot_token() -> Optional[str]:
-    """Resolve the Discord bot token from environment."""
-    return os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
+    """Resolve the Discord bot token from the active profile secret scope."""
+    try:
+        from agent.secret_scope import get_secret
+
+        value = get_secret("DISCORD_BOT_TOKEN")
+    except ImportError:
+        # Keep the standalone tool importable in minimal installations that do
+        # not include the gateway's multiplexing support.
+        value = os.getenv("DISCORD_BOT_TOKEN")
+    return str(value or "").strip() or None
 
 
 def _discord_request(
