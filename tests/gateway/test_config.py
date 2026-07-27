@@ -1476,6 +1476,38 @@ class TestLoadGatewayConfig:
             }
         }
 
+    def test_managed_platform_policy_applies_without_user_config(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh named profile must still receive host-managed policy."""
+        hermes_home = tmp_path / "profiles" / "vegapunk"
+        hermes_home.mkdir(parents=True)
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    ambient_rooms:\n"
+            '      "1531228453901439109":\n'
+            "        participants:\n"
+            "          - default\n"
+            "          - vegapunk\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        assert not (hermes_home / "config.yaml").exists()
+        assert discord.extra["ambient_rooms"] == {
+            "1531228453901439109": {
+                "participants": ["default", "vegapunk"],
+            }
+        }
+
     def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

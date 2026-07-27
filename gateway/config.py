@@ -1218,17 +1218,28 @@ def load_gateway_config() -> GatewayConfig:
     # Primary source: config.yaml
     try:
         import yaml
+        from hermes_cli import managed_scope
+
         config_yaml_path = _home / "config.yaml"
-        if config_yaml_path.exists():
+        # A named profile may intentionally have no agent-owned config yet.
+        # The host-managed overlay is still authoritative for that profile:
+        # skipping this block merely because ``config.yaml`` is absent drops
+        # platform policy (ambient rooms, channel authorization, tool policy)
+        # while profile-scoped credentials can still enable the adapter. That
+        # creates a connected but differently-authorized secondary bot.
+        has_user_config = config_yaml_path.exists()
+        if has_user_config or managed_scope.get_managed_dir() is not None:
+            yaml_cfg = {}
+        if has_user_config:
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
 
+        if has_user_config or managed_scope.get_managed_dir() is not None:
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
             # through hermes_cli.config.load_config, so without this a managed
             # session_reset / quick_commands / stt / model would be ignored by
             # the messaging gateway. Fail-open via the shared helper.
-            from hermes_cli import managed_scope
             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
 
             # Shared nested-fallback source: settings meant to be top-level
