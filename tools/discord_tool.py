@@ -584,6 +584,31 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
     return json.dumps({"success": True, "message": f"Message {message_id} deleted."})
 
 
+def _send_message(
+    token: str,
+    channel_id: str,
+    content: str,
+    **_kwargs: Any,
+) -> str:
+    """Send one visible message to a Discord channel or thread."""
+    content = str(content or "").strip()
+    if not content:
+        raise ValueError("content is required for send_message")
+    if len(content) > 2000:
+        raise ValueError("Discord messages cannot exceed 2000 characters")
+    message = _discord_request(
+        "POST",
+        f"/channels/{channel_id}/messages",
+        token,
+        body={"content": content},
+    )
+    return json.dumps({
+        "success": True,
+        "channel_id": str(channel_id),
+        "message_id": str(message["id"]),
+    })
+
+
 def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
@@ -643,12 +668,18 @@ _ACTIONS = {
     "pin_message": _pin_message,
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
+    "send_message": _send_message,
     "create_thread": _create_thread,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({
+    "fetch_messages",
+    "search_members",
+    "send_message",
+    "create_thread",
+})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -670,6 +701,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
+    ("send_message", "(channel_id, content)", "send a visible message to a channel or thread"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
@@ -691,6 +723,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "pin_message": ["channel_id", "message_id"],
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
+    "send_message": ["channel_id", "content"],
     "create_thread": ["channel_id", "name"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
@@ -853,6 +886,11 @@ def _build_schema(
             "type": "string",
             "description": "New thread name (create_thread).",
         },
+        "content": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "Message text (send_message). Discord mentions such as <@user_id> are supported.",
+        },
         "limit": {
             "type": "integer",
             "minimum": 1,
@@ -995,6 +1033,7 @@ def _run_discord_action(
     message_id: str = "",
     query: str = "",
     name: str = "",
+    content: str = "",
     limit: int = 50,
     before: str = "",
     after: str = "",
@@ -1032,6 +1071,7 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "content": content,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -1050,6 +1090,7 @@ def _run_discord_action(
             message_id=message_id,
             query=query,
             name=name,
+            content=content,
             limit=limit,
             before=before,
             after=after,
@@ -1066,7 +1107,7 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord read/participation action."""
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 
@@ -1081,7 +1122,7 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
-    "role_id": "", "message_id": "", "query": "", "name": "",
+    "role_id": "", "message_id": "", "query": "", "name": "", "content": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
 }
 
