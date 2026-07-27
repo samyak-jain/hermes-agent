@@ -1097,6 +1097,41 @@ class TestLoadGatewayConfig:
         assert config.platforms[Platform.DISCORD].token == "worker-token"
         assert Platform.API_SERVER not in config.platforms
 
+    def test_shared_key_loop_merges_root_and_nested_platform_fields(
+        self, tmp_path, monkeypatch
+    ):
+        """A root platform block must not hide distinct nested shared keys."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  require_mention: false\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    require_mention: true\n"
+            "    ambient_rooms:\n"
+            '      "1531228453901439109":\n'
+            "        participants:\n"
+            "          - default\n"
+            "          - vegapunk\n"
+            "gateway:\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      require_mention: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        assert discord.extra["require_mention"] is False
+        assert discord.extra["ambient_rooms"] == {
+            "1531228453901439109": {
+                "participants": ["default", "vegapunk"],
+            }
+        }
+
 
 class TestWebhookPortBridging:
     """Top-level port/host in the YAML platform section must be bridged into
