@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -330,9 +330,12 @@ class TestDrainWatcher:
 
 class TestNewTurnGate:
     @pytest.mark.asyncio
-    async def test_new_turn_refused_during_external_drain(self):
+    async def test_new_turn_is_durably_queued_during_external_drain(self):
         runner, _ = _drain_runner()
         runner._external_drain_active = True
+        runner._queue_external_drain_event = AsyncMock(
+            return_value="saved for after maintenance"
+        )
         event = MessageEvent(
             text="hello",
             message_type=MessageType.TEXT,
@@ -340,5 +343,15 @@ class TestNewTurnGate:
             message_id="m1",
         )
         result = await runner._handle_message(event)
-        assert result is not None
-        assert "draining" in result.lower()
+        assert result == "saved for after maintenance"
+        runner._queue_external_drain_event.assert_awaited_once_with(event)
+
+    @pytest.mark.asyncio
+    async def test_in_flight_turn_not_interrupted_by_drain(self):
+        # Entering drain must NOT touch the running-agents set.
+        runner, _ = _drain_runner()
+        sentinel = MagicMock()
+        runner._running_agents["k"] = sentinel
+        runner._enter_external_drain()
+        assert runner._running_agents.get("k") is sentinel
+        sentinel.interrupt.assert_not_called()
