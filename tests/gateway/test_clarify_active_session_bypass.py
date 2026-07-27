@@ -70,6 +70,7 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
 
     adapter = _ClarifyBypassAdapter()
     adapter._message_handler = AsyncMock(return_value="")
+    adapter._drain_message_handler = AsyncMock(return_value=(True, None))
     adapter._busy_session_handler = AsyncMock(return_value=True)
     event = _event("None of those are valid options")
     session_key = build_session_key(
@@ -83,6 +84,7 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
     await adapter.handle_message(event)
 
     adapter._message_handler.assert_awaited_once_with(event)
+    adapter._drain_message_handler.assert_not_awaited()
     adapter._busy_session_handler.assert_not_awaited()
     assert adapter._pending_messages == {}
 
