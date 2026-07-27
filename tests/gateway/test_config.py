@@ -1436,6 +1436,46 @@ class TestLoadGatewayConfig:
         )
         assert telegram.extra.get("require_mention") is False
 
+    def test_shared_key_loop_merges_root_and_nested_platform_fields(
+        self, tmp_path, monkeypatch
+    ):
+        """A root platform block must not hide distinct nested shared keys."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  require_mention: false\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    require_mention: true\n"
+            "    ambient_rooms:\n"
+            '      "1531228453901439109":\n'
+            "        participants:\n"
+            "          - default\n"
+            "          - vegapunk\n"
+            "gateway:\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      require_mention: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        # Root fields retain highest precedence.
+        assert discord.extra["require_mention"] is False
+        # A distinct nested field survives instead of being discarded simply
+        # because the root discord block exists.
+        assert discord.extra["ambient_rooms"] == {
+            "1531228453901439109": {
+                "participants": ["default", "vegapunk"],
+            }
+        }
+
     def test_bridges_quoted_false_session_notify_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
