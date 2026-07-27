@@ -2284,7 +2284,16 @@ def _profile_runtime_scope(profile_home: "Path"):
 
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    _scope_home = Path(profile_home)
+    _scope_profile = (
+        _scope_home.name if _scope_home.parent.name == "profiles" else "default"
+    )
+    secret_token = set_secret_scope(
+        build_profile_secret_scope(
+            _scope_home,
+            profile_name=_scope_profile,
+        )
+    )
     try:
         yield
     finally:
@@ -3932,8 +3941,45 @@ def _resolve_tool_policy_for_source(
             authority,
         )
         return global_policy
+    profile = str(getattr(source, "profile", None) or "default")
+    base_policy = global_policy
+    raw_profile_policies = (
+        agent_cfg.get("profile_tool_policies")
+        if isinstance(agent_cfg, dict)
+        else None
+    )
+    raw_profile_policy = (
+        raw_profile_policies.get(profile)
+        if isinstance(raw_profile_policies, dict)
+        else None
+    )
+    if isinstance(raw_profile_policy, dict):
+        profile_authorized = authority == "any"
+        if not profile_authorized:
+            try:
+                from hermes_cli import managed_scope
+
+                profile_authorized = any(
+                    managed_scope.is_key_managed(path)
+                    for path in (
+                        f"agent.profile_tool_policies.{profile}",
+                        f"agent.profile_tool_policies.{profile}.mode",
+                    )
+                )
+            except Exception:
+                profile_authorized = False
+        if profile_authorized:
+            resolved_profile = parse_tool_policy(
+                raw_profile_policy,
+                source=f"agent.profile_tool_policies.{profile}",
+                fallback=global_policy,
+            )
+            if resolved_profile.valid:
+                base_policy = resolved_profile
+        else:
+            logger.warning("Ignoring unmanaged profile tool policy for %s", profile)
     if source.platform != Platform.DISCORD:
-        return global_policy
+        return base_policy
 
     if gateway_config is None:
         platforms = user_config.get("platforms")
@@ -3952,7 +3998,7 @@ def _resolve_tool_policy_for_source(
         parent_id=getattr(source, "parent_chat_id", None),
     )
     if key is None or channel_override is None or channel_override.tool_policy is None:
-        return global_policy
+        return base_policy
     if authority == "managed_only":
         try:
             from hermes_cli import managed_scope
@@ -3967,15 +4013,15 @@ def _resolve_tool_policy_for_source(
                     "Ignoring unmanaged Discord tool_policy override for channel %s",
                     key,
                 )
-                return global_policy
+                return base_policy
         except Exception:
-            return global_policy
+            return base_policy
     resolved = parse_tool_policy(
         channel_override.tool_policy,
         source=f"platforms.discord.channel_overrides.{key}.tool_policy",
-        fallback=global_policy,
+        fallback=base_policy,
     )
-    return resolved if resolved.valid else global_policy
+    return resolved if resolved.valid else base_policy
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -5604,8 +5650,13 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if getattr(ctx.source, "_ambient_room_event", False):
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled
+            and not getattr(ctx.source, "_ambient_room_event", False)
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -13035,6 +13086,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
+            adapter._hermes_profile_name = self._active_profile_name()
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -14369,6 +14421,91 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    async def _admit_ambient_room_turn(self, event: MessageEvent) -> bool:
+        """Return whether this profile should run a visible shared-room turn."""
+        metadata = event.metadata
+        source = event.source
+        profile = str(source.profile or self._active_profile_name() or "default")
+        participants = tuple(
+            str(item)
+            for item in (metadata.get("ambient_participants") or ("default",))
+            if str(item)
+        )
+        if (
+            bool(getattr(source, "is_bot", False))
+            and int(metadata.get("ambient_hop", 0))
+            >= int(metadata.get("ambient_max_hops", 3))
+        ):
+            logger.info(
+                "Ambient cascade stopped at hop limit: room=%s message=%s hop=%s",
+                metadata.get("ambient_room_id"),
+                event.message_id,
+                metadata.get("ambient_hop"),
+            )
+            return False
+        if metadata.get("ambient_direct"):
+            selected = True
+        elif metadata.get("ambient_other_bot_mentioned"):
+            return False
+        else:
+            score = 0.0
+            try:
+                user_config = _load_gateway_config()
+                model, runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    user_config=user_config,
+                )
+                main_runtime = dict(runtime or {})
+                main_runtime["model"] = model
+                from gateway.ambient_rooms import (
+                    ambient_arbiter,
+                    score_ambient_participation,
+                )
+
+                score = await score_ambient_participation(
+                    profile=profile,
+                    role=str(metadata.get("ambient_profile_role") or ""),
+                    trigger_text=event.text or "",
+                    channel_context=event.channel_context or "",
+                    author_is_bot=bool(getattr(source, "is_bot", False)),
+                    main_runtime=main_runtime,
+                )
+                if score < float(metadata.get("ambient_min_confidence", 0.55)):
+                    score = 0.0
+                selected = await ambient_arbiter().choose(
+                    message_id=str(event.message_id or id(event)),
+                    profile=profile,
+                    participants=participants,
+                    score=score,
+                    decision_window_seconds=float(
+                        metadata.get("ambient_decision_window_seconds", 1.25)
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "Ambient attention decision failed for profile=%s room=%s",
+                    profile,
+                    metadata.get("ambient_room_id"),
+                    exc_info=True,
+                )
+                return False
+        if not selected:
+            return False
+        setattr(source, "_ambient_room_event", True)
+        role = str(metadata.get("ambient_profile_role") or "").strip()
+        room_note = (
+            "You are speaking in a shared Discord room with a human and other "
+            "independent agent profiles. Reply naturally as yourself. Do not "
+            "repeat room history, narrate your participation decision, or "
+            "address every participant unless useful."
+        )
+        if role:
+            room_note += f" Your role in this room is: {role}"
+        event.channel_prompt = "\n\n".join(
+            part for part in (event.channel_prompt, room_note) if part
+        )
+        return True
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -15601,6 +15738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
+        adapter._hermes_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -16947,6 +17085,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(source, "chat_id", None) or "unknown",
                     )
                     return _paused_notice
+
+        # Shared Discord room events are observed by every configured profile.
+        # Direct mentions are deterministic; unaddressed chatter goes through
+        # the shared attention arbiter so at most one profile responds.
+        if (
+            isinstance(event.metadata, dict)
+            and event.metadata.get("ambient_room_id")
+        ):
+            if not await self._admit_ambient_room_turn(event):
+                return None
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -18360,6 +18508,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
         if getattr(event, "channel_context", None):
+            if (
+                isinstance(event.metadata, dict)
+                and event.metadata.get("ambient_room_id")
+            ):
+                # Discord remains the shared-room source of truth. Feed the
+                # current window to this turn, but persist only the triggering
+                # message so every later turn does not duplicate the same room
+                # transcript and destroy prefix-cache efficiency.
+                setattr(event, "_ambient_persist_user_text", message_text)
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
@@ -20315,7 +20472,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if message_text and isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
-                persist_user_message = _clean_message_text
+                _ambient_persist_text = getattr(
+                    event, "_ambient_persist_user_text", None
+                )
+                if isinstance(_ambient_persist_text, str):
+                    persist_user_message, _ = _strip_msg_ts(
+                        _ambient_persist_text, tz=_evt_tz
+                    )
+                else:
+                    persist_user_message = _clean_message_text
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts
@@ -28566,6 +28731,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        _profile_terminal_registered = False
+        _profile_name = str(source.profile or self._active_profile_name() or "default")
+        _profile_terminal_cfg = (
+            (user_config.get("agent") or {}).get("profile_terminal") or {}
+        )
+        _profile_terminal_raw = (
+            _profile_terminal_cfg.get(_profile_name)
+            if isinstance(_profile_terminal_cfg, dict)
+            else None
+        )
+        if isinstance(_profile_terminal_raw, dict):
+            try:
+                from tools.delegate_tool import _get_child_terminal_overrides
+                from tools.terminal_tool import register_task_env_overrides
+
+                _profile_terminal_overrides = _get_child_terminal_overrides(
+                    {"child_terminal": _profile_terminal_raw}
+                )
+                if _profile_terminal_overrides:
+                    register_task_env_overrides(
+                        session_id, _profile_terminal_overrides
+                    )
+                    _profile_terminal_registered = True
+            except Exception:
+                logger.error(
+                    "Could not register terminal sandbox for profile %s",
+                    _profile_name,
+                    exc_info=True,
+                )
+                return {
+                    "final_response": (
+                        "The managed terminal sandbox for this agent is "
+                        "unavailable, so this turn was stopped safely."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "session_id": session_id,
+                }
+
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
@@ -29886,6 +30091,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "background turn task failed during cleanup",
                             exc_info=True,
                         )
+            if _profile_terminal_registered:
+                try:
+                    from tools.terminal_tool import clear_task_env_overrides
+
+                    clear_task_env_overrides(session_id)
+                except Exception:
+                    logger.warning(
+                        "Could not clear terminal sandbox for profile %s",
+                        _profile_name,
+                        exc_info=True,
+                    )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).

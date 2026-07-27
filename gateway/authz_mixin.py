@@ -505,6 +505,11 @@ class GatewayAuthorizationMixin:
             Platform.SLACK: "SLACK_ALLOW_BOTS",
         }
         if getattr(source, "is_bot", False):
+            if (
+                source.platform == Platform.DISCORD
+                and getattr(source, "ambient_authorized_bot", False) is True
+            ):
+                return True
             allow_bots_var = platform_allow_bots_map.get(source.platform)
             if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True

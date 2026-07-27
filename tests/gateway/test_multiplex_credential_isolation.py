@@ -39,6 +39,57 @@ class TestRuntimeProviderUsesScope:
         finally:
             ss.reset_secret_scope(tok_b)
 
+    def test_named_profile_maps_only_namespaced_host_secrets(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "default-token")
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN", "profile-token"
+        )
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__OPENAI_API_KEY", "profile-provider"
+        )
+        home = tmp_path / "profiles" / "vegapunk"
+        home.mkdir(parents=True)
+
+        scope = ss.build_profile_secret_scope(home)
+
+        assert scope["DISCORD_BOT_TOKEN"] == "profile-token"
+        assert scope["OPENAI_API_KEY"] == "profile-provider"
+        assert "default-token" not in scope.values()
+
+    def test_default_profile_owns_unprefixed_host_secrets(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "default-token")
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN", "profile-token"
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path, profile_name="default")
+
+        assert scope["DISCORD_BOT_TOKEN"] == "default-token"
+        assert "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN" not in scope
+
+    def test_named_profile_inherits_its_external_source_snapshot(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import env_loader
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "default-token")
+        home = tmp_path / "profiles" / "vegapunk"
+        home.mkdir(parents=True)
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+            str(home.resolve()),
+            {"BROWSERBASE_API_KEY": "profile-browser"},
+        )
+
+        scope = ss.build_profile_secret_scope(home)
+
+        assert scope["BROWSERBASE_API_KEY"] == "profile-browser"
+        assert "DISCORD_BOT_TOKEN" not in scope
+
 
 class TestMcpInterpolationUsesScope:
     """MCP config ${VAR} interpolation resolves through the secret scope."""
@@ -164,5 +215,4 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert calls["count"] == 1
     assert "TEST_PROVIDER_API_KEY" not in os.environ
     assert "EXPLICIT_API_KEY" not in os.environ
-
 
