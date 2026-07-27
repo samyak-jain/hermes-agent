@@ -5391,15 +5391,31 @@ class TestNewEndpoints:
         get1 = self.client.get("/api/profiles/soul-prof/soul")
         assert get1.status_code == 200
         assert get1.json()["exists"] is True
+        original_version = get1.json()["version"]
 
         put = self.client.put(
             "/api/profiles/soul-prof/soul",
-            json={"content": "# Edited soul"},
+            json={
+                "content": "# Edited soul",
+                "expected_version": original_version,
+            },
         )
         assert put.status_code == 200
+        assert put.json()["version"] != original_version
 
         got = self.client.get("/api/profiles/soul-prof/soul").json()
         assert got["content"] == "# Edited soul"
+        assert got["version"] == put.json()["version"]
+
+        stale = self.client.put(
+            "/api/profiles/soul-prof/soul",
+            json={
+                "content": "# Stale dashboard writer",
+                "expected_version": original_version,
+            },
+        )
+        assert stale.status_code == 409
+        assert self.client.get("/api/profiles/soul-prof/soul").json()["content"] == "# Edited soul"
 
         self.client.delete("/api/profiles/soul-prof")
 
