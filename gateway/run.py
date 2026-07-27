@@ -13316,7 +13316,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before the narrower agent-turn scope is installed.
             adapter._hermes_profile_name = self._active_profile_name()
             adapter.set_message_handler(self._primary_message_handler())
-            adapter.set_drain_message_handler(self._handle_external_drain_inbound)
+            set_drain_handler = getattr(
+                adapter, "set_drain_message_handler", None
+            )
+            if callable(set_drain_handler):
+                set_drain_handler(self._handle_external_drain_inbound)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -14892,9 +14896,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
-                    adapter.set_drain_message_handler(
-                        self._handle_external_drain_inbound
+                    set_drain_handler = getattr(
+                        adapter, "set_drain_message_handler", None
                     )
+                    if callable(set_drain_handler):
+                        set_drain_handler(self._handle_external_drain_inbound)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -15995,7 +16001,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
         adapter._hermes_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
-        adapter.set_drain_message_handler(self._handle_external_drain_inbound)
+        set_drain_handler = getattr(adapter, "set_drain_message_handler", None)
+        if callable(set_drain_handler):
+            set_drain_handler(self._handle_external_drain_inbound)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
