@@ -19,7 +19,7 @@ from gateway.session import SessionSource, build_session_key
 
 def _event(
     *,
-    profile: str = "default",
+    profile: str | None = "default",
     message_id: str = "message-1",
     ambient: bool = False,
 ) -> MessageEvent:
@@ -105,8 +105,15 @@ async def test_active_session_event_is_durable_before_in_memory_followup_queue()
         Platform.DISCORD,
     )
     adapter._message_handler = AsyncMock(return_value=None)
-    adapter._drain_message_handler = AsyncMock(return_value=(True, None))
-    event = _event()
+    captured_profiles = []
+
+    async def drain_handler(event):
+        captured_profiles.append(event.source.profile)
+        return True, None
+
+    adapter._drain_message_handler = AsyncMock(side_effect=drain_handler)
+    adapter._hermes_profile_name = "vegapunk"
+    event = _event(profile=None)
     session_key = build_session_key(
         event.source,
         group_sessions_per_user=True,
@@ -118,6 +125,7 @@ async def test_active_session_event_is_durable_before_in_memory_followup_queue()
 
     adapter._drain_message_handler.assert_awaited_once_with(event)
     adapter._message_handler.assert_not_awaited()
+    assert captured_profiles == ["vegapunk"]
     assert adapter._pending_messages == {}
 
 
