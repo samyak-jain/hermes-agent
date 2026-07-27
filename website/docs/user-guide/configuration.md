@@ -129,6 +129,34 @@ The broker policy cannot edit itself. Delegated children and cron should deny
 the `config` tool. No raw configuration file needs to be mounted into their
 execution sandbox.
 
+### Self-SOUL broker
+
+Managed deployments can separately grant a top-level profile agent safe
+access to its own `SOUL.md`:
+
+```yaml
+soul_edit:
+  enabled: true
+  require_approval: true
+  max_bytes: 65536
+  read_only_profiles: []
+```
+
+This policy only activates the service-gated `soul` tool when its standalone
+toolset is also enabled. The tool exposes `read`, `update`, `history`, and
+`rollback`; it never accepts a profile or filesystem path. Hermes derives the
+active profile, rejects symlinks and non-regular files, validates UTF-8 and
+the configured byte ceiling, requires compare-and-swap versions for writes,
+uses atomic replacement, writes metadata-only audit records, and retains five
+restorable snapshots.
+
+`require_approval` defaults to `true`. Set it to `false` only as an explicit
+operator decision. `read_only_profiles` accepts profile names or `*`.
+Distribution-owned SOUL files are also read-only. The `config` broker cannot
+inspect or modify `soul_edit`, so an agent cannot enable or weaken its own
+authorization policy. Delegated children and cron should not receive the
+`soul` tool.
+
 Secrets remain outside this surface. The broker rejects credential-shaped
 paths and values; use the relevant authentication or secret-management flow.
 The one structured exception is `mcp_servers.<name>.env`: an operator-directed

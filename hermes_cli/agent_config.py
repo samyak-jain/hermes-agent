@@ -377,6 +377,10 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
         raise AgentConfigError("Internal configuration metadata is not agent-editable.")
     if path == "agent_config" or path.startswith("agent_config."):
         raise AgentConfigError("The configuration broker policy cannot edit itself.")
+    if path == "soul_edit" or path.startswith("soul_edit."):
+        raise AgentConfigError(
+            "The configuration broker cannot edit the SOUL access policy."
+        )
     if _secret_shaped_path(path):
         raise AgentConfigError(
             f"'{path}' is credential-shaped. Secrets must use the authentication "
@@ -434,7 +438,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
     settings = []
     for dotted in sorted(effective_flat):
         top = dotted.split(".", 1)[0]
-        if top.startswith("_") or top == "agent_config":
+        if top.startswith("_") or top in {"agent_config", "soul_edit"}:
             continue
         classification = _path_class(dotted, effective)
         if classification is None or _secret_shaped_path(dotted):

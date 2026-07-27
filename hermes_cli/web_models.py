@@ -612,6 +612,9 @@ class ProfileImport(BaseModel):
 
 class ProfileSoulUpdate(BaseModel):
     content: str
+    # Optional for compatibility with older dashboard/desktop clients. New
+    # clients send the version returned by GET for optimistic concurrency.
+    expected_version: Optional[str] = None
 
 
 class ProfileActiveUpdate(BaseModel):
@@ -738,4 +741,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

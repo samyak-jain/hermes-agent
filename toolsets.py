@@ -112,6 +112,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "soul": {
+        "description": "Validated self-SOUL access for the active profile",
+        "tools": ["soul"],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
