@@ -189,6 +189,32 @@ class TestChannelToolPolicy:
         source = SessionSource(platform=Platform.DISCORD, chat_id="trusted")
         assert _resolve_tool_policy_for_source(cfg, source).mode == "allowlist"
 
+    def test_managed_profile_policy_applies_without_channel_override(
+        self, monkeypatch
+    ):
+        cfg = self._config()
+        cfg["agent"]["profile_tool_policies"] = {
+            "vegapunk": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda path: "profile_tool_policies.vegapunk" in path,
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="shared-room",
+            profile="vegapunk",
+        )
+
+        policy = _resolve_tool_policy_for_source(cfg, source)
+
+        assert policy.mode == "denylist"
+        assert policy.allows("terminal")
+        assert not policy.allows("delegate_task")
+
     def test_invalid_channel_policy_falls_back_to_restricted(self, monkeypatch):
         cfg = self._config()
         cfg["platforms"]["discord"]["channel_overrides"]["trusted"]["tool_policy"] = {

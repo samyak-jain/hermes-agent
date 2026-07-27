@@ -5008,7 +5008,13 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if (
+            getattr(self.config, "typing_indicator", True)
+            and not (
+                isinstance(event.metadata, dict)
+                and event.metadata.get("ambient_quiet_surface", False)
+            )
+        ):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -5238,6 +5244,34 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if (
+                        getattr(result, "success", False)
+                        and getattr(result, "message_id", None)
+                        and isinstance(event.metadata, dict)
+                        and event.metadata.get("ambient_room_id")
+                    ):
+                        try:
+                            from gateway.ambient_rooms import ambient_provenance
+
+                            ambient_provenance().record(
+                                message_id=str(result.message_id),
+                                room_id=str(event.metadata["ambient_room_id"]),
+                                root_message_id=str(
+                                    event.metadata.get("ambient_root_message_id")
+                                    or event.message_id
+                                    or result.message_id
+                                ),
+                                hop=int(event.metadata.get("ambient_hop", 0)) + 1,
+                                profile=str(
+                                    getattr(event.source, "profile", None)
+                                    or "default"
+                                ),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "ambient reply provenance record failed",
+                                exc_info=True,
+                            )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -5692,6 +5726,7 @@ class BasePlatformAdapter(ABC):
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
         role_authorized: bool = False,
+        ambient_authorized_bot: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
     ) -> SessionSource:
@@ -5754,6 +5789,7 @@ class BasePlatformAdapter(ABC):
             message_id=str(message_id) if message_id else None,
             profile=profile,
             role_authorized=role_authorized,
+            ambient_authorized_bot=ambient_authorized_bot,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )

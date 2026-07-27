@@ -62,6 +62,61 @@ class TestRuntimeProviderUsesScope:
         # global var: no scope needed, no raise
         assert _getenv("HERMES_MAX_ITERATIONS") == "42"
 
+    def test_named_profile_maps_only_namespaced_host_secrets(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "lena-token")
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN",
+            "vegapunk-token",
+        )
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__OPENAI_API_KEY",
+            "vegapunk-openai",
+        )
+        home = tmp_path / "profiles" / "vegapunk"
+        home.mkdir(parents=True)
+
+        scope = ss.build_profile_secret_scope(home)
+
+        assert scope["DISCORD_BOT_TOKEN"] == "vegapunk-token"
+        assert scope["OPENAI_API_KEY"] == "vegapunk-openai"
+        assert "lena-token" not in scope.values()
+
+    def test_default_profile_owns_unprefixed_host_secrets(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "lena-token")
+        monkeypatch.setenv(
+            "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN",
+            "vegapunk-token",
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path, profile_name="default")
+
+        assert scope["DISCORD_BOT_TOKEN"] == "lena-token"
+        assert "HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN" not in scope
+
+    def test_named_profile_inherits_external_vault_secrets_not_process_identity(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import env_loader
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "lena-token")
+        monkeypatch.setenv("BROWSERBASE_API_KEY", "shared-browser")
+        monkeypatch.setattr(
+            env_loader,
+            "get_secret_source",
+            lambda key: "bitwarden" if key == "BROWSERBASE_API_KEY" else None,
+        )
+        home = tmp_path / "profiles" / "vegapunk"
+        home.mkdir(parents=True)
+
+        scope = ss.build_profile_secret_scope(home)
+
+        assert scope["BROWSERBASE_API_KEY"] == "shared-browser"
+        assert "DISCORD_BOT_TOKEN" not in scope
+
 
 class TestMcpInterpolationUsesScope:
     """MCP config ${VAR} interpolation resolves through the secret scope."""

@@ -12258,7 +12258,18 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         from tools.mcp_oauth_manager import get_manager
 
         home_token = set_hermes_home_override(flow.hermes_home)
-        secret_token = set_secret_scope(build_profile_secret_scope(Path(flow.hermes_home)))
+        _scope_home = Path(flow.hermes_home)
+        _scope_profile = (
+            _scope_home.name
+            if _scope_home.parent.name == "profiles"
+            else "default"
+        )
+        secret_token = set_secret_scope(
+            build_profile_secret_scope(
+                _scope_home,
+                profile_name=_scope_profile,
+            )
+        )
         try:
             transaction = _mcp_oauth_transaction(flow)
             with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):

@@ -1156,6 +1156,18 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                try:
+                    from gateway.ambient_rooms import register_ambient_bot_id
+
+                    register_ambient_bot_id(
+                        getattr(adapter_self._client.user, "id", None)
+                    )
+                except Exception:
+                    logger.debug(
+                        "[%s] Could not register ambient bot identity",
+                        adapter_self.name,
+                        exc_info=True,
+                    )
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -1264,14 +1276,31 @@ class DiscordAdapter(BasePlatformAdapter):
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
 
+        ambient_room = self._discord_ambient_room(message)
         role_authorized = False
         if getattr(message.author, "bot", False):
+            if ambient_room is not None:
+                try:
+                    from gateway.ambient_rooms import is_registered_ambient_bot
+
+                    if not is_registered_ambient_bot(
+                        getattr(message.author, "id", None)
+                    ):
+                        return False, False
+                except Exception:
+                    return False, False
             allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-            if allow_bots == "none":
-                return False, False
-            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+            if ambient_room is None and allow_bots == "none":
                 return False, False
             if (
+                ambient_room is None
+                and allow_bots == "mentions"
+                and not self._self_is_explicitly_mentioned(message)
+            ):
+                return False, False
+            if (
+                ambient_room is None
+                and
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
@@ -1297,7 +1326,7 @@ class DiscordAdapter(BasePlatformAdapter):
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
-        if not isinstance(message.channel, discord.DMChannel) and (
+        if ambient_room is None and not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
             other_bots_mentioned = any(
@@ -1319,6 +1348,50 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False, False
 
         return True, role_authorized
+
+    def _discord_ambient_room(self, message: Any) -> Optional[dict]:
+        """Return the normalized shared-room config for a Discord message."""
+        raw = self.config.extra.get("ambient_rooms")
+        if not isinstance(raw, dict):
+            return None
+        parent_id = self._get_parent_channel_id(getattr(message, "channel", None))
+        keys = self._discord_channel_keys(message, parent_id)
+        for key in keys:
+            entry = raw.get(str(key))
+            if entry is True:
+                entry = {}
+            if not isinstance(entry, dict) or entry.get("enabled", True) is False:
+                continue
+            participants = entry.get("participants") or ["default"]
+            if isinstance(participants, str):
+                participants = [participants]
+            normalized = dict(entry)
+            normalized["participants"] = [
+                str(item).strip() for item in participants if str(item).strip()
+            ]
+            normalized["room_id"] = str(
+                parent_id or getattr(getattr(message, "channel", None), "id", key)
+            )
+            try:
+                normalized["decision_window_seconds"] = max(
+                    0.05, float(entry.get("decision_window_seconds", 1.25))
+                )
+            except (TypeError, ValueError):
+                normalized["decision_window_seconds"] = 1.25
+            try:
+                normalized["min_confidence"] = max(
+                    0.0, min(float(entry.get("min_confidence", 0.55)), 1.0)
+                )
+            except (TypeError, ValueError):
+                normalized["min_confidence"] = 0.55
+            try:
+                normalized["max_agent_hops"] = max(
+                    0, int(entry.get("max_agent_hops", 3))
+                )
+            except (TypeError, ValueError):
+                normalized["max_agent_hops"] = 3
+            return normalized
+        return None
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
@@ -5887,6 +5960,8 @@ class DiscordAdapter(BasePlatformAdapter):
         channel: Any,
         before: "DiscordMessage",
         reply_target: Optional[Any] = None,
+        *,
+        full_window: bool = False,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
@@ -5915,7 +5990,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Determine which bot messages to include in context
         allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-        include_other_bots = allow_bots_raw != "none"
+        include_other_bots = full_window or allow_bots_raw != "none"
 
         # Use the in-memory cache to narrow the fetch window on hot paths.
         # If we know our last message ID in this channel, pass it as `after`
@@ -5925,7 +6000,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # trigger — Discord snowflake IDs are monotonically increasing, so
         # a simple int comparison suffices.
         channel_id = str(getattr(channel, "id", ""))
-        _cached_id = self._last_self_message_id.get(channel_id)
+        _cached_id = (
+            None if full_window else self._last_self_message_id.get(channel_id)
+        )
         _after_obj = None
         try:
             if _cached_id and int(_cached_id) < int(before.id):
@@ -6024,7 +6101,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # partition point.  Everything before this is already in the
                 # session transcript.  (Redundant when _after_obj is set, but
                 # needed for cold start.)
-                if msg.author == self._client.user:
+                if msg.author == self._client.user and not full_window:
                     break
                 line = _keep(msg)
                 if line is None:
@@ -7075,6 +7152,8 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
+        ambient_room = self._discord_ambient_room(message)
+        is_ambient_room = ambient_room is not None
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
@@ -7144,7 +7223,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if (
+                require_mention
+                and not is_free_channel
+                and not in_bot_thread
+                and not is_ambient_room
+            ):
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
@@ -7155,7 +7239,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = (
+                bool(channel_keys & no_thread_channels)
+                or is_free_channel
+                or is_ambient_room
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -7270,6 +7358,10 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
             role_authorized=role_authorized,
+            ambient_authorized_bot=bool(
+                ambient_room is not None
+                and getattr(message.author, "bot", False)
+            ),
             auto_thread_created=auto_threaded_channel is not None,
             auto_thread_initial_name=(
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
@@ -7441,7 +7533,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # so the session transcript already has everything.
             # Auto-threaded messages also skip — we just created the thread,
             # there's nothing prior to backfill.
-            _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
+            _has_mention_gap = (
+                require_mention
+                and not is_free_channel
+                and not in_bot_thread
+            )
             _is_reply = message.reference is not None
 
             # Resolve the replied-to message into an object exposing ``.id``.
@@ -7464,9 +7560,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         with suppress(ValueError, TypeError):
                             _reply_target = _Snowflake(int(_ref_mid))
 
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            if (
+                (_has_mention_gap or is_thread or _is_reply or is_ambient_room)
+                and auto_threaded_channel is None
+            ):
                 _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message, reply_target=_reply_target,
+                    message.channel,
+                    before=message,
+                    reply_target=_reply_target,
+                    full_window=is_ambient_room,
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text
@@ -7508,6 +7610,67 @@ class DiscordAdapter(BasePlatformAdapter):
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
+        event_metadata = {}
+        if ambient_room is not None:
+            provenance = None
+            if getattr(message.author, "bot", False):
+                try:
+                    from gateway.ambient_rooms import ambient_provenance
+
+                    provenance = ambient_provenance().lookup(str(message.id))
+                    if provenance is None:
+                        # The other adapter may receive Discord's create event
+                        # immediately after send() returns but just before the
+                        # sender records its message ID. Yield briefly to close
+                        # that in-process race before assigning a conservative
+                        # first-hop fallback.
+                        await asyncio.sleep(0.05)
+                        provenance = ambient_provenance().lookup(str(message.id))
+                except Exception:
+                    logger.debug(
+                        "[%s] Ambient provenance lookup failed",
+                        self.name,
+                        exc_info=True,
+                    )
+            roles = ambient_room.get("roles") or {}
+            profile_name = str(
+                getattr(self, "_hermes_profile_name", "") or "default"
+            )
+            self_mentioned = self._self_is_explicitly_mentioned(message)
+            any_bot_mentioned = any(
+                getattr(mentioned, "bot", False)
+                for mentioned in (getattr(message, "mentions", None) or [])
+            )
+            reply_targets_self = bool(
+                resolved_reference is not None
+                and getattr(resolved_reference, "author", None)
+                == self._client.user
+            )
+            event_metadata = {
+                "ambient_room_id": ambient_room["room_id"],
+                "ambient_participants": ambient_room["participants"],
+                "ambient_profile_role": (
+                    str(roles.get(profile_name) or "")
+                    if isinstance(roles, dict)
+                    else ""
+                ),
+                "ambient_direct": bool(self_mentioned or reply_targets_self),
+                "ambient_other_bot_mentioned": bool(any_bot_mentioned and not self_mentioned),
+                "ambient_decision_window_seconds": ambient_room[
+                    "decision_window_seconds"
+                ],
+                "ambient_min_confidence": ambient_room["min_confidence"],
+                "ambient_max_hops": ambient_room["max_agent_hops"],
+                "ambient_root_message_id": str(
+                    (provenance or {}).get("root_message_id") or message.id
+                ),
+                "ambient_hop": int(
+                    (provenance or {}).get("hop")
+                    or (1 if getattr(message.author, "bot", False) else 0)
+                ),
+                "ambient_quiet_surface": not self_mentioned,
+            }
+
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -7522,6 +7685,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata=event_metadata,
         )
 
         # Track thread participation so the bot won't require @mention for

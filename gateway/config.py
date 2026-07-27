@@ -1495,6 +1495,14 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if plat == Platform.DISCORD and "ambient_rooms" in platform_cfg:
+                    ambient_rooms = platform_cfg["ambient_rooms"]
+                    if isinstance(ambient_rooms, dict):
+                        bridged["ambient_rooms"] = {
+                            str(k): v for k, v in ambient_rooms.items()
+                        }
+                    else:
+                        bridged["ambient_rooms"] = ambient_rooms
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if "typing_indicator" in platform_cfg:
