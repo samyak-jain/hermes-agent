@@ -2918,6 +2918,21 @@ class BasePlatformAdapter(ABC):
         handler = getattr(self, "_drain_message_handler", None)
         if handler is None:
             return False
+        # Multiplexed secondary profiles normally stamp source.profile in
+        # their message-handler wrapper. The drain interceptor deliberately
+        # runs before that wrapper (and before the process-local busy queue),
+        # so preserve the adapter's ownership here or replay would route the
+        # durable row through the default profile.
+        source = getattr(event, "source", None)
+        profile_name = str(
+            getattr(self, "_hermes_profile_name", "") or ""
+        ).strip()
+        if (
+            source is not None
+            and not getattr(source, "profile", None)
+            and profile_name
+        ):
+            source.profile = profile_name
         try:
             handled, response = await handler(event)
         except Exception:
