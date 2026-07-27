@@ -14084,6 +14084,7 @@ class ProfileRename(BaseModel):
 
 class ProfileSoulUpdate(BaseModel):
     content: str
+    expected_version: str
 
 
 class ProfileActiveUpdate(BaseModel):
@@ -14565,24 +14566,44 @@ async def delete_profile_endpoint(name: str):
 
 @app.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    if soul_path.exists():
-        try:
-            return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
-    return {"content": "", "exists": False}
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.soul import SoulError, read_soul
+
+    profile_dir = _resolve_profile_dir(name)
+    token = set_hermes_home_override(profile_dir)
+    try:
+        return read_soul(home=profile_dir)
+    except SoulError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        reset_hermes_home_override(token)
 
 
 @app.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.soul import SoulConflict, SoulError, update_soul
+
+    profile_dir = _resolve_profile_dir(name)
+    token = set_hermes_home_override(profile_dir)
     try:
-        soul_path.write_text(body.content, encoding="utf-8")
-    except OSError as e:
+        result = update_soul(
+            home=profile_dir,
+            content=body.content,
+            expected_version=body.expected_version,
+            reason="Operator used the dashboard profile SOUL editor.",
+            actor="dashboard-profile-editor",
+        )
+        return {"ok": True, **result}
+    except SoulConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except SoulError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
-    return {"ok": True}
+    finally:
+        reset_hermes_home_override(token)
 
 
 @app.put("/api/profiles/{name}/description")

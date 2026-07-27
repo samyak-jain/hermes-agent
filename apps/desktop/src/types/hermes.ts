@@ -705,8 +705,15 @@ export interface ProjectsPayload {
 }
 
 export interface ProfileSoul {
+  bytes: number
   content: string
+  editable: boolean
   exists: boolean
+  max_bytes: number
+  ownership: string
+  profile: string
+  read_only_reason: null | string
+  version: string
 }
 
 export interface ProfilesResponse {
