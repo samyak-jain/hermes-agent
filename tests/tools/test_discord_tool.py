@@ -509,6 +509,43 @@ class TestCreateThread:
 
 
 # ---------------------------------------------------------------------------
+# Action: send_message
+# ---------------------------------------------------------------------------
+
+class TestSendMessage:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_to_channel_or_thread(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "901"}
+        result = json.loads(discord_core(
+            action="send_message",
+            channel_id="800",
+            content="<@42> Please take this handoff.",
+        ))
+        assert result == {
+            "success": True,
+            "channel_id": "800",
+            "message_id": "901",
+        }
+        mock_req.assert_called_once_with(
+            "POST",
+            "/channels/800/messages",
+            "test-token",
+            body={"content": "<@42> Please take this handoff."},
+        )
+
+    def test_send_message_rejects_empty_content(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(
+            action="send_message",
+            channel_id="800",
+            content="",
+        ))
+        assert "Missing required parameters" in result["error"]
+        assert "content" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # Actions: add_role / remove_role
 # ---------------------------------------------------------------------------
 
@@ -593,14 +630,24 @@ class TestRegistration:
         from tools.registry import registry
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == {"fetch_messages", "search_members", "create_thread"}
+        assert actions == {
+            "fetch_messages",
+            "search_members",
+            "send_message",
+            "create_thread",
+        }
 
     def test_admin_schema_actions(self):
         """Admin static schema should list only admin actions."""
         from tools.registry import registry
         entry = registry._tools["discord_admin"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread"}
+        expected_admin = set(_ACTIONS.keys()) - {
+            "fetch_messages",
+            "search_members",
+            "send_message",
+            "create_thread",
+        }
         assert actions == expected_admin
 
     def test_all_actions_covered(self):
@@ -623,6 +670,7 @@ class TestRegistration:
         desc = entry.schema["description"]
         assert "fetch_messages(channel_id)" in desc
         assert "search_members(guild_id, query)" in desc
+        assert "send_message(channel_id, content)" in desc
         assert "create_thread(channel_id, name)" in desc
         # Admin actions should NOT be in core description
         assert "list_guilds()" not in desc
