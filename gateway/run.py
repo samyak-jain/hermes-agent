@@ -4123,6 +4123,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not selected:
             return False
 
+        # BasePlatformAdapter suppresses typing while every ambient participant
+        # is still evaluating the message; otherwise all bots would flash
+        # "typing…" even when most decide to stay quiet.  Once this profile is
+        # admitted, start its platform typing state explicitly.  The normal
+        # processing finalizer still owns stop_typing(), so this remains
+        # bounded even on errors.
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                await adapter.send_typing(
+                    source.chat_id,
+                    metadata=self._thread_metadata_for_source(
+                        source,
+                        event.message_id,
+                    ),
+                )
+        except Exception:
+            logger.debug(
+                "Could not start typing for admitted ambient profile=%s room=%s",
+                profile,
+                metadata.get("ambient_room_id"),
+                exc_info=True,
+            )
+
         # Keep ambient delivery on the ordinary final-send path. Streamed
         # Discord messages are delivered before BasePlatformAdapter can record
         # their message ID, which would leave agent-authored replies without
@@ -4377,8 +4401,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        ``agent.profile_models`` → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider
+        resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -4434,6 +4459,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
+
+        # A multiplexed gateway serves independent agents from one process.
+        # Their primary inference runtimes must therefore be selectable by
+        # profile without relying on a session-local /model override or
+        # duplicating the whole gateway.  Keep this below session overrides
+        # and channel overrides, but above the process-global default.
+        if source is not None and isinstance(user_config, dict):
+            agent_config = user_config.get("agent") or {}
+            profile_models = (
+                agent_config.get("profile_models")
+                if isinstance(agent_config, dict)
+                else None
+            )
+            profile_name = str(
+                source.profile or self._active_profile_name() or "default"
+            )
+            profile_model = (
+                profile_models.get(profile_name)
+                if isinstance(profile_models, dict)
+                else None
+            )
+            if isinstance(profile_model, dict):
+                profile_provider = str(
+                    profile_model.get("provider") or ""
+                ).strip()
+                profile_model_name = str(
+                    profile_model.get("model")
+                    or profile_model.get("default")
+                    or ""
+                ).strip()
+                if profile_provider:
+                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                        profile_provider
+                    )
+                    provider_default_model = runtime_kwargs.pop("model", None)
+                    if provider_default_model and not profile_model_name:
+                        model = provider_default_model
+                if profile_model_name:
+                    model = profile_model_name
+                for key in ("api_mode", "base_url", "max_tokens"):
+                    if profile_model.get(key) not in (None, ""):
+                        runtime_kwargs[key] = profile_model[key]
+                logger.info(
+                    "Profile model override: profile=%s provider=%s model=%s",
+                    profile_name,
+                    runtime_kwargs.get("provider") or profile_provider or "",
+                    model,
+                )
 
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
@@ -5216,6 +5289,173 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read-merge keeps the live count); only the state changes.
         self._update_runtime_status("draining")
 
+    def _drain_inbox(self):
+        store = getattr(self, "_drain_inbox_store", None)
+        if store is None:
+            from gateway.drain_inbox import DrainInbox
+
+            process_home = Path(
+                os.environ.get("HERMES_HOME") or str(_hermes_home)
+            )
+            store = DrainInbox(process_home / "state" / "drain_inbox.db")
+            self._drain_inbox_store = store
+        return store
+
+    async def _queue_external_drain_event(
+        self,
+        event: MessageEvent,
+    ) -> Optional[str]:
+        """Persist a real inbound event for replay after maintenance.
+
+        Shared ambient rooms deliver one normalized event to every profile.
+        Each profile row is retained because participation is independent, but
+        only the first adapter acknowledges the human's original message.
+        """
+
+        try:
+            inserted, should_ack = await asyncio.to_thread(
+                self._drain_inbox().enqueue,
+                event,
+            )
+        except Exception:
+            logger.error(
+                "Could not persist inbound message during external drain",
+                exc_info=True,
+            )
+            return (
+                "⏳ This agent is draining for maintenance, and I couldn't "
+                "safely queue this message. Please resend it when I'm back."
+            )
+
+        if not inserted:
+            return None
+        logger.info(
+            "Queued inbound message during external drain: platform=%s chat=%s "
+            "profile=%s message=%s",
+            event.source.platform.value,
+            event.source.chat_id,
+            event.source.profile or "default",
+            event.message_id or "",
+        )
+        if not should_ack:
+            return None
+
+        # A text acknowledgement in an ambient room is itself a bot-authored
+        # room message. During drain the peer adapter would queue that message,
+        # acknowledge it, and create a loop. React to the original Discord
+        # message instead; only the first profile does so.
+        if event.metadata.get("ambient_room_id"):
+            raw_message = getattr(event, "raw_message", None)
+            add_reaction = getattr(raw_message, "add_reaction", None)
+            if callable(add_reaction):
+                try:
+                    await add_reaction("⏳")
+                except Exception:
+                    logger.debug(
+                        "Could not acknowledge queued ambient message with reaction",
+                        exc_info=True,
+                    )
+            return None
+
+        return (
+            "⏳ Maintenance is queued. I saved your message and will pick it "
+            "up automatically when the gateway is back."
+        )
+
+    async def _handle_external_drain_inbound(
+        self,
+        event: MessageEvent,
+    ) -> tuple[bool, Optional[str]]:
+        """Adapter-level drain gate, ahead of process-local busy queues."""
+        if (
+            not self._external_drain_active
+            or event.internal
+            or getattr(event, "_hermes_external_drain_replay", False)
+        ):
+            return False, None
+        return True, await self._queue_external_drain_event(event)
+
+    async def _replay_external_drain_inbox(self) -> int:
+        """Replay and retire durable messages received during a drain."""
+
+        lock = getattr(self, "_drain_inbox_replay_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._drain_inbox_replay_lock = lock
+        if lock.locked():
+            return 0
+
+        replayed = 0
+        async with lock:
+            try:
+                queued = await asyncio.to_thread(self._drain_inbox().pending)
+            except Exception:
+                logger.error("Could not load external-drain inbox", exc_info=True)
+                return 0
+
+            for record in queued:
+                if self._external_drain_active or self._draining:
+                    break
+                event = record.event
+                source = event.source
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    logger.warning(
+                        "Keeping drain-queued message %s: adapter unavailable "
+                        "for platform=%s profile=%s",
+                        event.message_id or record.row_id,
+                        source.platform.value,
+                        source.profile or "default",
+                    )
+                    continue
+                try:
+                    setattr(event, "_hermes_external_drain_replay", True)
+                    await adapter.handle_message(event)
+                    session_key = build_session_key(
+                        source,
+                        group_sessions_per_user=adapter.config.extra.get(
+                            "group_sessions_per_user", True
+                        ),
+                        thread_sessions_per_user=adapter.config.extra.get(
+                            "thread_sessions_per_user", False
+                        ),
+                    )
+                    # handle_message returns after spawning the owner task.
+                    # Wait until this event and any prior event in the same
+                    # lane have drained before deleting its durable row.
+                    while True:
+                        task = getattr(adapter, "_session_tasks", {}).get(
+                            session_key
+                        )
+                        if task is not None and not task.done():
+                            await asyncio.shield(task)
+                            await asyncio.sleep(0)
+                            continue
+                        if session_key in getattr(
+                            adapter, "_pending_messages", {}
+                        ):
+                            await asyncio.sleep(0.05)
+                            continue
+                        break
+                    await asyncio.to_thread(
+                        self._drain_inbox().delete,
+                        record.row_id,
+                    )
+                    replayed += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Keeping drain-queued message %s after replay failure",
+                        event.message_id or record.row_id,
+                    )
+        if replayed:
+            logger.info(
+                "Replayed %d inbound message(s) queued during external drain",
+                replayed,
+            )
+        return replayed
+
     def _exit_external_drain(self) -> None:
         """Cancel external drain: revert state, re-accept new turns.
 
@@ -5239,6 +5479,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "re-accepting new turns; gateway_state -> running."
         )
         self._update_runtime_status("running")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Some embedders/tests drive the reversible state transition from
+            # a synchronous control thread. Startup replay still drains the
+            # durable inbox when the event loop becomes available.
+            return
+        self._spawn_supervised(
+            self._replay_external_drain_inbox,
+            "external_drain_inbox_replay",
+            restart=False,
+        )
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -7968,6 +8220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Set up message + fatal error handlers
             adapter._hermes_profile_name = self._active_profile_name()
             adapter.set_message_handler(self._handle_message)
+            adapter.set_drain_message_handler(self._handle_external_drain_inbound)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8272,6 +8525,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._redeliver_pending_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        # Messages accepted by platform adapters during the previous
+        # process's external drain were durably queued rather than rejected.
+        # Replay only after restart-interrupted sessions have been restored so
+        # the new user turns preserve conversation order.
+        await self._replay_external_drain_inbox()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -8941,6 +9199,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._handle_message)
+                    adapter.set_drain_message_handler(
+                        self._handle_external_drain_inbound
+                    )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -9828,6 +10089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter._hermes_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        adapter.set_drain_message_handler(self._handle_external_drain_inbound)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -10427,8 +10689,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Ambient Discord rooms behave like human group chats. Every configured
         # profile observes the same room event, explicit mentions always reach
-        # the named bot, and unaddressed chatter is admitted only for the one
-        # profile selected by the shared attention arbiter.
+        # the named bot, and each profile independently decides whether
+        # unaddressed chatter benefits from its contribution.
         if (
             isinstance(event.metadata, dict)
             and event.metadata.get("ambient_room_id")
@@ -11713,24 +11975,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # ── External-drain new-turn gate (Phase 2) ────────────────────
         # When NAS has engaged an external drain (.drain_request.json present,
-        # observed by _drain_control_watcher), refuse to START a new turn so
-        # the in-flight set can only fall to zero — eliminating the TOCTOU race
+        # observed by _drain_control_watcher), do not START a new turn so the
+        # in-flight set can only fall to zero — eliminating the TOCTOU race
         # (D4a: stop accepting new turns FIRST, then NAS polls until
-        # active_agents==0). In-flight turns are untouched; this only blocks the
-        # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
-        # Reversible: once the marker is removed the gate opens again.
+        # active_agents==0). Persist real inbound messages for automatic replay
+        # after the replacement gateway connects; requiring the user to notice
+        # a transient maintenance window and resend loses work. Internal/system
+        # events (restart-recovery replays, background-process completions)
+        # bypass the gate because they are not user-initiated new work.
         if self._external_drain_active and not is_internal:
-            logger.info(
-                "Refusing new turn for session %s — external drain active.",
-                _quick_key,
-            )
-            return (
-                "⏳ This agent is draining for a maintenance action and isn't "
-                "accepting new turns right now. It'll be back in a moment — "
-                "please resend shortly."
-            )
+            return await self._queue_external_drain_event(event)
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there

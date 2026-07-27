@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -8,7 +9,7 @@ from gateway.run import GatewayRunner
 
 
 @pytest.mark.asyncio
-async def test_arbiter_selects_one_highest_scoring_profile():
+async def test_arbiter_allows_every_positive_profile_to_join():
     arbiter = AmbientRoomArbiter()
     results = await asyncio.gather(
         arbiter.choose(
@@ -26,7 +27,7 @@ async def test_arbiter_selects_one_highest_scoring_profile():
             decision_window_seconds=0.2,
         ),
     )
-    assert results == [False, True]
+    assert results == [True, True]
 
 
 @pytest.mark.asyncio
@@ -89,6 +90,39 @@ async def test_direct_ambient_turn_is_atomic_and_gets_room_contract():
     assert source._ambient_room_event is True
     assert "existing room rule" in event.channel_prompt
     assert "coding operator" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_admitted_ambient_turn_starts_typing_after_attention_gate():
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(send_typing=AsyncMock())
+    runner._adapter_for_source = lambda _source: adapter
+    runner._thread_metadata_for_source = lambda _source, message_id: {
+        "reply_to_message_id": message_id
+    }
+    source = SimpleNamespace(
+        profile="vegapunk",
+        is_bot=False,
+        chat_id="room",
+    )
+    event = SimpleNamespace(
+        source=source,
+        message_id="human-typing",
+        text="@Vegapunk hello",
+        channel_context="",
+        channel_prompt="",
+        metadata={
+            "ambient_direct": True,
+            "ambient_participants": ["default", "vegapunk"],
+            "ambient_profile_role": "coding operator",
+        },
+    )
+
+    assert await runner._admit_ambient_room_turn(event) is True
+    adapter.send_typing.assert_awaited_once_with(
+        "room",
+        metadata={"reply_to_message_id": "human-typing"},
+    )
 
 
 @pytest.mark.asyncio

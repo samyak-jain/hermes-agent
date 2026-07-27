@@ -5,7 +5,7 @@ but every bot adapter sees the same inbound room event.  This module provides
 the small amount of shared coordination needed to make that feel like a human
 group chat:
 
-* one spontaneous speaker is selected per message;
+* each participant independently decides whether to speak;
 * explicit mentions bypass arbitration and always reach the named bot;
 * bot-authored replies carry a durable hop count so agent cascades are bounded
   across gateway restarts.
@@ -17,6 +17,7 @@ Discord message IDs and routing metadata only.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 import threading
@@ -28,18 +29,26 @@ from typing import Iterable, Optional
 from hermes_constants import get_hermes_home
 from hermes_state import apply_sqlite_storage_policy
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _Decision:
     created_at: float
     participants: tuple[str, ...]
     candidates: dict[str, float] = field(default_factory=dict)
-    selected: Optional[str] = None
+    selected: frozenset[str] = field(default_factory=frozenset)
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class AmbientRoomArbiter:
-    """Choose at most one spontaneous speaker for a Discord message."""
+    """Coordinate independent participation decisions for one room message.
+
+    Waiting briefly for every configured participant keeps decisions based on
+    the same room snapshot and gives us one observable decision record.  It
+    must not turn a human-style group chat into a single-assistant router:
+    every candidate whose own attention score is positive is admitted.
+    """
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -81,19 +90,25 @@ class AmbientRoomArbiter:
                 async with self._lock:
                     self._finalize(decision)
 
-        return decision.selected == profile
+        return profile in decision.selected
 
     @staticmethod
     def _finalize(decision: _Decision) -> None:
         if decision.ready.is_set():
             return
-        eligible = [
-            (score, -index, profile)
-            for index, profile in enumerate(decision.participants)
-            if (score := decision.candidates.get(profile, 0.0)) > 0.0
-        ]
-        if eligible:
-            decision.selected = max(eligible)[2]
+        decision.selected = frozenset(
+            profile
+            for profile in decision.participants
+            if decision.candidates.get(profile, 0.0) > 0.0
+        )
+        logger.info(
+            "Ambient participation decision: candidates=%s selected=%s",
+            {
+                profile: round(decision.candidates.get(profile, 0.0), 3)
+                for profile in decision.participants
+            },
+            sorted(decision.selected),
+        )
         decision.ready.set()
 
     def _prune(self, now: float) -> None:
