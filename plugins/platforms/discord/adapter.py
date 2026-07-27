@@ -1373,18 +1373,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_id or getattr(getattr(message, "channel", None), "id", key)
             )
             try:
-                normalized["decision_window_seconds"] = max(
-                    0.05, float(entry.get("decision_window_seconds", 1.25))
-                )
-            except (TypeError, ValueError):
-                normalized["decision_window_seconds"] = 1.25
-            try:
-                normalized["min_confidence"] = max(
-                    0.0, min(float(entry.get("min_confidence", 0.55)), 1.0)
-                )
-            except (TypeError, ValueError):
-                normalized["min_confidence"] = 0.55
-            try:
                 normalized["max_agent_hops"] = max(
                     0, int(entry.get("max_agent_hops", 3))
                 )
@@ -7656,10 +7644,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 ),
                 "ambient_direct": bool(self_mentioned or reply_targets_self),
                 "ambient_other_bot_mentioned": bool(any_bot_mentioned and not self_mentioned),
-                "ambient_decision_window_seconds": ambient_room[
-                    "decision_window_seconds"
-                ],
-                "ambient_min_confidence": ambient_room["min_confidence"],
                 "ambient_max_hops": ambient_room["max_agent_hops"],
                 "ambient_root_message_id": str(
                     (provenance or {}).get("root_message_id") or message.id
