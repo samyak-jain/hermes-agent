@@ -23113,7 +23113,7 @@ class _ProfileCronSchedulerRuntime:
 def _run_profile_cron_scheduler(
     runtime: _ProfileCronSchedulerRuntime,
     *,
-    runner: "GatewayRunner",
+    runner: Any,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """Resolve and run one provider entirely inside its profile scope."""
@@ -23129,13 +23129,22 @@ def _run_profile_cron_scheduler(
             # profile's provider to every multiplexed profile.
             provider = resolve_cron_scheduler()
             runtime.provider = provider
-            kwargs = {"adapters": runtime.adapters, "loop": loop}
-            if isinstance(provider, InProcessCronScheduler):
-                kwargs["can_dispatch"] = lambda: not (
-                    runner._draining or runner._external_drain_active
-                )
             runtime.ready.set()
-            provider.start(runtime.stop_event, **kwargs)
+            if isinstance(provider, InProcessCronScheduler):
+                provider.start(
+                    runtime.stop_event,
+                    adapters=runtime.adapters,
+                    loop=loop,
+                    can_dispatch=lambda: not (
+                        runner._draining or runner._external_drain_active
+                    ),
+                )
+            else:
+                provider.start(
+                    runtime.stop_event,
+                    adapters=runtime.adapters,
+                    loop=loop,
+                )
     except BaseException as exc:
         runtime.startup_error = exc
         runtime.ready.set()
@@ -23148,7 +23157,7 @@ def _run_profile_cron_scheduler(
 
 
 def _start_profile_cron_schedulers(
-    runner: "GatewayRunner",
+    runner: Any,
     *,
     loop: asyncio.AbstractEventLoop,
 ) -> List[_ProfileCronSchedulerRuntime]:
