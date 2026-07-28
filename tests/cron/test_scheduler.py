@@ -17,6 +17,7 @@ from cron.scheduler import (
     _cron_archive_prompt,
     _attach_cron_memory_store,
     _register_cron_terminal,
+    _resolve_cron_terminal,
     _resolve_cron_enabled_toolsets,
     _resolve_cron_tool_policy,
     _resolve_delivery_target,
@@ -198,6 +199,39 @@ class TestCronToolPolicy:
         assert overrides["env_type"] == "ssh"
         assert overrides["cwd"] == "/data"
         assert overrides["ssh_sync_files"] is False
+
+    def test_secondary_profile_terminal_replaces_shared_cron_default(self):
+        cfg = {
+            "cron": {
+                "terminal": {
+                    "backend": "ssh",
+                    "ssh_host_file": "/run/secrets/sandbox-ip",
+                },
+                "profile_terminal": {
+                    "vegapunk": {
+                        "backend": "ssh",
+                        "ssh_host_file": "/run/secrets/operator-ip",
+                    },
+                },
+            },
+        }
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="vegapunk",
+        ):
+            assert _resolve_cron_terminal(cfg) == {
+                "backend": "ssh",
+                "ssh_host_file": "/run/secrets/operator-ip",
+            }
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ):
+            assert _resolve_cron_terminal(cfg) == {
+                "backend": "ssh",
+                "ssh_host_file": "/run/secrets/sandbox-ip",
+            }
 
     def test_cron_script_uses_registered_terminal_and_cleans_it_up(self):
         import cron.scheduler as scheduler
