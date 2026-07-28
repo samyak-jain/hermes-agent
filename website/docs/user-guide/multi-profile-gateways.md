@@ -180,7 +180,22 @@ The **default** profile keeps the historical `agent:main:…` namespace
 byte-for-byte, so existing default-profile sessions are unaffected — no
 migration, no orphaned history.
 
-#### 5. One PID/lock and one status surface
+#### 5. Cron remains profile-local
+
+The default multiplexer starts one scheduler lifecycle for every profile it
+serves. Each scheduler resolves that profile's `cron.provider`, credentials,
+jobs, tick lock, heartbeat, output, and execution ledger under the profile's
+own home. Default-profile jobs use the default adapters; named-profile jobs use
+that named profile's live adapter map, including `deliver: origin` and
+`agent_respond` routing.
+
+This does not create extra gateway services. The named profile's standalone
+service stays stopped in multiplex mode; the default multiplexer owns its cron
+scheduler. If the gateway is down at a job's due time, persisted due jobs are
+claimed on the next healthy tick according to the normal one-shot/recurring
+catch-up rules.
+
+#### 6. One PID/lock and one status surface
 
 There is a single process-level PID and lock (the multiplexer, under the default
 home). `hermes status` reports the multiplexer and the profiles it serves;

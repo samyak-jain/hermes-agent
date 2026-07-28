@@ -200,7 +200,10 @@ What they do:
 
 ## How it works
 
-**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
+**Cron execution is handled by the gateway daemon.** The gateway ticks the
+scheduler every 60 seconds, running any due jobs in isolated agent sessions. A
+multiplexed gateway runs one independently scoped scheduler per served profile;
+it never combines profile stores.
 
 ```bash
 hermes gateway install     # Install as a user service
@@ -224,6 +227,15 @@ On each tick Hermes:
 7. updates run metadata and the next scheduled time
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
+
+Because jobs and their next-run timestamps are persisted, the built-in
+scheduler checks overdue jobs immediately after gateway startup. One-shots fire
+at most once; recurring schedules collapse missed intervals into one catch-up
+run and then advance. This makes a one-shot cron job the durable choice for a
+notification that must still be discovered after a gateway restart. It does
+not make an already-running agent execution replay-safe: an execution
+interrupted by restart is recorded as `unknown` and is not automatically
+retried.
 
 ### Execution history
 
