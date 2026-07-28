@@ -2838,28 +2838,44 @@ def _resolve_tool_policy_for_source(
         thread_id=getattr(source, "thread_id", None),
         parent_id=getattr(source, "parent_chat_id", None),
     )
-    if key is None or channel_override is None or channel_override.tool_policy is None:
+    if key is None or channel_override is None:
         return base_policy
+
+    raw_channel_policy = channel_override.tool_policy
+    raw_channel_profile_policies = channel_override.profile_tool_policies
+    raw_channel_profile_policy = (
+        raw_channel_profile_policies.get(profile)
+        if isinstance(raw_channel_profile_policies, dict)
+        else None
+    )
+    policy_path = f"platforms.discord.channel_overrides.{key}.tool_policy"
+    if isinstance(raw_channel_profile_policy, dict):
+        raw_channel_policy = raw_channel_profile_policy
+        policy_path = (
+            f"platforms.discord.channel_overrides.{key}."
+            f"profile_tool_policies.{profile}"
+        )
+    if raw_channel_policy is None:
+        return base_policy
+
     if authority == "managed_only":
         try:
             from hermes_cli import managed_scope
-            paths = (
-                f"platforms.discord.channel_overrides.{key}.tool_policy",
-                f"platforms.discord.channel_overrides.{key}.tool_policy.mode",
-                f"discord.channel_overrides.{key}.tool_policy",
-                f"discord.channel_overrides.{key}.tool_policy.mode",
-            )
+            legacy_policy_path = policy_path.removeprefix("platforms.")
+            paths = (policy_path, f"{policy_path}.mode",
+                     legacy_policy_path, f"{legacy_policy_path}.mode")
             if not any(managed_scope.is_key_managed(path) for path in paths):
                 logger.warning(
-                    "Ignoring unmanaged Discord tool_policy override for channel %s",
-                    key,
+                    "Ignoring unmanaged Discord tool policy override for "
+                    "channel %s profile %s",
+                    key, profile,
                 )
                 return base_policy
         except Exception:
             return base_policy
     resolved = parse_tool_policy(
-        channel_override.tool_policy,
-        source=f"platforms.discord.channel_overrides.{key}.tool_policy",
+        raw_channel_policy,
+        source=policy_path,
         fallback=base_policy,
     )
     return resolved if resolved.valid else base_policy

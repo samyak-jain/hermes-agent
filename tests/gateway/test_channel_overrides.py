@@ -95,6 +95,9 @@ class TestGetChannelOverride:
             model="openrouter/healer-alpha",
             provider="openrouter",
             system_prompt="You are a summarizer.",
+            profile_tool_policies={
+                "operator": {"mode": "denylist", "tools": ["delegate_task"]}
+            },
         )
         config = GatewayConfig(
             platforms={
@@ -109,6 +112,9 @@ class TestGetChannelOverride:
         assert result.model == "openrouter/healer-alpha"
         assert result.provider == "openrouter"
         assert result.system_prompt == "You are a summarizer."
+        assert result.profile_tool_policies == {
+            "operator": {"mode": "denylist", "tools": ["delegate_task"]}
+        }
 
     def test_returns_override_when_chat_id_is_int_like(self):
         """Caller may pass str(chat_id); override keys are normalized to str."""
@@ -268,6 +274,106 @@ class TestChannelToolPolicy:
         assert policy.mode == "denylist"
         assert policy.allows("terminal")
         assert not policy.allows("delegate_task")
+
+    def test_managed_channel_profile_policy_preserves_profile_authority(
+        self, monkeypatch
+    ):
+        cfg = self._config()
+        cfg["agent"]["profile_tool_policies"] = {
+            "vegapunk": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
+        trusted = cfg["platforms"]["discord"]["channel_overrides"]["trusted"]
+        trusted["tool_policy"] = {
+            "mode": "allowlist",
+            "tools": ["memory", "cronjob"],
+        }
+        trusted["profile_tool_policies"] = {
+            "vegapunk": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda path: (
+                "profile_tool_policies.vegapunk" in path
+                or "channel_overrides.trusted.tool_policy" in path
+            ),
+        )
+
+        lena_trusted = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="trusted",
+            chat_type="group",
+            profile="default",
+        )
+        lena_other = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="other",
+            chat_type="group",
+            profile="default",
+        )
+        vegapunk_trusted = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="trusted",
+            chat_type="group",
+            profile="vegapunk",
+        )
+        vegapunk_other = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="other",
+            chat_type="group",
+            profile="vegapunk",
+        )
+
+        lena_trusted_policy = _resolve_tool_policy_for_source(cfg, lena_trusted)
+        lena_other_policy = _resolve_tool_policy_for_source(cfg, lena_other)
+        vegapunk_trusted_policy = _resolve_tool_policy_for_source(
+            cfg, vegapunk_trusted
+        )
+        vegapunk_other_policy = _resolve_tool_policy_for_source(
+            cfg, vegapunk_other
+        )
+
+        assert lena_trusted_policy.allows("cronjob")
+        assert not lena_trusted_policy.allows("terminal")
+        assert not lena_other_policy.allows("cronjob")
+        assert vegapunk_trusted_policy.allows("cronjob")
+        assert vegapunk_trusted_policy.allows("terminal")
+        assert not vegapunk_trusted_policy.allows("delegate_task")
+        assert vegapunk_other_policy.allows("cronjob")
+        assert vegapunk_other_policy.allows("terminal")
+        assert not vegapunk_other_policy.allows("delegate_task")
+
+    def test_unmanaged_channel_profile_policy_cannot_elevate(
+        self, monkeypatch
+    ):
+        cfg = self._config()
+        cfg["platforms"]["discord"]["channel_overrides"]["trusted"][
+            "profile_tool_policies"
+        ] = {
+            "vegapunk": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda path: "channel_overrides.trusted.tool_policy" in path,
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="trusted",
+            profile="vegapunk",
+        )
+
+        policy = _resolve_tool_policy_for_source(cfg, source)
+
+        assert policy.mode == "allowlist"
+        assert not policy.allows("terminal")
 
     def test_invalid_channel_policy_falls_back_to_restricted(self, monkeypatch):
         cfg = self._config()
