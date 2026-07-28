@@ -30,6 +30,8 @@ SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    monkeypatch.delenv("HERMES_MANAGED", raising=False)
     from hermes_cli import web_server
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
@@ -56,6 +58,26 @@ class TestSoulWriteDurability:
         r = client.put("/api/profiles/demo/soul", json={"content": "# New\n"})
 
         assert r.status_code == 200, r.text
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == "# New\n"
+
+    def test_versioned_put_rejects_a_stale_editor(self, client, profile_dir: Path):
+        (profile_dir / "SOUL.md").write_text(SOUL, encoding="utf-8")
+        original = client.get("/api/profiles/demo/soul")
+        assert original.status_code == 200, original.text
+        original_version = original.json()["version"]
+
+        saved = client.put(
+            "/api/profiles/demo/soul",
+            json={"content": "# New\n", "expected_version": original_version},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["version"] != original_version
+
+        stale = client.put(
+            "/api/profiles/demo/soul",
+            json={"content": "# Stale\n", "expected_version": original_version},
+        )
+        assert stale.status_code == 409
         assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == "# New\n"
 
     def test_put_creates_soul_when_absent(self, client, profile_dir: Path):

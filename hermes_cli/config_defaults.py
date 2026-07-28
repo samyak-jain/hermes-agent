@@ -22,6 +22,14 @@ DEFAULT_CONFIG = {
         "editable_paths": [],
         "guarded_paths": [],
     },
+    # Service-gated broker that can read and replace only the active profile's
+    # SOUL.md. Authorization and safety ceilings remain operator-owned.
+    "soul_edit": {
+        "enabled": False,
+        "require_approval": True,
+        "max_bytes": 65_536,
+        "read_only_profiles": [],
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; use DELETE or TRUNCATE for weak-fsync/shared filesystems
     # after an offline migration. TRUNCATE avoids a directory mutation per commit.

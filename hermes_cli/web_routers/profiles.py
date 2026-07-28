@@ -1051,42 +1051,80 @@ async def delete_profile_endpoint(name: str):
 
 @router.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    if soul_path.exists():
-        try:
-            return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
-    return {"content": "", "exists": False}
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.soul import SoulError, read_soul
+
+    profile_dir = _resolve_profile_dir(name)
+    token = set_hermes_home_override(profile_dir)
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        raw_config = read_raw_config() or {}
+        soul_config = dict(raw_config)
+        soul_config["soul_edit"] = {
+            **DEFAULT_CONFIG["soul_edit"],
+            **(
+                raw_config.get("soul_edit")
+                if isinstance(raw_config.get("soul_edit"), dict)
+                else {}
+            ),
+        }
+        soul_config = apply_managed_overlay(soul_config)
+        return read_soul(home=profile_dir, config=soul_config)
+    except SoulError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        reset_hermes_home_override(token)
 
 
 @router.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    try:
-        from utils import atomic_write_text
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.soul import SoulConflict, SoulError, read_soul, update_soul
 
-        # PUT replaces the whole persona document from the dashboard editor.
-        # A bare write_text() truncates SOUL.md before the new body lands, and
-        # the paired GET above reports an unreadable file as
-        # ``{"content": "", "exists": False}`` -- so an interrupted save shows
-        # up as "your persona was never set" and the editor's next Save
-        # persists that empty document over it.
-        #
-        # preserve_mode carries an existing file's permission bits and owner
-        # across the replace. create_mode=0o644 covers the first save: named
-        # profiles seed SOUL.md at the umask default (hermes_cli.profiles
-        # chmods only .env to 0600), and SOUL.md is not a secret. (The default
-        # profile's runtime seeder does run it through _secure_file, but that
-        # seeder fires on every load_config, so the file already exists there
-        # and preserve_mode keeps whatever mode it set.)
-        atomic_write_text(
-            soul_path, body.content, preserve_mode=True, create_mode=0o644
+    profile_dir = _resolve_profile_dir(name)
+    token = set_hermes_home_override(profile_dir)
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        raw_config = read_raw_config() or {}
+        soul_config = dict(raw_config)
+        soul_config["soul_edit"] = {
+            **DEFAULT_CONFIG["soul_edit"],
+            **(
+                raw_config.get("soul_edit")
+                if isinstance(raw_config.get("soul_edit"), dict)
+                else {}
+            ),
+        }
+        soul_config = apply_managed_overlay(soul_config)
+        expected_version = body.expected_version
+        if expected_version is None:
+            expected_version = read_soul(
+                home=profile_dir, config=soul_config
+            )["version"]
+        result = update_soul(
+            home=profile_dir,
+            content=body.content,
+            expected_version=expected_version,
+            reason="Operator used the dashboard profile SOUL editor.",
+            actor="dashboard-profile-editor",
+            config=soul_config,
         )
-    except OSError as e:
+        return {"ok": True, **result}
+    except SoulConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except SoulError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
-    return {"ok": True}
+    finally:
+        reset_hermes_home_override(token)
 
 
 @router.put("/api/profiles/{name}/description")

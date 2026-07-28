@@ -136,6 +136,8 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 # OUTPUT_DIR — the documented escape hatch existing tests/embedders use)
 # is distinguishable from the constants merely being stale.
 _IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
+_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
 
 
 def _current_cron_store() -> _CronStorePaths:
@@ -189,6 +191,20 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def _current_ticker_file(*, success: bool) -> Path:
+    """Resolve a profile-local ticker marker without breaking test overrides."""
+    configured = TICKER_SUCCESS_FILE if success else TICKER_HEARTBEAT_FILE
+    imported = (
+        _IMPORT_TICKER_SUCCESS_FILE
+        if success
+        else _IMPORT_TICKER_HEARTBEAT_FILE
+    )
+    # Preserve the long-standing module-constant monkeypatch surface.
+    if configured != imported:
+        return configured
+    return _current_cron_store().cron_dir / configured.name
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -1140,14 +1156,13 @@ def record_ticker_heartbeat(success: bool = False) -> None:
 
     Best-effort: a write failure must never disrupt the tick loop.
     """
-    store = _current_cron_store()
     try:
-        _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
+        _atomic_write_epoch(_current_ticker_file(success=False))
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(store.cron_dir / "ticker_last_success")
+            _atomic_write_epoch(_current_ticker_file(success=True))
         except Exception:
             pass
 
@@ -1170,8 +1185,7 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     scoped to the active profile — critical under multiplex_profiles where
     ``hermes cron status`` must report per-profile liveness (#69377).
     """
-    store = _current_cron_store()
-    return _epoch_file_age(store.cron_dir / "ticker_heartbeat")
+    return _epoch_file_age(_current_ticker_file(success=False))
 
 
 def get_ticker_success_age() -> Optional[float]:
@@ -1181,8 +1195,7 @@ def get_ticker_success_age() -> Optional[float]:
     scoped to the active profile — critical under multiplex_profiles where
     ``hermes cron status`` must report per-profile liveness (#69377).
     """
-    store = _current_cron_store()
-    return _epoch_file_age(store.cron_dir / "ticker_last_success")
+    return _epoch_file_age(_current_ticker_file(success=True))
 
 
 def record_catch_up_occurrence() -> None:

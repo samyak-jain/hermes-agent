@@ -40,6 +40,11 @@ Cron jobs are fired by the gateway's background ticker thread, which ticks every
 
 If you're expecting jobs to fire automatically, you need a running gateway (`hermes gateway` for foreground, or `hermes gateway start` for the installed service). For one-off debugging, you can manually trigger a tick with `hermes cron tick`.
 
+With `gateway.multiplex_profiles: true`, run only the default profile's gateway.
+That one process owns an isolated ticker for the default profile and every
+valid named profile. Do not start a named profile's standalone gateway merely
+to make its cron jobs run.
+
 ### Check 4: Check the system clock and timezone
 
 Jobs use the local timezone. If your machine's clock is wrong or in a different timezone than expected, jobs will fire at the wrong times. Verify:

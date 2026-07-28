@@ -129,6 +129,34 @@ The broker policy cannot edit itself. Delegated children and cron should deny
 the `config` tool. No raw configuration file needs to be mounted into their
 execution sandbox.
 
+### Self-SOUL broker
+
+Managed deployments can separately grant a top-level profile agent safe
+access to its own `SOUL.md`:
+
+```yaml
+soul_edit:
+  enabled: true
+  require_approval: true
+  max_bytes: 65536
+  read_only_profiles: []
+```
+
+This policy only activates the service-gated `soul` tool when its standalone
+toolset is also enabled. The tool exposes `read`, `update`, `history`, and
+`rollback`; it never accepts a profile or filesystem path. Hermes derives the
+active profile, rejects symlinks and non-regular files, validates UTF-8 and
+the configured byte ceiling, requires compare-and-swap versions for writes,
+uses atomic replacement, writes metadata-only audit records, and retains five
+restorable snapshots.
+
+`require_approval` defaults to `true`. Set it to `false` only as an explicit
+operator decision. `read_only_profiles` accepts profile names or `*`.
+Distribution-owned SOUL files are also read-only. The `config` broker cannot
+inspect or modify `soul_edit`, so an agent cannot enable or weaken its own
+authorization policy. Delegated children and cron should not receive the
+`soul` tool.
+
 Secrets remain outside this surface. The broker rejects credential-shaped
 paths and values; use the relevant authentication or secret-management flow.
 The one structured exception is `mcp_servers.<name>.env`: an operator-directed
@@ -426,6 +454,22 @@ When `ssh_systemd_run` is enabled, each foreground command receives a remote
 `RuntimeMaxSec` deadline and `KillMode=control-group`; killing or timing out the
 local SSH client also stops the remote unit. Background commands become leased
 transient services and are stopped when `ssh_background_ttl_seconds` elapses.
+Hermes resolves the remote shell and systemd utilities to absolute paths before
+launch, disables systemd's command-line environment expansion, and accepts the
+launch only after receiving a numeric remote PID. A unit that has already
+failed returns its actual nonzero status and a redacted diagnostic; its process
+session ID remains available to `process(action="wait")` and
+`process(action="log")`.
+
+:::caution Remote completion watchers do not survive a Hermes restart
+The transient SSH unit may continue running on the remote host, but Hermes does
+not currently reconstruct a remote `process` registry entry or its
+`notify_on_complete` delivery watcher after the gateway/CLI process restarts.
+Use a persisted one-shot cron job when the wake-up itself must survive a gateway
+restart. `notify_on_complete` is reliable only while the originating Hermes
+process remains alive.
+:::
+
 This mode requires a remote systemd service manager and permission to create
 transient units.
 

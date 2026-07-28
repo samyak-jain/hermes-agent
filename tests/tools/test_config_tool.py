@@ -110,6 +110,7 @@ def test_inspect_reports_effective_source_without_exposing_policy(broker_home: P
     assert by_path["model.default"]["editable"] is False
     assert by_path["model.default"]["classification"] == "operator_managed"
     assert not any(item["path"].startswith("agent_config.") for item in result["settings"])
+    assert not any(item["path"].startswith("soul_edit.") for item in result["settings"])
 
 
 def test_unmanaged_mode_exposes_every_recognized_non_secret_leaf(
@@ -140,6 +141,16 @@ def test_unmanaged_mode_rejects_internal_metadata(broker_home: Path):
             path="_config_version",
             value=99,
             reason="operator asked",
+        )
+
+
+def test_config_broker_cannot_modify_soul_access_policy(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="SOUL access policy"):
+        prepare_change(
+            operation="set",
+            path="soul_edit.enabled",
+            value=True,
+            reason="attempt self-enablement",
         )
 
 

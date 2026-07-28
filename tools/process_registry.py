@@ -1259,6 +1259,7 @@ class ProcessRegistry:
                 log_path=log_path,
                 pid_path=pid_path,
                 exit_path=exit_path,
+                cwd=cwd,
                 ttl_seconds=getattr(
                     env, "background_ttl_seconds", MAX_ACTIVE_PROCESS_AGE
                 ),
@@ -1275,29 +1276,50 @@ class ProcessRegistry:
             )
 
         try:
-            result = env.execute(
-                bg_command,
-                timeout=timeout,
-                rewrite_compound_background=False,
-            )
+            launch_background = getattr(env, "launch_background_command", None)
+            if callable(launch_background) and session.backend_id:
+                result = launch_background(bg_command, timeout=timeout)
+            else:
+                result = env.execute(
+                    bg_command,
+                    timeout=timeout,
+                    rewrite_compound_background=False,
+                )
             output = result.get("output", "").strip()
-            # Try to extract the PID from the output
-            for line in output.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    session.pid = int(line)
+            returncode = result.get("returncode", result.get("exit_code", 0))
+            try:
+                returncode = int(returncode)
+            except (TypeError, ValueError):
+                returncode = -1
+
+            # Supervised launchers emit an explicit handshake. Legacy/fallback
+            # backends may emit a single bare PID line. Never scan arbitrary
+            # diagnostic output for digits: systemd status messages contain
+            # numeric fields that are not process identities.
+            output_lines = [line.strip() for line in output.splitlines() if line.strip()]
+            for line in output_lines:
+                if line.startswith("HERMES_BG_PID="):
+                    candidate = line.partition("=")[2].strip()
+                    if candidate.isdigit() and int(candidate) > 0:
+                        session.pid = int(candidate)
                     break
+            else:
+                if len(output_lines) == 1 and output_lines[0].isdigit():
+                    candidate_pid = int(output_lines[0])
+                    if candidate_pid > 0:
+                        session.pid = candidate_pid
+
             # If the wrapper couldn't produce a PID (for example, syntax
             # error or broken redirect), treat it as a failed launch instead
             # of exposing a fake running session.
-            if session.pid is None:
+            if returncode != 0 or session.pid is None:
                 session.exited = True
-                session.exit_code = int(result.get("returncode", -1))
+                session.exit_code = returncode
                 if session.exit_code == 0:
                     session.exit_code = -1
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
-                session.output_buffer = result.get("output", "").strip()
+                session.output_buffer = output
         except Exception as e:
             session.exited = True
             session.exit_code = -1
@@ -1305,7 +1327,21 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
-        if not session.exited:
+        if session.exited:
+            cleanup_backend = getattr(env, "kill_background_unit", None)
+            if callable(cleanup_backend) and session.backend_id:
+                try:
+                    cleanup_backend(session.backend_id)
+                except Exception as cleanup_error:
+                    logger.debug(
+                        "Could not clean failed background unit %s: %s",
+                        session.backend_id,
+                        cleanup_error,
+                    )
+            # A returned session ID is a retrieval contract. Keep failed starts
+            # in the finished registry so process(wait/log) can explain them.
+            self._move_to_finished(session)
+        else:
             # Start a poller thread that periodically reads the log file
             reader = threading.Thread(
                 target=self._env_poller_loop,
@@ -1314,12 +1350,14 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
-
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
+            with self._lock:
+                self._prune_if_needed()
                 self._running[session.id] = session
+            # Publish the session before the poller can observe a fast exit.
+            # Otherwise _move_to_finished() sees no running entry, suppresses
+            # the completion, and the subsequent insertion resurrects an
+            # already-finished session as running.
+            reader.start()
 
         if not session.exited:
             self._write_checkpoint()

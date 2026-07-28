@@ -44,11 +44,15 @@ export function getProfileSoul(name: string): Promise<ProfileSoul> {
   })
 }
 
-export function updateProfileSoul(name: string, content: string): Promise<{ ok: boolean }> {
-  return hermesApi<{ ok: boolean }>({
+export function updateProfileSoul(
+  name: string,
+  content: string,
+  expectedVersion: string
+): Promise<{ ok: boolean; version: string }> {
+  return hermesApi<{ ok: boolean; version: string }>({
     path: `/api/profiles/${encodeURIComponent(name)}/soul`,
     method: 'PUT',
-    body: { content }
+    body: { content, expected_version: expectedVersion }
   })
 }
 
