@@ -225,6 +225,45 @@ class TestCreateJobSnapshot:
         assert job["model"] is None
         assert job["model_snapshot"] == "llama-3.3-70b:free"
 
+    def test_unpinned_profile_job_snapshots_effective_override(
+        self, monkeypatch, tmp_path
+    ):
+        """A configless named profile snapshots its managed model/provider."""
+        jobs = self._isolate_storage(monkeypatch)
+        monkeypatch.setattr(
+            "cron.jobs.get_hermes_home", lambda: tmp_path, raising=True
+        )
+        managed = {
+            "model": {
+                "default": "claude-fable-5",
+                "provider": "anthropic",
+            },
+            "agent": {
+                "profile_models": {
+                    "vegapunk": {
+                        "provider": "anthropic",
+                        "model": "claude-opus-5",
+                    }
+                }
+            },
+        }
+        with patch(
+            "hermes_cli.managed_scope.apply_managed_overlay",
+            return_value=managed,
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="vegapunk",
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "anthropic"},
+        ) as resolver:
+            job = jobs.create_job(prompt="do a thing", schedule="every 1 hour")
+
+        assert job["provider_snapshot"] == "anthropic"
+        assert job["model_snapshot"] == "claude-opus-5"
+        assert resolver.call_args.kwargs["requested"] == "anthropic"
+        assert resolver.call_args.kwargs["target_model"] == "claude-opus-5"
+
     def test_pinned_model_skips_model_snapshot(self, monkeypatch, tmp_path):
         """An explicit model → pinned → no model_snapshot captured."""
         jobs = self._isolate_storage(monkeypatch)
