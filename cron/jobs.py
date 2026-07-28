@@ -982,33 +982,55 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _load_effective_snapshot_config() -> Dict[str, Any]:
+    """Load agent-owned plus managed config for cron inference snapshots."""
+    import yaml
+    from hermes_cli.config import _expand_env_vars
+
+    cfg: Dict[str, Any] = {}
+    cfg_path = get_hermes_home() / "config.yaml"
+    if cfg_path.exists():
+        with cfg_path.open(encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    try:
+        from hermes_cli import managed_scope
+
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception:
+        pass
+    expanded = _expand_env_vars(cfg)
+    return expanded if isinstance(expanded, dict) else {}
+
+
+def _resolve_profile_snapshot_config() -> Dict[str, Any]:
+    """Return the active profile's shared main-model override, if any."""
+    from hermes_cli.model_routing import resolve_profile_model_config
+    from hermes_cli.profiles import get_active_profile_name
+
+    return resolve_profile_model_config(
+        _load_effective_snapshot_config(),
+        get_active_profile_name() or "default",
+    )
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
-    """Resolve the global default model the same way the cron ticker does.
+    """Resolve the effective profile/default model the same way cron does.
 
     Mirrors the unpinned-model resolution in ``cron/scheduler.py`` ``run_job``:
-    read ``config.yaml`` ``model.default`` (or the ``model`` alias / bare string
-    form), applying the managed-scope overlay and env expansion. Used by
-    ``create_job`` to snapshot the default model for unpinned jobs so a later
-    swap of the global default is detected at fire time (#44585).
+    prefer the active profile's ``agent.profile_models`` entry, then read
+    ``model.default`` (or the ``model`` alias / bare string form), applying the
+    managed-scope overlay and env expansion. Used by ``create_job`` to snapshot
+    the effective model for unpinned jobs so a later swap is detected at fire
+    time (#44585).
 
     Returns the resolved model string, or ``None`` if config is missing/empty
     or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
     """
     try:
-        import yaml
-        from hermes_cli.config import _expand_env_vars
-
-        cfg_path = get_hermes_home() / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with cfg_path.open(encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        try:
-            from hermes_cli import managed_scope
-            cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:
-            pass
-        cfg = _expand_env_vars(cfg)
+        cfg = _load_effective_snapshot_config()
+        profile = _resolve_profile_snapshot_config()
+        if profile.get("model"):
+            return str(profile["model"])
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             return model_cfg.strip() or None
@@ -1059,9 +1081,18 @@ def _compute_provider_model_snapshots(
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            runtime_kwargs = {"requested": None}
+            profile = _resolve_profile_snapshot_config()
+            runtime_kwargs = {
+                "requested": profile.get("provider"),
+                "target_model": (
+                    profile.get("model")
+                    or _resolve_default_model_snapshot()
+                ),
+            }
             if normalized_base_url:
                 runtime_kwargs["explicit_base_url"] = normalized_base_url
+            elif profile.get("base_url"):
+                runtime_kwargs["explicit_base_url"] = profile["base_url"]
             snap = resolve_runtime_provider(**runtime_kwargs)
             snap_provider = str(snap.get("provider") or "").strip().lower()
             provider_snapshot = snap_provider or None

@@ -4499,28 +4499,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # duplicating the whole gateway.  Keep this below session overrides
         # and channel overrides, but above the process-global default.
         if source is not None and isinstance(user_config, dict):
-            agent_config = user_config.get("agent") or {}
-            profile_models = (
-                agent_config.get("profile_models")
-                if isinstance(agent_config, dict)
-                else None
-            )
             profile_name = str(
                 source.profile or self._active_profile_name() or "default"
             )
-            profile_model = (
-                profile_models.get(profile_name)
-                if isinstance(profile_models, dict)
-                else None
+            from hermes_cli.model_routing import resolve_profile_model_config
+
+            profile_model = resolve_profile_model_config(
+                user_config, profile_name
             )
-            if isinstance(profile_model, dict):
+            if profile_model:
                 profile_provider = str(
                     profile_model.get("provider") or ""
                 ).strip()
                 profile_model_name = str(
-                    profile_model.get("model")
-                    or profile_model.get("default")
-                    or ""
+                    profile_model.get("model") or ""
                 ).strip()
                 if profile_provider:
                     runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(

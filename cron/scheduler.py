@@ -3468,9 +3468,10 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > HERMES_MODEL env >
-        # config.yaml ``model:`` (string or ``{default: ...}``). The per-job
-        # value is intentionally re-read from storage every tick so a
+        # Model resolution precedence: per-job override > active-profile
+        # ``agent.profile_models`` override > HERMES_MODEL env > config.yaml
+        # ``model:`` (string or ``{default: ...}`). The per-job value is
+        # intentionally re-read from storage every tick so a
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
@@ -3478,34 +3479,45 @@ def run_job(
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
         _model_cfg = {}
+        _profile_model_cfg = {}
         try:
             import yaml
             _cfg_path = str(_get_hermes_home() / "config.yaml")
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
-                # Managed scope: a scheduled job must honor administrator-pinned
-                # model / reasoning / toolsets / provider_routing too. This loader
-                # builds its own dict, so overlay managed values via the shared
-                # helper (fail-open, no-op when no managed scope).
-                try:
-                    from hermes_cli import managed_scope
-                    _cfg = managed_scope.apply_managed_overlay(_cfg)
-                except Exception:
-                    pass
-                _cfg = _expand_env_vars(_cfg)
-                # Coerce null/missing to {} so a falsy default never
-                # clobbers an already-resolved env value with ``None``.
-                _model_cfg = _cfg.get("model") or {}
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        # Mirror the CLI/oneshot resolution: prefer ``default``,
-                        # accept a ``model`` alias, overwrite only when truthy.
-                        _default = _model_cfg.get("default") or _model_cfg.get("model")
-                        if _default:
-                            model = _default
+            # Managed scope must be applied even when a named profile has no
+            # agent-owned config.yaml. The host overlay is the only source of
+            # truth in that valid configuration.
+            try:
+                from hermes_cli import managed_scope
+                _cfg = managed_scope.apply_managed_overlay(_cfg)
+            except Exception:
+                pass
+            _cfg = _expand_env_vars(_cfg)
+            # Coerce null/missing to {} so a falsy default never clobbers an
+            # already-resolved env value with ``None``.
+            _model_cfg = _cfg.get("model") or {}
+            if not job.get("model"):
+                if isinstance(_model_cfg, str):
+                    model = _model_cfg
+                elif isinstance(_model_cfg, dict):
+                    # Mirror the CLI/oneshot resolution: prefer ``default``,
+                    # accept a ``model`` alias, overwrite only when truthy.
+                    _default = _model_cfg.get("default") or _model_cfg.get("model")
+                    if _default:
+                        model = _default
+
+                from hermes_cli.model_routing import (
+                    resolve_profile_model_config,
+                )
+                from hermes_cli.profiles import get_active_profile_name
+
+                _profile_model_cfg = resolve_profile_model_config(
+                    _cfg, get_active_profile_name() or "default"
+                )
+                if _profile_model_cfg.get("model"):
+                    model = _profile_model_cfg["model"]
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -3590,11 +3602,15 @@ def run_job(
         _guard_job_credential_exfil(job)
 
         primary_model_for_drift = model
-        configured_provider_for_drift = (
-            str(_model_cfg.get("provider") or "").strip().lower()
-            if isinstance(_model_cfg, dict)
-            else ""
-        )
+        configured_provider_for_drift = str(
+            _profile_model_cfg.get("provider")
+            or (
+                _model_cfg.get("provider")
+                if isinstance(_model_cfg, dict)
+                else ""
+            )
+            or ""
+        ).strip().lower()
         primary_provider_for_drift = (
             str(job.get("provider") or "").strip().lower()
             or configured_provider_for_drift
@@ -3607,7 +3623,10 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": (
+                    job.get("provider")
+                    or _profile_model_cfg.get("provider")
+                ),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -3617,6 +3636,10 @@ def run_job(
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
+            if not job.get("provider"):
+                for key in ("api_mode", "base_url", "max_tokens"):
+                    if _profile_model_cfg.get(key) not in (None, ""):
+                        runtime[key] = _profile_model_cfg[key]
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
                 or primary_provider_for_drift
