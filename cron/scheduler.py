@@ -651,6 +651,7 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    mark_job_dispatch_error,
     mark_job_run,
     save_job_output,
     use_cron_store,
@@ -7851,11 +7852,26 @@ def tick(
             except Exception as submit_err:
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
+                dispatch_error = f"Executor dispatch failed: {submit_err}"
                 finish_execution(
                     execution["id"],
                     success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
+                    error=dispatch_error,
                 )
+                # next_run_at was advanced before dispatch to preserve
+                # at-most-once semantics. A rejected executor submission is
+                # still a terminal attempted dispatch, so mirror the execution
+                # ledger failure into the job's legacy observability fields.
+                # Without this, operators see the exact misleading shape from
+                # t_3bc20d0e: next_run_at moved while last_run_at/last_status
+                # remained null.
+                try:
+                    mark_job_dispatch_error(job_id, dispatch_error)
+                except Exception:
+                    logger.exception(
+                        "Job '%s': failed to persist executor dispatch error",
+                        job.get("name", job_id),
+                    )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

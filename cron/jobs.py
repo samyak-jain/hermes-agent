@@ -2707,6 +2707,34 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
+def mark_job_dispatch_error(job_id: str, error: str) -> bool:
+    """Record a terminal executor-dispatch failure without completing the job.
+
+    ``tick()`` advances recurring schedules before handing work to the executor.
+    If ``submit()`` rejects that handoff, the attempt still needs observable
+    ``last_*`` fields, but it must not increment a finite repeat counter,
+    recompute ``next_run_at``, or remove/disable a one-shot job that never
+    reached ``claim_dispatch()``.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            job["last_run_at"] = _hermes_now().isoformat()
+            job["last_status"] = "error"
+            job["last_error"] = error
+            job["last_delivery_error"] = None
+            save_jobs(jobs)
+            return True
+
+    logger.warning(
+        "mark_job_dispatch_error: job_id %s not found, skipping save",
+        job_id,
+    )
+    return False
+
+
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 

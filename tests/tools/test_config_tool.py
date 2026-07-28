@@ -68,6 +68,14 @@ def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                     "require_approval": False,
                 },
                 "model": {"default": "managed-model"},
+                "agent": {
+                    "profile_models": {
+                        "vegapunk": {
+                            "provider": "anthropic",
+                            "model": "managed-profile-model",
+                        }
+                    }
+                },
             },
             sort_keys=False,
         ),
@@ -202,6 +210,121 @@ def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
             value=False,
             reason="operator asked",
         )
+
+
+def test_parent_mapping_rejection_enumerates_managed_shadowed_leaves(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={
+            "default": "agent-model",
+            "provider": "openrouter",
+        },
+        reason="operator requested a parent model update",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is False
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+    assert result["unshadowed_leaves"] == ["model.provider"]
+    assert "No parent mapping was written" in result["warning"]
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert "model" not in raw
+
+    # The same managed overlay also owns the active profile route. The broker
+    # reports only descendants touched by this parent write, never unrelated
+    # managed leaves.
+    effective = config_module.load_config()
+    assert (
+        effective["agent"]["profile_models"]["vegapunk"]["model"]
+        == "managed-profile-model"
+    )
+
+
+def test_wholly_shadowed_parent_mapping_is_explicitly_refused(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={"default": "agent-model"},
+        reason="replace the managed model through its parent",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is True
+    assert result["unshadowed_leaves"] == []
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+
+
+def test_inspect_mapping_recursively_redacts_sensitive_leaves_and_preserves_shape(
+    broker_home: Path,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "provider": "openrouter",
+        "runtime_options": {
+            "headers": {
+                "Authorization": "Bearer not-a-real-production-token",
+                "X-Label": "public",
+            },
+            "targets": [
+                {"name": "alpha", "client_secret": "also-not-real"},
+                {"name": "beta", "weight": 2},
+            ],
+            "modes": ["fast", "careful"],
+        },
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    options = result["value"]["runtime_options"]
+    assert options["headers"] == {
+        "Authorization": "[REDACTED]",
+        "X-Label": "public",
+    }
+    assert options["targets"] == [
+        {"name": "alpha", "client_secret": "[REDACTED]"},
+        {"name": "beta", "weight": 2},
+    ]
+    assert options["modes"] == ["fast", "careful"]
+    assert result["redacted_paths"] == [
+        "model.runtime_options.headers.Authorization",
+        "model.runtime_options.targets[0].client_secret",
+    ]
+
+
+def test_inspect_sensitive_scalar_returns_precise_refusal(broker_home: Path):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {"client_secret": "not-real"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(
+        AgentConfigError,
+        match=r"Requested scalar 'model\.runtime_options\.client_secret' is sensitive",
+    ):
+        inspect_config("model.runtime_options.client_secret")
 
 
 def test_mcp_env_reference_map_is_structured_and_approval_free(

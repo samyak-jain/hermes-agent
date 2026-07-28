@@ -3,7 +3,7 @@
 import yaml
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -68,3 +68,110 @@ async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
     # switch_model was offloaded to a worker thread, not run on the event loop.
     assert "_fake_switch" in offloaded
     assert result is not None and "nope" in result
+
+
+@pytest.mark.asyncio
+async def test_model_reports_same_effective_managed_profile_route_as_turn_client(
+    tmp_path,
+    monkeypatch,
+):
+    """The /model display and AIAgent construction route share one resolver."""
+    import gateway.run as gateway_run
+
+    profile_home = tmp_path / "profiles" / "vegapunk"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "agent-owned-model",
+                    "provider": "openrouter",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    effective_config = {
+        "model": {
+            "default": "managed-global-model",
+            "provider": "anthropic",
+        },
+        "agent": {
+            "profile_models": {
+                "vegapunk": {
+                    "model": "managed-profile-model",
+                    "provider": "openai-codex",
+                    "api_mode": "codex_responses",
+                }
+            }
+        },
+        "providers": {},
+    }
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: effective_config)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_gateway_model",
+        lambda _config=None: "managed-global-model",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "anthropic",
+            "api_mode": "chat_completions",
+            "api_key": "test-only",
+        },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {
+            "provider": provider,
+            "api_mode": "codex_responses",
+            "api_key": "test-only",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [],
+    )
+
+    runner = _make_runner()
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._last_resolved_model = {}
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._session_key_for_source = lambda _source: (
+        "agent:vegapunk:discord:channel:operator-room"
+    )
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+    runner._adapter_for_source = lambda _source: None
+    event = MessageEvent(
+        text="/model",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="operator-room",
+            chat_type="group",
+            user_id="operator",
+            profile="vegapunk",
+        ),
+    )
+
+    output = await runner._handle_model_command(event)
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=event.source,
+        session_key="agent:vegapunk:discord:channel:operator-room",
+        user_config=effective_config,
+    )
+    turn_client_route = runner._resolve_turn_agent_config("", model, runtime)
+
+    assert turn_client_route["model"] == "managed-profile-model"
+    assert turn_client_route["runtime"]["provider"] == "openai-codex"
+    assert (
+        "**Effective route (profile/channel winner):** "
+        "`managed-profile-model` via `openai-codex`"
+    ) in output
+    assert (
+        "**Agent-owned model config (overridden):** "
+        "`agent-owned-model` via `openrouter`"
+    ) in output
