@@ -1317,6 +1317,88 @@ class TestRunJobConfigEnvVarExpansion:
         assert kwargs["provider"] == "anthropic"
         assert kwargs["api_mode"] == "codex_app_server"
 
+    @pytest.mark.parametrize(
+        ("profile_name", "expected_model", "token"),
+        [
+            ("default", "claude-fable-5", "LENA_SUBSCRIPTION_CRON_OK"),
+            ("vegapunk", "claude-opus-5", "VEGAPUNK_SUBSCRIPTION_CRON_OK"),
+        ],
+    )
+    def test_null_model_executes_with_profile_subscription_credential(
+        self, tmp_path, monkeypatch, profile_name, expected_model, token
+    ):
+        """Both profile routes execute through the resolved OAuth credential."""
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        managed = {
+            "model": {
+                "default": "claude-fable-5",
+                "provider": "anthropic",
+                "agent_runtime": "codex_app_server",
+                "codex_app_server": {"adapter": "claude_agent_sdk"},
+            },
+            "agent": {
+                "profile_models": {
+                    "vegapunk": {
+                        "provider": "anthropic",
+                        "model": "claude-opus-5",
+                    }
+                }
+            },
+        }
+        oauth_token = "sk-ant-oat-test-subscription-token"
+        runtime = {
+            "api_key": oauth_token,
+            "base_url": "https://api.anthropic.com",
+            "provider": "anthropic",
+            "api_mode": "codex_app_server",
+            "credential_pool": None,
+        }
+        job = {
+            "id": f"{profile_name}-subscription-null-model",
+            "name": f"{profile_name} subscription null model",
+            "prompt": f"Return exactly {token}",
+            "model": None,
+            "provider": None,
+        }
+        fake_db = MagicMock()
+
+        class ExecutingAgent:
+            def __init__(self, *args, **kwargs):
+                assert kwargs["model"] == expected_model
+                assert kwargs["provider"] == "anthropic"
+                assert kwargs["api_mode"] == "codex_app_server"
+                assert kwargs["api_key"] == oauth_token
+
+            def run_conversation(self, prompt, **kwargs):
+                assert job["prompt"] in prompt
+                return {
+                    "final_response": token,
+                    "completed": True,
+                    "failed": False,
+                }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.managed_scope.apply_managed_overlay",
+                   return_value=managed), \
+             patch("hermes_cli.profiles.get_active_profile_name",
+                   return_value=profile_name), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=runtime), \
+             patch("agent.credential_pool.load_pool") as load_pool, \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent", ExecutingAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == token
+        assert token in output
+        load_pool.assert_not_called()
+
     def test_null_model_uses_bare_global_config(
         self, tmp_path, monkeypatch
     ):
