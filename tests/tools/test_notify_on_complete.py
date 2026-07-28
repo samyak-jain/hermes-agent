@@ -483,6 +483,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
+            exited=False,
+            exit_code=None,
+            output_buffer="",
+            completion_reason="",
             notify_on_complete=False,
             watcher_platform="",
             watcher_chat_id="",
@@ -500,6 +504,72 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     return terminal_tool_module
+
+
+def test_failed_background_start_returns_diagnostic_without_watcher(
+    monkeypatch, tmp_path,
+):
+    import tools.terminal_tool as terminal_tool_module
+    from tools import process_registry as process_registry_module
+    from types import SimpleNamespace
+
+    config = _silent_bg_base_config(tmp_path)
+    config["env_type"] = "ssh"
+    failed = SimpleNamespace(
+        id="proc_failed_start",
+        pid=None,
+        exited=True,
+        exit_code=127,
+        output_buffer=(
+            "bash: command_that_failed: not found\n"
+            "API_KEY=sk-secret-that-must-not-leak"
+        ),
+        completion_reason="failed_start",
+    )
+    pending_before = list(process_registry_module.process_registry.pending_watchers)
+    monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        process_registry_module.process_registry,
+        "spawn_via_env",
+        lambda **kwargs: failed,
+    )
+    monkeypatch.setitem(
+        terminal_tool_module._active_environments,
+        "default",
+        SimpleNamespace(env={}),
+    )
+    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+
+    try:
+        result = json.loads(
+            terminal_tool_module.terminal_tool(
+                command="command_that_failed API_KEY=sk-secret-that-must-not-leak",
+                background=True,
+                notify_on_complete=True,
+            )
+        )
+    finally:
+        terminal_tool_module._active_environments.pop("default", None)
+        terminal_tool_module._last_activity.pop("default", None)
+
+    assert result["status"] == "failed_start"
+    assert result["session_id"] == "proc_failed_start"
+    assert result["pid"] is None
+    assert result["exit_code"] == 127
+    assert result["output"] == ""
+    assert "Background process started" not in json.dumps(result)
+    assert "not found" in result["error"]
+    assert "sk-secret-that-must-not-leak" not in result["error"]
+    assert (
+        process_registry_module.process_registry.pending_watchers
+        == pending_before
+    )
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):

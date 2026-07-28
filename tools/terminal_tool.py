@@ -2547,6 +2547,30 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
+                if proc_session.exited:
+                    from agent.redact import redact_terminal_output
+
+                    diagnostic = (proc_session.output_buffer or "").strip()
+                    if diagnostic:
+                        diagnostic = redact_terminal_output(diagnostic, command)
+                    else:
+                        diagnostic = "Remote background launcher exited before startup"
+                    exit_code = proc_session.exit_code
+                    if exit_code is None or exit_code == 0:
+                        exit_code = -1
+                    return json.dumps(
+                        {
+                            "output": "",
+                            "session_id": proc_session.id,
+                            "pid": proc_session.pid,
+                            "exit_code": exit_code,
+                            "error": diagnostic,
+                            "status": "failed_start",
+                            "completion_reason": proc_session.completion_reason,
+                        },
+                        ensure_ascii=False,
+                    )
+
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,

@@ -748,8 +748,14 @@ class TestSpawnEnvSanitization:
         assert session.pid is None
         assert session.output_buffer == "syntax error"
         fake_thread.start.assert_not_called()
-        # A failed launch must not be exposed as a running/tracked session.
+        # A failed launch must not be exposed as running, but its returned ID
+        # remains retrievable so process(wait/log) can explain the failure.
         assert session.id not in registry._running
+        assert registry.get(session.id) is session
+        waited = registry.wait(session.id, timeout=0)
+        assert waited["status"] == "exited"
+        assert waited["exit_code"] == 2
+        assert waited["completion_reason"] == "failed_start"
 
     def test_spawn_via_env_disables_rewrite_for_bg_wrapper(self, registry):
         class FakeEnv:
@@ -803,6 +809,103 @@ class TestSpawnEnvSanitization:
         assert session.backend_id == "hermes-bg-test"
         assert session.pid == 4321
         fake_thread.start.assert_called_once()
+
+    def test_supervised_launch_failure_cleans_unit_and_retains_diagnostic(
+        self, registry,
+    ):
+        class FakeEnv:
+            background_ttl_seconds = 21600
+
+            def __init__(self):
+                self.cleaned = []
+
+            def build_background_command(self, **kwargs):
+                return "supervised-launch", "hermes-bg-failed"
+
+            def launch_background_command(self, command, **kwargs):
+                assert command == "supervised-launch"
+                return {
+                    "output": "bash: missing_binary: command not found",
+                    "returncode": 127,
+                }
+
+            def kill_background_unit(self, unit):
+                self.cleaned.append(unit)
+
+        env = FakeEnv()
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "missing_binary")
+
+        assert session.exited is True
+        assert session.pid is None
+        assert session.exit_code == 127
+        assert session.completion_reason == "failed_start"
+        assert registry.get(session.id) is session
+        assert env.cleaned == ["hermes-bg-failed"]
+
+    def test_supervised_launcher_rejects_pid_null_false_success(self, registry):
+        class FakeEnv:
+            def build_background_command(self, **kwargs):
+                return "supervised-launch", "hermes-bg-null"
+
+            def launch_background_command(self, command, **kwargs):
+                return {
+                    "output": "HERMES_BG_PID=$\nExecMainStatus=127",
+                    "returncode": 0,
+                }
+
+            def kill_background_unit(self, unit):
+                self.cleaned = unit
+
+        env = FakeEnv()
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "echo never-ran")
+
+        assert session.exited is True
+        assert session.pid is None
+        assert session.exit_code == -1
+        assert registry.get(session.id) is session
+        assert env.cleaned == "hermes-bg-null"
+
+    def test_fast_remote_completion_moves_once_and_notifies_once(self, registry):
+        class FakeEnv:
+            def __init__(self):
+                self.responses = iter(
+                    [
+                        {"output": "benign output\n"},
+                        {"output": "1\n"},
+                        {"output": "0\n"},
+                    ]
+                )
+
+            def execute(self, command, **kwargs):
+                if "nohup bash" in command:
+                    return {"output": "4321\n", "returncode": 0}
+                return next(self.responses)
+
+        captured_target = {}
+
+        class DeferredThread:
+            def __init__(self, target, args, **kwargs):
+                captured_target["target"] = target
+                captured_target["args"] = args
+
+            def start(self):
+                return None
+
+        env = FakeEnv()
+        with patch("tools.process_registry.threading.Thread", DeferredThread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "printf benign")
+            session.notify_on_complete = True
+            with patch("tools.process_registry.time.sleep", return_value=None):
+                captured_target["target"](*captured_target["args"])
+            registry._move_to_finished(session)
+
+        assert session.id not in registry._running
+        assert registry.get(session.id) is session
+        assert session.exit_code == 0
+        assert registry.completion_queue.qsize() == 1
 
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
