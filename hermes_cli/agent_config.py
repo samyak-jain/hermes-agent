@@ -136,6 +136,10 @@ _NEXT_SESSION_PREFIXES = (
 class AgentConfigError(RuntimeError):
     """A validated agent configuration operation was rejected."""
 
+    def __init__(self, message: str, *, details: Optional[dict] = None):
+        super().__init__(message)
+        self.details = dict(details or {})
+
 
 def _matches(path: str, pattern: str) -> bool:
     if pattern.endswith(".*"):
@@ -245,6 +249,48 @@ def _value_looks_secret(value: Any) -> bool:
     return False
 
 
+_REDACTED_VALUE = "[REDACTED]"
+
+
+def _redact_non_secret_view(
+    value: Any,
+    path: str,
+    *,
+    inherited_sensitive: bool = False,
+) -> tuple[Any, list[str]]:
+    """Return a shape-preserving view with every sensitive scalar redacted."""
+    sensitive = inherited_sensitive or _secret_shaped_path(path)
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        redacted: list[str] = []
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            child_value, child_redacted = _redact_non_secret_view(
+                child,
+                child_path,
+                inherited_sensitive=sensitive,
+            )
+            out[key] = child_value
+            redacted.extend(child_redacted)
+        return out, redacted
+    if isinstance(value, list):
+        out = []
+        redacted: list[str] = []
+        for index, child in enumerate(value):
+            child_path = f"{path}[{index}]"
+            child_value, child_redacted = _redact_non_secret_view(
+                child,
+                child_path,
+                inherited_sensitive=sensitive,
+            )
+            out.append(child_value)
+            redacted.extend(child_redacted)
+        return out, redacted
+    if sensitive or _value_looks_secret(value):
+        return _REDACTED_VALUE, [path]
+    return value, []
+
+
 def _is_mcp_env_reference_map(path: str, value: Any) -> bool:
     """Accept only name-preserving environment references, never plaintext.
 
@@ -332,6 +378,58 @@ def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     return out
 
 
+def _managed_shadow_report(path: str, value: Any, effective: dict) -> dict:
+    """Describe managed leaves that would override a proposed parent write."""
+    from hermes_cli import managed_scope
+
+    proposed = _flatten(value, path) if isinstance(value, dict) else {path: value}
+    managed_keys = managed_scope.managed_config_keys()
+    shadowed: list[dict[str, Any]] = []
+    shadowed_paths: set[str] = set()
+    marker = object()
+    for managed_path in sorted(managed_keys):
+        overlaps = managed_path in proposed or any(
+            managed_path.startswith(proposed_path + ".")
+            for proposed_path in proposed
+        )
+        if not overlaps:
+            continue
+        effective_value = _nested(effective, managed_path, marker)
+        if effective_value is marker:
+            continue
+        safe_value, _ = _redact_non_secret_view(effective_value, managed_path)
+        shadowed.append(
+            {
+                "path": managed_path,
+                "source": "managed",
+                "effective_value": safe_value,
+            }
+        )
+        shadowed_paths.add(managed_path)
+
+    if not shadowed:
+        return {}
+    unshadowed = sorted(
+        proposed_path
+        for proposed_path in proposed
+        if proposed_path not in shadowed_paths
+        and not any(
+            managed_path.startswith(proposed_path + ".")
+            for managed_path in shadowed_paths
+        )
+    )
+    return {
+        "status": "rejected",
+        "shadowed_leaves": shadowed,
+        "unshadowed_leaves": unshadowed,
+        "wholly_shadowed": not unshadowed,
+        "warning": (
+            "The managed overlay would override the listed leaves. "
+            "No parent mapping was written."
+        ),
+    }
+
+
 def _nested(config: dict, path: str, missing: Any) -> Any:
     node: Any = config
     for part in path.split("."):
@@ -415,25 +513,32 @@ def inspect_config(path: Optional[str] = None) -> dict:
     effective_flat = _flatten(effective)
 
     if path:
-        classification = _assert_path_allowed(path, effective, for_write=False)
         marker = object()
         value = _nested(effective, path, marker)
         if value is marker:
             raise AgentConfigError(f"Configuration leaf '{path}' is not set.")
-        if isinstance(value, dict) or _value_looks_secret(value):
+        if not isinstance(value, (dict, list)) and (
+            _secret_shaped_path(path) or _value_looks_secret(value)
+        ):
             raise AgentConfigError(
-                f"'{path}' cannot be returned through the non-secret configuration view."
+                f"Requested scalar '{path}' is sensitive and cannot be returned "
+                "through the non-secret configuration view."
             )
+        classification = _assert_path_allowed(path, effective, for_write=False)
+        safe_value, redacted_paths = _redact_non_secret_view(value, path)
         source = _source_for(path, raw, managed)
-        return {
+        result = {
             "success": True,
             "path": path,
-            "value": value,
+            "value": safe_value,
             "source": source,
             "editable": source != "managed",
             "classification": classification,
             "apply": _apply_mode(path),
         }
+        if redacted_paths:
+            result["redacted_paths"] = redacted_paths
+        return result
 
     settings = []
     for dotted in sorted(effective_flat):
@@ -613,7 +718,16 @@ def prepare_change(
         raise AgentConfigError("The change reason appears to contain credential material.")
     if operation == "set":
         value = _normalize_structured_input(path, value, effective)
-        _validate_value(path, value)
+        shadow_report = _managed_shadow_report(path, value, effective)
+        try:
+            _validate_value(path, value)
+        except AgentConfigError as exc:
+            if shadow_report:
+                raise AgentConfigError(
+                    str(exc),
+                    details=shadow_report,
+                ) from exc
+            raise
         if _value_looks_secret(value) and not _is_mcp_env_reference_map(path, value):
             raise AgentConfigError(
                 "The proposed value resembles credential material. Use the "

@@ -215,6 +215,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
             raise ValueError("executor rejected")
 
     finished = []
+    marked = []
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
@@ -225,6 +226,11 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
     monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_dispatch_error",
+        lambda job_id, error: marked.append((job_id, error)),
+    )
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
@@ -234,7 +240,42 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
             "error": "Executor dispatch failed: executor rejected",
         })
     ]
+    assert marked == [
+        ("submit-fail", "Executor dispatch failed: executor rejected")
+    ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_dispatch_failure_records_error_without_consuming_schedule(
+    monkeypatch,
+    tmp_path,
+):
+    import cron.jobs as jobs
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    job = jobs.create_job(
+        prompt="retry after executor recovery",
+        schedule="every 5m",
+        repeat=2,
+    )
+    original_completed = job["repeat"]["completed"]
+    assert jobs.advance_next_run(job["id"]) is True
+    advanced = jobs.list_jobs(include_disabled=True)[0]
+
+    assert advanced["last_run_at"] is None
+    assert advanced["last_status"] is None
+    assert jobs.mark_job_dispatch_error(job["id"], "executor rejected") is True
+
+    recorded = jobs.list_jobs(include_disabled=True)[0]
+    assert recorded["last_run_at"]
+    assert recorded["last_status"] == "error"
+    assert recorded["last_error"] == "executor rejected"
+    assert recorded["next_run_at"] == advanced["next_run_at"]
+    assert recorded["repeat"]["completed"] == original_completed
+    assert recorded["enabled"] is True
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):

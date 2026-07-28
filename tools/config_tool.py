@@ -118,7 +118,9 @@ def config_tool(
             success=False,
         )
     except AgentConfigError as exc:
-        return tool_error(str(exc), success=False)
+        payload = {"success": False, "error": str(exc)}
+        payload.update(getattr(exc, "details", {}) or {})
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as exc:
         return tool_error(f"Configuration broker failed safely: {exc}", success=False)
 

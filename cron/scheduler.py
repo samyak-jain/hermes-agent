@@ -387,7 +387,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_dispatch_error,
+    mark_job_run,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4594,11 +4602,26 @@ def tick(
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
+                dispatch_error = f"Executor dispatch failed: {submit_err}"
                 finish_execution(
                     execution["id"],
                     success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
+                    error=dispatch_error,
                 )
+                # next_run_at was advanced before dispatch to preserve
+                # at-most-once semantics. A rejected executor submission is
+                # still a terminal attempted dispatch, so mirror the execution
+                # ledger failure into the job's legacy observability fields.
+                # Without this, operators see the exact misleading shape from
+                # t_3bc20d0e: next_run_at moved while last_run_at/last_status
+                # remained null.
+                try:
+                    mark_job_dispatch_error(job_id, dispatch_error)
+                except Exception:
+                    logger.exception(
+                        "Job '%s': failed to persist executor dispatch error",
+                        job.get("name", job_id),
+                    )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

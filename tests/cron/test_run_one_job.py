@@ -11,6 +11,7 @@ the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
 import cron.scheduler as s
+import pytest
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -117,6 +118,78 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+@pytest.mark.parametrize(
+    ("run_result", "run_error", "expected_status"),
+    [
+        ((True, "output", "delivered response", None), None, "ok"),
+        (None, RuntimeError("provider failed"), "error"),
+    ],
+)
+def test_secondary_profile_agent_respond_run_persists_terminal_job_fields(
+    tmp_path,
+    monkeypatch,
+    run_result,
+    run_error,
+    expected_status,
+):
+    """A moved next_run_at must never leave a completed attempt looking unrun."""
+    from cron import jobs
+
+    profile_home = tmp_path / "profiles" / "vegapunk"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(jobs, "CRON_DIR", profile_home / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", profile_home / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", profile_home / "cron" / "output")
+
+    job = jobs.create_job(
+        prompt="check operator relay",
+        schedule="every 5m",
+        name="secondary profile agent response",
+        agent_respond=True,
+        origin={
+            "platform": "discord",
+            "chat_id": "operator-channel",
+            "profile": "vegapunk",
+        },
+    )
+    original_next_run = job["next_run_at"]
+    assert jobs.advance_next_run(job["id"]) is True
+    advanced = jobs.get_job(job["id"])
+    assert advanced["next_run_at"] != original_next_run
+    assert advanced["last_run_at"] is None
+    assert advanced["last_status"] is None
+
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "secondary-execution"},
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "save_job_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: profile_home)
+    if run_error is None:
+        monkeypatch.setattr(s, "run_job", lambda *_args, **_kwargs: run_result)
+    else:
+        def _raise_run_error(*_args, **_kwargs):
+            raise run_error
+
+        monkeypatch.setattr(s, "run_job", _raise_run_error)
+
+    assert s.run_one_job(dict(advanced, execution_id="secondary-execution")) is (
+        expected_status == "ok"
+    )
+
+    completed = jobs.get_job(job["id"])
+    assert completed["last_run_at"] is not None
+    assert completed["last_status"] == expected_status
+    if expected_status == "error":
+        assert "provider failed" in completed["last_error"]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
