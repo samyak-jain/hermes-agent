@@ -2924,6 +2924,10 @@ DEFAULT_CONFIG = {
         # code tools through the selected sandbox without changing the
         # gateway's own terminal backend.
         "terminal": {},
+        # Optional per-profile terminal backends for a multiplexed scheduler.
+        # A matching profile replaces cron.terminal for that profile's jobs;
+        # other profiles retain the default backend and credentials.
+        "profile_terminal": {},
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here

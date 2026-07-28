@@ -3626,10 +3626,16 @@ class AIAgent:
         """
         task_id = getattr(self, "session_id", None) or ""
 
-        # 1. Kill background processes for this task
+        # 1. Kill disposable background processes for this task. A process
+        # created with notify_on_complete=True is an explicit durable wake-up:
+        # keep it registered across this per-turn agent teardown so the
+        # gateway watcher can re-enter the session when it exits.
         try:
             from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
+            process_registry.kill_all(
+                task_id=task_id,
+                preserve_notify_on_complete=True,
+            )
         except Exception:
             pass
 

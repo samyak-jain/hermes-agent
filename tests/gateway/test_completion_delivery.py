@@ -511,6 +511,41 @@ def test_bulk_kill_does_not_consume_discarded_completion_output(monkeypatch):
     assert queued["output"] == "output bulk cleanup does not return\n"
 
 
+def test_turn_cleanup_preserves_notify_on_complete_processes(monkeypatch):
+    registry = ProcessRegistry()
+    durable = ProcessSession(
+        id="proc_durable_wait",
+        command="paseo-handoff wait --agent worker",
+        task_id="vegapunk-turn",
+        started_at=1.0,
+        notify_on_complete=True,
+    )
+    disposable = ProcessSession(
+        id="proc_disposable",
+        command="sleep 999",
+        task_id="vegapunk-turn",
+        started_at=2.0,
+        notify_on_complete=False,
+    )
+    registry._running = {
+        durable.id: durable,
+        disposable.id: disposable,
+    }
+    killed = []
+
+    def fake_kill(session_id, **_kwargs):
+        killed.append(session_id)
+        return {"status": "killed"}
+
+    monkeypatch.setattr(registry, "kill_process", fake_kill)
+
+    assert registry.kill_all(
+        task_id="vegapunk-turn",
+        preserve_notify_on_complete=True,
+    ) == 1
+    assert killed == [disposable.id]
+
+
 def test_unobserved_normal_completion_still_notifies(monkeypatch):
     import tools.process_registry as pr_module
 
