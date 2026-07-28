@@ -23094,6 +23094,148 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+@dataclasses.dataclass
+class _ProfileCronSchedulerRuntime:
+    """One profile-isolated cron provider lifecycle owned by the gateway."""
+
+    profile_name: str
+    profile_home: Path
+    adapters: Any
+    stop_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    ready: threading.Event = dataclasses.field(default_factory=threading.Event)
+    provider: Any = None
+    thread: Optional[threading.Thread] = None
+    startup_error: Optional[BaseException] = None
+
+
+def _run_profile_cron_scheduler(
+    runtime: _ProfileCronSchedulerRuntime,
+    *,
+    runner: "GatewayRunner",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Resolve and run one provider entirely inside its profile scope."""
+    try:
+        with _profile_runtime_scope(runtime.profile_home):
+            from cron.scheduler_provider import (
+                InProcessCronScheduler,
+                resolve_cron_scheduler,
+            )
+
+            # Provider selection reads cron.provider from the active config;
+            # resolving it outside this scope silently applies the default
+            # profile's provider to every multiplexed profile.
+            provider = resolve_cron_scheduler()
+            runtime.provider = provider
+            kwargs = {"adapters": runtime.adapters, "loop": loop}
+            if isinstance(provider, InProcessCronScheduler):
+                kwargs["can_dispatch"] = lambda: not (
+                    runner._draining or runner._external_drain_active
+                )
+            runtime.ready.set()
+            provider.start(runtime.stop_event, **kwargs)
+    except BaseException as exc:
+        runtime.startup_error = exc
+        runtime.ready.set()
+        logger.error(
+            "Cron scheduler for profile '%s' stopped with an error: %s",
+            runtime.profile_name,
+            exc,
+            exc_info=True,
+        )
+
+
+def _start_profile_cron_schedulers(
+    runner: "GatewayRunner",
+    *,
+    loop: asyncio.AbstractEventLoop,
+) -> List[_ProfileCronSchedulerRuntime]:
+    """Start one isolated scheduler for every profile this gateway owns."""
+    from hermes_cli.profiles import profiles_to_serve
+
+    multiplex = bool(getattr(runner.config, "multiplex_profiles", False))
+    profiles = profiles_to_serve(multiplex=multiplex)
+    runtimes: List[_ProfileCronSchedulerRuntime] = []
+    for profile_name, profile_home in profiles:
+        if multiplex:
+            # The multiplex owner is the default gateway slot. Named profile
+            # adapters are created by _start_secondary_profile_adapters().
+            adapters = (
+                runner.adapters
+                if profile_name == "default"
+                else runner._profile_adapters.get(profile_name, {})
+            )
+        else:
+            # A standalone named-profile gateway still owns runner.adapters.
+            adapters = runner.adapters
+
+        runtime = _ProfileCronSchedulerRuntime(
+            profile_name=profile_name,
+            profile_home=Path(profile_home).resolve(),
+            adapters=adapters,
+        )
+        runtime.thread = threading.Thread(
+            target=_run_profile_cron_scheduler,
+            kwargs={"runtime": runtime, "runner": runner, "loop": loop},
+            daemon=True,
+            name=f"cron-scheduler-{profile_name}",
+        )
+        runtime.thread.start()
+        runtimes.append(runtime)
+    return runtimes
+
+
+async def _stop_profile_cron_schedulers(
+    runtimes: List[_ProfileCronSchedulerRuntime],
+) -> None:
+    """Stop every profile provider, then cooperatively await every thread."""
+    for runtime in runtimes:
+        runtime.stop_event.set()
+    # Shutdown can race startup immediately after thread.start(). Provider
+    # resolution is local/config-only, so give each thread a short chance to
+    # publish its provider before invoking every provider's eager stop hook.
+    await asyncio.gather(
+        *(
+            asyncio.to_thread(runtime.ready.wait, 5.0)
+            for runtime in runtimes
+            if not runtime.ready.is_set()
+        )
+    )
+    for runtime in runtimes:
+        provider = runtime.provider
+        if provider is None:
+            continue
+        try:
+            with _profile_runtime_scope(runtime.profile_home):
+                provider.stop()
+        except Exception as exc:
+            logger.debug(
+                "Cron provider stop() error for profile '%s': %s",
+                runtime.profile_name,
+                exc,
+            )
+
+    results = await asyncio.gather(
+        *(
+            _await_thread_exit(
+                runtime.thread,
+                timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            )
+            for runtime in runtimes
+        )
+    )
+    for runtime, stopped in zip(runtimes, results):
+        if not stopped:
+            logger.warning(
+                "Cron ticker for profile '%s' did not exit within %.0fs of "
+                "shutdown — an in-flight delivery may have been dropped.",
+                runtime.profile_name,
+                _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            )
+
+
 # Upper bound for cooperatively draining the cron ticker on shutdown. The cron
 # thread delivers via ``safe_schedule_threadsafe`` and blocks on
 # ``future.result(timeout=60)`` (see cron/scheduler.py::_deliver_result), so a
@@ -23586,38 +23728,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             raise SystemExit(runner.exit_code)
         return True
 
-    # Start the background cron scheduler via the resolved provider so
-    # scheduled jobs fire automatically. The built-in provider is the
-    # historical in-process 60s ticker; an external provider (e.g. chronos)
-    # may arm a schedule and return. Pass the event loop so cron delivery can
-    # use live adapters (E2EE support).
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
-    cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
-    # External cron providers own their remote scheduling contract. Only the
-    # in-process ticker polls local due jobs, so only it receives the local
-    # external-drain dispatch gate.
-    if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs=cron_start_kwargs,
-        daemon=True,
-        name="cron-scheduler",
-    )
-    cron_thread.start()
+    # Every served profile owns an independent cron store and therefore needs
+    # an independent scheduler lifecycle. Each thread resolves its provider
+    # inside _profile_runtime_scope so config, jobs, heartbeat, execution
+    # ledger, credentials, skills, and adapters all remain profile-local.
+    gateway_loop = asyncio.get_running_loop()
+    cron_runtimes = _start_profile_cron_schedulers(runner, loop=gateway_loop)
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
-    # Shares cron_stop as the shutdown signal.
+    housekeeping_stop = threading.Event()
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        args=(housekeeping_stop,),
+        kwargs={"adapters": runner.adapters, "loop": gateway_loop},
         daemon=True,
         name="gateway-housekeeping",
     )
@@ -23640,11 +23764,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    if runner.should_exit_with_failure:
-        if runner.exit_reason:
-            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-        return False
-    
     # Stop cron scheduler + housekeeping cleanly.
     #
     # These MUST be awaited cooperatively, not join()ed. A cron delivery in
@@ -23654,16 +23773,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # so that delivery could never run — it timed out and the message was
     # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
     # delivery finishes before we tear down.
-    cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
-        logger.warning(
-            "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
-            "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
-        )
+    housekeeping_stop.set()
+    await _stop_profile_cron_schedulers(cron_runtimes)
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )
@@ -23678,6 +23789,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         shutdown_mcp_servers()
     except Exception:
         pass
+
+    if runner.should_exit_with_failure:
+        if runner.exit_reason:
+            logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+        return False
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)

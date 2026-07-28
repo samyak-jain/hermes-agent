@@ -17,6 +17,7 @@ was filed for. These tests pin per-profile isolation so a stale-branch merge or
 a re-anchor "fix" can't silently flip it back.
 """
 import importlib
+import json
 from pathlib import Path
 
 
@@ -124,3 +125,130 @@ def test_cron_storage_unaffected_when_no_profile(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(jobs)
+
+
+def test_heartbeat_and_execution_ledger_follow_runtime_profile(tmp_path):
+    """Import-time defaults must not funnel multiplex threads into one store."""
+    from cron import executions, jobs
+    from gateway.run import _profile_runtime_scope
+
+    default_home = tmp_path / "hermes"
+    named_home = default_home / "profiles" / "vegapunk"
+    default_home.mkdir()
+    named_home.mkdir(parents=True)
+
+    with _profile_runtime_scope(default_home):
+        jobs.record_ticker_heartbeat(success=True)
+        default_execution = executions.create_execution(
+            "same-job-id",
+            source="builtin",
+        )
+    with _profile_runtime_scope(named_home):
+        jobs.record_ticker_heartbeat(success=True)
+        named_execution = executions.create_execution(
+            "same-job-id",
+            source="builtin",
+        )
+
+    assert (default_home / "cron" / "ticker_heartbeat").is_file()
+    assert (named_home / "cron" / "ticker_heartbeat").is_file()
+    assert (default_home / "cron" / "ticker_last_success").is_file()
+    assert (named_home / "cron" / "ticker_last_success").is_file()
+    assert (default_home / "cron" / "executions.db").is_file()
+    assert (named_home / "cron" / "executions.db").is_file()
+    assert default_execution["id"] != named_execution["id"]
+
+
+def test_scoped_tool_created_overdue_oneshots_run_with_profile_origin_and_adapters(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise create-tool → persisted store → due scan → execution per profile."""
+    from cron import executions, jobs, scheduler
+    from gateway.run import _profile_runtime_scope
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_time import now as hermes_now
+    from tools.cronjob_tools import cronjob
+
+    default_home = tmp_path / "hermes"
+    named_home = default_home / "profiles" / "vegapunk"
+    default_home.mkdir()
+    named_home.mkdir(parents=True)
+    adapter_maps = {
+        "default": {"discord": object()},
+        "vegapunk": {"discord": object()},
+    }
+    ran = []
+
+    def fake_run_one_job(job, *, adapters=None, loop=None, verbose=False):
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home().resolve()
+        profile = "vegapunk" if home == named_home.resolve() else "default"
+        ran.append(
+            {
+                "profile": profile,
+                "home": home,
+                "adapters": adapters,
+                "origin": job.get("origin"),
+                "agent_respond": job.get("agent_respond"),
+            }
+        )
+        scheduler.mark_job_run(job["id"], True)
+        executions.finish_execution(job["execution_id"], success=True)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", fake_run_one_job)
+
+    for profile, home in (
+        ("default", default_home),
+        ("vegapunk", named_home),
+    ):
+        tokens = set_session_vars(
+            platform="discord",
+            chat_id=f"{profile}-channel",
+            session_key=f"agent:{profile}:discord:dm:{profile}-channel",
+            profile=profile,
+        )
+        try:
+            with _profile_runtime_scope(home):
+                created = json.loads(
+                    cronjob(
+                        action="create",
+                        prompt=f"report for {profile}",
+                        schedule=hermes_now().isoformat(),
+                        repeat=1,
+                        deliver="origin",
+                        agent_respond=True,
+                        name=f"{profile} due job",
+                    )
+                )
+                assert created["success"] is True
+                stored = jobs.load_jobs()
+                assert len(stored) == 1
+                # Simulate the gateway being down for hours. Existing
+                # next_run_at remains eligible for exactly one catch-up fire.
+                stored[0]["next_run_at"] = "2020-01-01T00:00:00+00:00"
+                jobs.save_jobs(stored)
+        finally:
+            clear_session_vars(tokens)
+
+    for profile, home in (
+        ("default", default_home),
+        ("vegapunk", named_home),
+    ):
+        with _profile_runtime_scope(home):
+            assert scheduler.tick(
+                verbose=False,
+                adapters=adapter_maps[profile],
+                sync=True,
+            ) == 1
+            assert jobs.load_jobs() == []
+
+    assert {item["profile"] for item in ran} == {"default", "vegapunk"}
+    for item in ran:
+        profile = item["profile"]
+        assert item["adapters"] is adapter_maps[profile]
+        assert item["origin"]["profile"] == profile
+        assert item["origin"]["chat_id"] == f"{profile}-channel"
+        assert item["agent_respond"] is True
