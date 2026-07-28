@@ -120,6 +120,8 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 # OUTPUT_DIR — the documented escape hatch existing tests/embedders use)
 # is distinguishable from the constants merely being stale.
 _IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
+_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
 
 
 def _current_cron_store() -> _CronStorePaths:
@@ -173,6 +175,20 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def _current_ticker_file(*, success: bool) -> Path:
+    """Resolve a profile-local ticker marker without breaking test overrides."""
+    configured = TICKER_SUCCESS_FILE if success else TICKER_HEARTBEAT_FILE
+    imported = (
+        _IMPORT_TICKER_SUCCESS_FILE
+        if success
+        else _IMPORT_TICKER_HEARTBEAT_FILE
+    )
+    # Preserve the long-standing module-constant monkeypatch surface.
+    if configured != imported:
+        return configured
+    return _current_cron_store().cron_dir / configured.name
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -819,12 +835,12 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     Best-effort: a write failure must never disrupt the tick loop.
     """
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(_current_ticker_file(success=False))
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(_current_ticker_file(success=True))
         except Exception:
             pass
 
@@ -843,12 +859,12 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(_current_ticker_file(success=False))
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(_current_ticker_file(success=True))
 
 
 # =============================================================================

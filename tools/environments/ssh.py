@@ -111,6 +111,7 @@ class SSHEnvironment(BaseEnvironment):
         self._task_hash = hashlib.sha256(self.task_id.encode()).hexdigest()[:10]
         self._unit_lock = threading.Lock()
         self._owned_units: set[str] = set()
+        self._remote_executable_cache: dict[str, str] = {}
 
         self.control_dir = _get_control_dir()
         # Keep the socket filename short and deterministic so the full path
@@ -411,6 +412,52 @@ class SSHEnvironment(BaseEnvironment):
     def _new_unit_name(self, kind: str) -> str:
         return f"hermes-{kind}-{self._task_hash}-{uuid.uuid4().hex[:10]}"
 
+    def _resolve_remote_executable(
+        self,
+        name: str,
+        candidates: tuple[str, ...],
+    ) -> str:
+        """Resolve and cache an absolute executable path on the SSH target.
+
+        Transient systemd services commonly receive a much narrower PATH than
+        an interactive SSH login.  In particular, NixOS exposes core tools
+        under ``/run/current-system/sw/bin`` rather than ``/bin``.  Resolve the
+        executable while we still have the login shell, then pass the absolute
+        path into the unit so service startup never depends on that restricted
+        PATH.
+        """
+        cached = self._remote_executable_cache.get(name)
+        if cached:
+            return cached
+
+        quoted_candidates = " ".join(shlex.quote(path) for path in candidates)
+        probe = (
+            f"for _hermes_exe in {quoted_candidates}; do "
+            'if [ -x "$_hermes_exe" ]; then printf \'%s\\n\' "$_hermes_exe"; '
+            "exit 0; fi; done; "
+            f"command -v {shlex.quote(name)} 2>/dev/null || exit 127"
+        )
+        cmd = self._build_ssh_command()
+        cmd.append(probe)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        resolved = (result.stdout or "").strip().splitlines()
+        path = resolved[-1].strip() if resolved else ""
+        if result.returncode != 0 or not path.startswith("/"):
+            diagnostic = (result.stderr or result.stdout or "").strip()
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise RuntimeError(
+                f"SSH target has no absolute path for required executable "
+                f"{name!r}{suffix}"
+            )
+        self._remote_executable_cache[name] = path
+        return path
+
     def _systemd_properties(self, *, runtime_seconds: int) -> list[str]:
         properties = [
             f"--property=RuntimeMaxSec={max(int(runtime_seconds), 1)}s",
@@ -523,6 +570,7 @@ class SSHEnvironment(BaseEnvironment):
         pid_path: str,
         exit_path: str,
         ttl_seconds: int | None = None,
+        cwd: str | None = None,
     ) -> tuple[str, str] | None:
         """Build a leased transient service for a sandbox background process."""
         if not self.systemd_run:
@@ -530,34 +578,163 @@ class SSHEnvironment(BaseEnvironment):
 
         unit = self._new_unit_name("bg")
         ttl = max(int(ttl_seconds or self.background_ttl_seconds), 60)
+        remote_bash = self._resolve_remote_executable(
+            "bash",
+            ("/run/current-system/sw/bin/bash", "/usr/bin/bash", "/bin/bash"),
+        )
+        remote_systemd_run = self._resolve_remote_executable(
+            "systemd-run",
+            (
+                "/run/current-system/sw/bin/systemd-run",
+                "/usr/bin/systemd-run",
+                "/bin/systemd-run",
+            ),
+        )
+        remote_systemctl = self._resolve_remote_executable(
+            "systemctl",
+            (
+                "/run/current-system/sw/bin/systemctl",
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+            ),
+        )
+        remote_sleep = self._resolve_remote_executable(
+            "sleep",
+            (
+                "/run/current-system/sw/bin/sleep",
+                "/usr/bin/sleep",
+                "/bin/sleep",
+            ),
+        )
+        remote_tail = self._resolve_remote_executable(
+            "tail",
+            (
+                "/run/current-system/sw/bin/tail",
+                "/usr/bin/tail",
+                "/bin/tail",
+            ),
+        )
+
+        working_directory = str(cwd or self.cwd or "").strip()
+        if working_directory == "~":
+            working_directory = self._remote_home
+        elif working_directory.startswith("~/"):
+            working_directory = f"{self._remote_home}/{working_directory[2:]}"
+
         inner = (
-            f"set +e; printf '%s\\n' \"$$\" > {shlex.quote(pid_path)}; "
-            f"bash -lc {shlex.quote(command)} "
-            f"> {shlex.quote(log_path)} 2>&1; "
+            f"set +e; printf '%s\\n' \"$BASHPID\" > {shlex.quote(pid_path)}; "
+            f"( eval \"$1\" ) > {shlex.quote(log_path)} 2>&1; "
             "rc=$?; "
             f"printf '%s\\n' \"$rc\" > {shlex.quote(exit_path)}; "
             "exit \"$rc\""
         )
         remote_argv = [
-            "systemd-run",
+            remote_systemd_run,
             "--quiet",
             "--collect",
+            # systemd-run expands $VAR/$$ in command argv by default.  The old
+            # wrapper's "$$" therefore reached Bash as a literal "$", corrupting
+            # the PID file.  The unit shell owns all expansion here.
+            "--expand-environment=no",
             f"--unit={unit}",
             *self._systemd_properties(runtime_seconds=ttl),
-            "bash",
-            "-c",
-            inner,
         ]
-        launch = (
-            f"mkdir -p {shlex.quote(str(Path(log_path).parent))} && "
-            f"{shlex.join(remote_argv)} && "
-            f"for _hermes_wait in $(seq 1 20); do "
-            f"[ -s {shlex.quote(pid_path)} ] && break; sleep 0.1; done; "
-            f"cat {shlex.quote(pid_path)}"
+        if working_directory.startswith("/"):
+            remote_argv.append(f"--working-directory={working_directory}")
+        remote_argv.extend([
+            "--",
+            remote_bash,
+            "-lc",
+            inner,
+            "hermes-background-command",
+            command,
+        ])
+
+        launcher = (
+            "set +e; "
+            f"mkdir -p {shlex.quote(str(Path(log_path).parent))}; "
+            f"rm -f {shlex.quote(log_path)} {shlex.quote(pid_path)} "
+            f"{shlex.quote(exit_path)}; "
+            f"{shlex.join(remote_argv)}; "
+            "_hermes_launch_rc=$?; "
+            'if [ "$_hermes_launch_rc" -ne 0 ]; then '
+            'exit "$_hermes_launch_rc"; fi; '
+            "for _hermes_wait in {1..20}; do "
+            f"[ -s {shlex.quote(pid_path)} ] && break; "
+            f"{shlex.quote(remote_systemctl)} is-active --quiet "
+            f"{shlex.quote(unit)} || break; "
+            f"{shlex.quote(remote_sleep)} 0.1; "
+            "done; "
+            f"if [ ! -s {shlex.quote(pid_path)} ]; then "
+            f"{shlex.quote(remote_systemctl)} show {shlex.quote(unit)} "
+            "--property=ActiveState,SubState,Result,ExecMainStatus "
+            "--no-pager >&2 || true; "
+            "exit 1; fi; "
+            f"IFS= read -r _hermes_pid < {shlex.quote(pid_path)}; "
+            'if [[ ! "$_hermes_pid" =~ ^[0-9]+$ ]] || '
+            '(( _hermes_pid <= 0 )); then '
+            'printf \'Invalid background PID handshake: %s\\n\' '
+            '"$_hermes_pid" >&2; exit 1; fi; '
+            # Give commands that fail during shell startup a brief chance to
+            # publish their exit record before we promise a live background
+            # session. Successful fast commands remain valid and are reaped by
+            # the normal poller.
+            f"{shlex.quote(remote_sleep)} 0.1; "
+            f"if [ -s {shlex.quote(exit_path)} ]; then "
+            f"IFS= read -r _hermes_exit < {shlex.quote(exit_path)}; "
+            'if [[ "$_hermes_exit" =~ ^-?[0-9]+$ ]] && '
+            '(( _hermes_exit != 0 )); then '
+            f"{shlex.quote(remote_tail)} -c 4096 -- "
+            f"{shlex.quote(log_path)} >&2 || true; "
+            'exit "$_hermes_exit"; fi; fi; '
+            "printf 'HERMES_BG_PID=%s\\n' \"$_hermes_pid\""
+        )
+        launch = shlex.join(
+            [remote_bash, "-c", launcher, "hermes-background-launcher"]
         )
         with self._unit_lock:
             self._owned_units.add(unit)
         return launch, unit
+
+    def launch_background_command(self, command: str, *, timeout: int = 10) -> dict:
+        """Launch a prebuilt background unit directly over SSH.
+
+        Calling ``execute()`` here would wrap the launcher in the foreground
+        systemd-run path, creating a nested transient unit with a restricted
+        PATH before the real background service is even started.
+        """
+        self._before_execute()
+        cmd = self._build_ssh_command()
+        cmd.append(command)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            parts = []
+            for part in (exc.stdout, exc.stderr):
+                if isinstance(part, bytes):
+                    part = part.decode("utf-8", errors="replace")
+                if part:
+                    parts.append(part)
+            output = "".join(parts)
+            return {
+                "output": output or "SSH background launcher timed out",
+                "returncode": 124,
+            }
+        output_parts = [
+            part.strip()
+            for part in (result.stdout or "", result.stderr or "")
+            if part and part.strip()
+        ]
+        return {
+            "output": "\n".join(output_parts),
+            "returncode": int(result.returncode),
+        }
 
     def kill_background_unit(self, unit: str) -> None:
         if not unit.startswith("hermes-bg-"):

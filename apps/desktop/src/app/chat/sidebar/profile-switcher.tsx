@@ -348,6 +348,9 @@ function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profile
   const { t } = useI18n()
   const p = t.profiles
   const [content, setContent] = useState('')
+  const [version, setVersion] = useState('')
+  const [editable, setEditable] = useState(true)
+  const [readOnlyReason, setReadOnlyReason] = useState<null | string>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -359,9 +362,19 @@ function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profile
     let cancelled = false
     setLoading(true)
     setContent('')
+    setVersion('')
+    setEditable(true)
+    setReadOnlyReason(null)
 
     getProfileSoul(profileName)
-      .then(soul => !cancelled && setContent(soul.content))
+      .then(soul => {
+        if (!cancelled) {
+          setContent(soul.content)
+          setVersion(soul.version)
+          setEditable(soul.editable)
+          setReadOnlyReason(soul.read_only_reason)
+        }
+      })
       .catch(err => !cancelled && notifyError(err, p.failedLoadSoul))
       .finally(() => !cancelled && setLoading(false))
 
@@ -369,14 +382,14 @@ function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profile
   }, [p, profileName])
 
   const save = async () => {
-    if (!profileName) {
+    if (!profileName || !editable) {
       return
     }
 
     setSaving(true)
 
     try {
-      await updateProfileSoul(profileName, content)
+      await updateProfileSoul(profileName, content, version)
       notify({ kind: 'success', title: p.soulSaved, message: profileName })
       onClose()
     } catch (err) {
@@ -396,6 +409,7 @@ function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profile
           {!loading && profileName && (
             <CodeEditor
               filePath="SOUL.md"
+              disabled={!editable || saving}
               framed
               initialValue={content}
               key={profileName}
@@ -405,11 +419,14 @@ function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profile
             />
           )}
         </div>
+        {!editable && readOnlyReason && (
+          <p className="text-xs text-muted-foreground">{readOnlyReason}</p>
+        )}
         <DialogFooter>
           <Button disabled={saving} onClick={onClose} type="button" variant="ghost">
             {t.common.cancel}
           </Button>
-          <Button disabled={saving || loading} onClick={() => void save()}>
+          <Button disabled={!editable || saving || loading} onClick={() => void save()}>
             {saving ? p.saving : p.saveSoul}
           </Button>
         </DialogFooter>

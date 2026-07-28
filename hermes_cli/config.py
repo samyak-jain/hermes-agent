@@ -1017,6 +1017,16 @@ DEFAULT_CONFIG = {
         "editable_paths": [],
         "guarded_paths": [],
     },
+    # Service-gated broker that can read and replace only the active profile's
+    # SOUL.md. Disabled unless an operator explicitly grants the toolset and
+    # enables this policy. Security ceilings and authorization remain
+    # operator-owned; the agent-facing config broker cannot edit this block.
+    "soul_edit": {
+        "enabled": False,
+        "require_approval": True,
+        "max_bytes": 65_536,
+        "read_only_profiles": [],
+    },
     # SQLite defaults to WAL on local filesystems. Network-filesystem
     # deployments can explicitly select a rollback journal for every Hermes
     # connection (TRUNCATE avoids a directory-entry mutation per commit).

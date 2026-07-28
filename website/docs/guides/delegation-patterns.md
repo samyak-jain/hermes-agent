@@ -25,7 +25,9 @@ For the full feature reference, see [Subagent Delegation](/user-guide/features/d
 - Mechanical multi-step work with logic between steps → `execute_code`
 - Tasks needing user interaction → subagents can't use `clarify`
 - Quick file edits → do them directly
-- Durable long-running work that must survive session closure or process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level delegation is asynchronous but still process-local.
+- Durable work whose wake-up must survive session closure or a Hermes process
+  restart → a persisted `cronjob`. A terminal background notification is
+  process-local even when an SSH/systemd transient unit continues remotely.
 
 ---
 
@@ -221,7 +223,13 @@ delegation:
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
-- **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
+- **Not durable** — top-level delegation runs in the background and posts its
+  result back later, but it remains tied to the owning session and Hermes
+  process. Session closure, `/stop`, `/new`, or a process restart can cancel or
+  strand in-progress work. Use a persisted `cronjob` when the wake-up must
+  survive those boundaries. `terminal(background=True,
+  notify_on_complete=True)` also relies on the originating Hermes process for
+  delivery; remote SSH units are not reattached after restart.
 
 ---
 
