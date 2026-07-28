@@ -3760,7 +3760,19 @@ def run_job(
         # separately loaded instance with a different current_id.
         credential_pool = runtime.get("credential_pool")
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
-        if credential_pool is None and runtime_provider:
+        # Keep the credential selected by the canonical runtime resolver when
+        # it already returned one.  In particular, Anthropic subscription
+        # OAuth is exposed there as the runtime token used to construct the
+        # otherwise-unused compatibility client before ``codex_app_server``
+        # hands the turn to Claude Agent SDK.  Loading a separate pool here
+        # used to acquire an empty legacy ANTHROPIC_TOKEN entry and overwrite
+        # that valid OAuth token, so cron failed before the SDK harness while
+        # an interactive turn with the same route succeeded.
+        if (
+            credential_pool is None
+            and runtime_provider
+            and not runtime.get("api_key")
+        ):
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(runtime_provider)
@@ -3780,7 +3792,12 @@ def run_job(
                 leased_entry = credential_pool.current()
                 if _cron_credential_lease_id and leased_entry is not None:
                     runtime = dict(runtime)
-                    runtime["api_key"] = leased_entry.runtime_api_key
+                    # Never replace a credential already selected by runtime
+                    # resolution with a blank pool entry.  Empty legacy env
+                    # slots may coexist with a usable credential in a pool.
+                    leased_api_key = leased_entry.runtime_api_key
+                    if leased_api_key:
+                        runtime["api_key"] = leased_api_key
                     if leased_entry.runtime_base_url:
                         runtime["base_url"] = leased_entry.runtime_base_url
                     logger.info(
