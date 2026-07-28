@@ -4560,6 +4560,7 @@ class AIAgent:
             pass
 
         task_id = getattr(self, "session_id", None) or ""
+        durable_background_active = False
 
         # 1. Kill disposable background processes for this task. A process
         # created with notify_on_complete=True is an explicit durable wake-up:
@@ -4571,14 +4572,24 @@ class AIAgent:
                 task_id=task_id,
                 preserve_notify_on_complete=True,
             )
+            durable_background_active = process_registry.has_active_processes(
+                task_id
+            )
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
-        try:
-            cleanup_vm(task_id)
-        except Exception:
-            pass
+        # 2. Clean terminal sandbox environments unless a durable background
+        # process still owns one. SSH cleanup stops every transient unit owned
+        # by the environment; doing that here would kill the notifying process
+        # we deliberately preserved above. The registry poller keeps the live
+        # environment active and the ordinary idle reaper cleans it after the
+        # process exits. Full gateway shutdown still uses kill_all's hard
+        # cleanup default, so this does not leak work across process lifetime.
+        if not durable_background_active:
+            try:
+                cleanup_vm(task_id)
+            except Exception:
+                pass
 
         # 3. Clean browser daemon sessions
         try:
