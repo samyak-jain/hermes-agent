@@ -89,11 +89,12 @@ def _cron_event(execution_id="exec_duplicate"):
         "type": "cron_result",
         "execution_id": execution_id,
         "text": "[Automated cron result]",
-        "session_key": "agent:main:telegram:dm:12345:678",
+        "session_key": "agent:vegapunk:telegram:dm:12345:678",
         "platform": "telegram",
         "chat_type": "dm",
         "chat_id": "12345",
         "thread_id": "678",
+        "profile": "vegapunk",
         "message_id": f"cron:{execution_id}",
         "event_metadata": {
             "automated_trigger": "cron_result",
@@ -146,6 +147,7 @@ def test_duplicate_cron_queue_replay_injects_once(monkeypatch, isolated_registry
     delivered = adapter.handle_message.await_args.args[0]
     assert delivered.internal is True
     assert delivered.message_id == "cron:exec_duplicate"
+    assert delivered.source.profile == "vegapunk"
     assert delivered.metadata["automated_trigger"] == "cron_result"
     assert delivered.metadata["cron_job_id"] == "job-1"
 

@@ -9,6 +9,16 @@ from types import SimpleNamespace
 import pytest
 
 
+_PASEO_READINESS_COMMAND = """\
+set -e
+command -v paseo-handoff >/dev/null
+command -v paseo-desktop >/dev/null
+test -s /run/secrets/paseo-host
+paseo-desktop workspace ls >/dev/null
+printf 'paseo-ready\\n'
+"""
+
+
 @pytest.mark.asyncio
 async def test_multiplex_starts_and_stops_one_scoped_scheduler_per_profile(
     tmp_path,
@@ -158,20 +168,22 @@ async def test_single_named_profile_keeps_primary_adapter_map(
 
 
 @pytest.mark.asyncio
-async def test_secondary_cron_executes_with_profile_token_and_operator_terminal(
+async def test_secondary_cron_executes_with_profile_token_and_ready_operator_terminal(
     tmp_path,
     monkeypatch,
 ):
-    """Pin the complete secondary-profile wake-up ownership chain."""
+    """Pin profile discovery, credentials, sandbox, relay, and continuation."""
     import gateway.run as gateway_run
     from agent.secret_scope import get_secret
     from cron import executions, jobs, scheduler, scheduler_provider
+    from gateway.config import Platform
     from gateway.session_context import clear_session_vars, set_session_vars
     from hermes_cli.config import load_config
     from hermes_cli.profiles import get_active_profile_name
     from hermes_time import now as hermes_now
     from tools import terminal_tool
     from tools.cronjob_tools import cronjob
+    from tools.process_registry import process_registry
 
     default_home = tmp_path / "hermes"
     named_home = default_home / "profiles" / "vegapunk"
@@ -220,7 +232,7 @@ cron:
                 prompt="check Paseo completions",
                 schedule=hermes_now().isoformat(),
                 repeat=1,
-                deliver="local",
+                deliver="origin",
                 agent_respond=True,
                 name="secondary profile wake-up regression",
             )
@@ -231,9 +243,33 @@ cron:
     finally:
         clear_session_vars(context_tokens)
 
-    named_adapters = {"discord": object()}
+    named_adapter = SimpleNamespace(
+        supports_async_delivery=True,
+        handle_message=lambda _event: None,
+    )
+    named_adapters = {Platform.DISCORD: named_adapter}
     captured = {}
     tick_finished = threading.Event()
+
+    class ReadyOperatorEnvironment:
+        cwd = "/data"
+
+        def execute(self, command, **_kwargs):
+            # This intentionally rejects the shared-/data false positive:
+            # local handoff state is insufficient unless PATH, the mounted
+            # credential, and a relay-touching round trip are all required.
+            assert command == _PASEO_READINESS_COMMAND
+            return {"output": "paseo-ready\n", "returncode": 0}
+
+    def fake_create_environment(*, env_type, ssh_config=None, **_kwargs):
+        assert env_type == "ssh"
+        assert ssh_config["host"] == "10.0.0.3"
+        return ReadyOperatorEnvironment()
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
 
     def fake_run_one_job(job, *, adapters=None, loop=None, verbose=False):
         profile = get_active_profile_name()
@@ -242,15 +278,38 @@ cron:
         assert scheduler._register_cron_terminal(task_id, cfg) is True
         try:
             terminal = terminal_tool.resolve_task_overrides(task_id)
+            readiness = json.loads(
+                terminal_tool.terminal_tool(
+                    _PASEO_READINESS_COMMAND,
+                    task_id=task_id,
+                    force=True,
+                )
+            )
+            assert readiness["exit_code"] == 0
+            assert readiness["output"] == "paseo-ready"
+            assert scheduler._inject_cron_agent_response(
+                job,
+                readiness["output"],
+                named_adapter,
+                Platform.DISCORD,
+                "vegapunk-operator",
+                None,
+                loop,
+            ) is True
+            continuation = process_registry.completion_queue.get_nowait()
         finally:
             terminal_tool.clear_task_env_overrides(task_id)
+            terminal_tool._active_environments.pop(task_id, None)
         captured.update(
             {
                 "profile": profile,
                 "token": get_secret("BWS_ACCESS_TOKEN"),
                 "ssh_host": terminal.get("ssh_host"),
+                "readiness": readiness["output"].strip(),
                 "origin_profile": (job.get("origin") or {}).get("profile"),
+                "deliver": job.get("deliver"),
                 "agent_respond": job.get("agent_respond"),
+                "continuation_profile": continuation.get("profile"),
                 "adapters": adapters,
             }
         )
@@ -300,7 +359,10 @@ cron:
         "profile": "vegapunk",
         "token": "vegapunk-profile-token",
         "ssh_host": "10.0.0.3",
+        "readiness": "paseo-ready",
         "origin_profile": "vegapunk",
+        "deliver": "origin",
         "agent_respond": True,
+        "continuation_profile": "vegapunk",
         "adapters": named_adapters,
     }
