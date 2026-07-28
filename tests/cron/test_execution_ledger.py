@@ -415,3 +415,42 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_recurring_claim_is_visible_before_completion_fields_land(
+    monkeypatch,
+    tmp_path,
+):
+    """Advancing the schedule must not look like a silently skipped run."""
+    import cron.jobs as jobs
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    job = jobs.create_job(
+        prompt="watch completions",
+        schedule="every 5m",
+        name="watcher",
+    )
+    old_next_run = job["next_run_at"]
+    assert jobs.advance_next_run(job["id"]) is True
+    claimed = executions.create_execution(job["id"], source="builtin")
+
+    in_flight = jobs.list_jobs(include_disabled=True)[0]
+    assert in_flight["next_run_at"] != old_next_run
+    assert in_flight["last_run_at"] is None
+    assert in_flight["last_status"] is None
+    assert in_flight["latest_execution"]["status"] == "claimed"
+    assert in_flight["latest_execution"]["claimed_at"]
+
+    executions.mark_execution_running(claimed["id"])
+    jobs.mark_job_run(job["id"], success=True)
+    executions.finish_execution(claimed["id"], success=True)
+
+    completed = jobs.list_jobs(include_disabled=True)[0]
+    assert completed["last_run_at"]
+    assert completed["last_status"] == "ok"
+    assert completed["latest_execution"]["status"] == "completed"
+    assert completed["latest_execution"]["finished_at"]
