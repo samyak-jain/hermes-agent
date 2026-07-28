@@ -454,6 +454,22 @@ When `ssh_systemd_run` is enabled, each foreground command receives a remote
 `RuntimeMaxSec` deadline and `KillMode=control-group`; killing or timing out the
 local SSH client also stops the remote unit. Background commands become leased
 transient services and are stopped when `ssh_background_ttl_seconds` elapses.
+Hermes resolves the remote shell and systemd utilities to absolute paths before
+launch, disables systemd's command-line environment expansion, and accepts the
+launch only after receiving a numeric remote PID. A unit that has already
+failed returns its actual nonzero status and a redacted diagnostic; its process
+session ID remains available to `process(action="wait")` and
+`process(action="log")`.
+
+:::caution Remote completion watchers do not survive a Hermes restart
+The transient SSH unit may continue running on the remote host, but Hermes does
+not currently reconstruct a remote `process` registry entry or its
+`notify_on_complete` delivery watcher after the gateway/CLI process restarts.
+Use a persisted one-shot cron job when the wake-up itself must survive a gateway
+restart. `notify_on_complete` is reliable only while the originating Hermes
+process remains alive.
+:::
+
 This mode requires a remote systemd service manager and permission to create
 transient units.
 
