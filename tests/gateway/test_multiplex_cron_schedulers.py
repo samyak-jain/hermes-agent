@@ -1,6 +1,7 @@
 """Profile ownership contracts for the multiplexed gateway cron lifecycle."""
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,3 +155,152 @@ async def test_single_named_profile_keeps_primary_adapter_map(
     assert await asyncio.to_thread(started.wait, 3)
     assert seen["adapters"] is primary_adapters
     await gateway_run._stop_profile_cron_schedulers(runtimes)
+
+
+@pytest.mark.asyncio
+async def test_secondary_cron_executes_with_profile_token_and_operator_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    """Pin the complete secondary-profile wake-up ownership chain."""
+    import gateway.run as gateway_run
+    from agent.secret_scope import get_secret
+    from cron import executions, jobs, scheduler, scheduler_provider
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli.config import load_config
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_time import now as hermes_now
+    from tools import terminal_tool
+    from tools.cronjob_tools import cronjob
+
+    default_home = tmp_path / "hermes"
+    named_home = default_home / "profiles" / "vegapunk"
+    default_home.mkdir()
+    named_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    (default_home / ".env").write_text(
+        "BWS_ACCESS_TOKEN=default-profile-token\n",
+        encoding="utf-8",
+    )
+    (named_home / ".env").write_text(
+        "BWS_ACCESS_TOKEN=vegapunk-profile-token\n",
+        encoding="utf-8",
+    )
+    sandbox_ip_file = tmp_path / "sandbox-ip"
+    operator_ip_file = tmp_path / "operator-ip"
+    sandbox_ip_file.write_text("10.0.0.2\n", encoding="utf-8")
+    operator_ip_file.write_text("10.0.0.3\n", encoding="utf-8")
+    config = f"""
+cron:
+  terminal:
+    backend: ssh
+    ssh_host_file: {sandbox_ip_file}
+    ssh_user: root
+  profile_terminal:
+    vegapunk:
+      backend: ssh
+      ssh_host_file: {operator_ip_file}
+      ssh_user: root
+      ssh_key: /run/secrets/operator-ssh-key
+      ssh_known_hosts_file: /run/secrets/operator-known-hosts
+"""
+    (default_home / "config.yaml").write_text(config, encoding="utf-8")
+    (named_home / "config.yaml").write_text(config, encoding="utf-8")
+
+    context_tokens = set_session_vars(
+        platform="discord",
+        chat_id="vegapunk-operator",
+        session_key="agent:vegapunk:discord:dm:vegapunk-operator",
+        profile="vegapunk",
+    )
+    try:
+        with gateway_run._profile_runtime_scope(named_home):
+            created = cronjob(
+                action="create",
+                prompt="check Paseo completions",
+                schedule=hermes_now().isoformat(),
+                repeat=1,
+                deliver="local",
+                agent_respond=True,
+                name="secondary profile wake-up regression",
+            )
+            assert json.loads(created)["success"] is True
+            stored = jobs.load_jobs()
+            stored[0]["next_run_at"] = "2020-01-01T00:00:00+00:00"
+            jobs.save_jobs(stored)
+    finally:
+        clear_session_vars(context_tokens)
+
+    named_adapters = {"discord": object()}
+    captured = {}
+    tick_finished = threading.Event()
+
+    def fake_run_one_job(job, *, adapters=None, loop=None, verbose=False):
+        profile = get_active_profile_name()
+        cfg = load_config()
+        task_id = "cron-profile-routing-regression"
+        assert scheduler._register_cron_terminal(task_id, cfg) is True
+        try:
+            terminal = terminal_tool.resolve_task_overrides(task_id)
+        finally:
+            terminal_tool.clear_task_env_overrides(task_id)
+        captured.update(
+            {
+                "profile": profile,
+                "token": get_secret("BWS_ACCESS_TOKEN"),
+                "ssh_host": terminal.get("ssh_host"),
+                "origin_profile": (job.get("origin") or {}).get("profile"),
+                "agent_respond": job.get("agent_respond"),
+                "adapters": adapters,
+            }
+        )
+        scheduler.mark_job_run(job["id"], True)
+        executions.finish_execution(job["execution_id"], success=True)
+        tick_finished.set()
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", fake_run_one_job)
+
+    class TickOnceProvider:
+        name = "tick-once"
+
+        def start(self, stop_event, *, adapters=None, loop=None, **kwargs):
+            scheduler.tick(
+                verbose=False,
+                adapters=adapters,
+                loop=loop,
+                sync=True,
+            )
+            stop_event.wait(3)
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        scheduler_provider,
+        "resolve_cron_scheduler",
+        lambda: TickOnceProvider(),
+    )
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        adapters={"discord": object()},
+        _profile_adapters={"vegapunk": named_adapters},
+        _draining=False,
+        _external_drain_active=False,
+    )
+
+    runtimes = gateway_run._start_profile_cron_schedulers(
+        runner,
+        loop=asyncio.get_running_loop(),
+    )
+    assert await asyncio.to_thread(tick_finished.wait, 3)
+    await gateway_run._stop_profile_cron_schedulers(runtimes)
+
+    assert captured == {
+        "profile": "vegapunk",
+        "token": "vegapunk-profile-token",
+        "ssh_host": "10.0.0.3",
+        "origin_profile": "vegapunk",
+        "agent_respond": True,
+        "adapters": named_adapters,
+    }

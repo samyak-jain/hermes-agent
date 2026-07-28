@@ -1896,12 +1896,27 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+    def kill_all(
+        self,
+        task_id: str = None,
+        *,
+        preserve_notify_on_complete: bool = False,
+    ) -> int:
+        """Kill matching processes and return the number terminated.
+
+        ``notify_on_complete`` is an explicit request for a background command
+        to outlive the creating turn and wake the session when it exits. Turn
+        teardown therefore opts into ``preserve_notify_on_complete`` while
+        gateway/process shutdown keeps the historical hard-cleanup default.
+        """
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id)
+                and not s.exited
+                and not (
+                    preserve_notify_on_complete and s.notify_on_complete
+                )
             ]
 
         killed = 0
