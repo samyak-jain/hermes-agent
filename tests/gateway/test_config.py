@@ -101,6 +101,16 @@ class TestPlatformConfigRoundtrip:
                     model="openrouter/healer-alpha",
                     provider="openrouter",
                     system_prompt="You are a daily news summarizer.",
+                    tool_policy={
+                        "mode": "allowlist",
+                        "tools": ["memory", "cronjob"],
+                    },
+                    profile_tool_policies={
+                        "operator": {
+                            "mode": "denylist",
+                            "tools": ["delegate_task"],
+                        }
+                    },
                 ),
                 "9876543210": ChannelOverride(
                     model="anthropic/claude-opus-4.6",
@@ -115,6 +125,16 @@ class TestPlatformConfigRoundtrip:
         assert d["channel_overrides"]["9876543210"]["system_prompt"] == "You are a coding assistant."
         restored = PlatformConfig.from_dict(d)
         assert restored.channel_overrides["1234567890"].model == "openrouter/healer-alpha"
+        assert restored.channel_overrides["1234567890"].tool_policy == {
+            "mode": "allowlist",
+            "tools": ["memory", "cronjob"],
+        }
+        assert restored.channel_overrides["1234567890"].profile_tool_policies == {
+            "operator": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
         assert restored.channel_overrides["9876543210"].provider == "anthropic"
 
 
