@@ -154,6 +154,10 @@ class TestForegroundTimeoutCap:
             mock_proc_session = MagicMock()
             mock_proc_session.id = "test-123"
             mock_proc_session.pid = 1234
+            mock_proc_session.exited = False
+            mock_proc_session.exit_code = None
+            mock_proc_session.output_buffer = ""
+            mock_proc_session.completion_reason = ""
 
             mock_registry = MagicMock()
             mock_registry.spawn_local.return_value = mock_proc_session

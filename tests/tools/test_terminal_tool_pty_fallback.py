@@ -33,7 +33,15 @@ def test_terminal_background_disables_pty_for_gh_with_token(monkeypatch, tmp_pat
 
     def fake_spawn_local(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(id="proc_test", pid=1234, notify_on_complete=False)
+        return SimpleNamespace(
+            id="proc_test",
+            pid=1234,
+            exited=False,
+            exit_code=None,
+            output_buffer="",
+            completion_reason="",
+            notify_on_complete=False,
+        )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
@@ -66,7 +74,15 @@ def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypa
 
     def fake_spawn_local(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(id="proc_test", pid=1234, notify_on_complete=False)
+        return SimpleNamespace(
+            id="proc_test",
+            pid=1234,
+            exited=False,
+            exit_code=None,
+            output_buffer="",
+            completion_reason="",
+            notify_on_complete=False,
+        )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
