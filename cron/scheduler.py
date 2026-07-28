@@ -427,10 +427,37 @@ def _cron_archive_prompt(prompt: str, cfg: dict) -> str:
         return "[omitted because redaction failed]"
 
 
-def _register_cron_terminal(session_id: str, cfg: dict) -> bool:
-    """Apply trusted cron.terminal settings to this cron session only."""
+def _resolve_cron_terminal(cfg: dict) -> dict | None:
+    """Resolve the active profile's trusted cron terminal backend.
+
+    ``cron.terminal`` remains the default for ordinary and single-profile
+    schedulers. A multiplexed secondary profile may select a distinct backend
+    through ``cron.profile_terminal.<profile>`` without repointing every cron
+    job or sharing that profile's credentials with the default profile.
+    """
     cron_cfg = (cfg or {}).get("cron") or {}
-    raw = cron_cfg.get("terminal") if isinstance(cron_cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        return None
+
+    raw = cron_cfg.get("terminal")
+    profile_terminals = cron_cfg.get("profile_terminal")
+    if isinstance(profile_terminals, dict):
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or "default"
+        except Exception:
+            profile = "default"
+        profile_raw = profile_terminals.get(profile)
+        if isinstance(profile_raw, dict):
+            raw = profile_raw
+
+    return raw if isinstance(raw, dict) else None
+
+
+def _register_cron_terminal(session_id: str, cfg: dict) -> bool:
+    """Apply the trusted profile-aware cron terminal to this session only."""
+    raw = _resolve_cron_terminal(cfg)
     if raw in (None, {}):
         return False
 

@@ -2549,14 +2549,26 @@ class ProcessRegistry:
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
+        preserve_notify_on_complete: bool = False,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill matching processes and return the number terminated.
+
+        ``notify_on_complete`` is an explicit request for a background command
+        to outlive the creating turn and wake the session when it exits. Turn
+        teardown therefore opts into ``preserve_notify_on_complete`` while
+        gateway/process shutdown keeps the historical hard-cleanup default.
+        ``exclude_ids``, ``source``, and ``consume_output`` retain the stricter
+        abandoned-turn cleanup controls used by upstream.
+        """
         with self._lock:
             targets = [
                 s for s in self._running.values()
                 if (task_id is None or s.task_id == task_id)
                 and s.id not in exclude_ids
                 and not s.exited
+                and not (
+                    preserve_notify_on_complete and s.notify_on_complete
+                )
             ]
 
         killed = 0
