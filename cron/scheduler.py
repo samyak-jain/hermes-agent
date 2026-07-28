@@ -5776,8 +5776,9 @@ def run_job(
             )
 
         # Model resolution precedence: per-job override > cron.model (the
-        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
-        # (string or ``{default: ...}``). The per-job value is intentionally
+        # cron-fleet default) > active-profile
+        # ``agent.profile_models`` override > HERMES_MODEL env > config.yaml
+        # ``model:`` (string or ``{default: ...}`). The per-job value is
         # re-read from storage every tick so a ``hermes cron edit --model``
         # after a failed run takes effect on the next tick — there is no
         # in-memory cache.
@@ -5793,43 +5794,49 @@ def run_job(
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
         _model_cfg = {}
+        _profile_model_cfg = {}
         try:
             from hermes_cli.config import read_user_config_raw
             _cfg_path = str(_get_hermes_home() / "config.yaml")
             if os.path.exists(_cfg_path):
                 _cfg = read_user_config_raw(Path(_cfg_path))
-                # Managed scope: a scheduled job must honor administrator-pinned
-                # model / reasoning / toolsets / provider_routing too. This loader
-                # builds its own dict, so overlay managed values via the shared
-                # helper (fail-open, no-op when no managed scope).
-                try:
-                    from hermes_cli import managed_scope
-                    _cfg = managed_scope.apply_managed_overlay(_cfg)
-                except Exception:
-                    pass
-                _cfg = _expand_env_vars(_cfg)
-                # Coerce null/missing to {} so a falsy default never
-                # clobbers an already-resolved env value with ``None``.
-                _model_cfg = _cfg.get("model") or {}
-                _cron_cfg_for_model = _cfg.get("cron") or {}
-                if isinstance(_cron_cfg_for_model, dict):
-                    _cron_default_model = str(
-                        _cron_cfg_for_model.get("model") or ""
-                    ).strip()
-                    _cron_default_provider = str(
-                        _cron_cfg_for_model.get("model_provider") or ""
-                    ).strip()
-                if not job.get("model"):
-                    if _cron_default_model:
-                        # Cron-fleet default beats the global chat model: it is
-                        # the user's explicit "cron runs on this" setting.
-                        model = _cron_default_model
-                    else:
-                        # Shared with Desktop's post-save impact summary so both
-                        # paths compare snapshots against the same global model.
-                        _, _global_model = resolve_cron_model_drift_defaults(_cfg)
-                        if _global_model:
-                            model = _global_model
+            # Managed scope must be applied even when a named profile has no
+            # agent-owned config.yaml. The host overlay is the only source of
+            # truth in that valid configuration.
+            try:
+                from hermes_cli import managed_scope
+                _cfg = managed_scope.apply_managed_overlay(_cfg)
+            except Exception:
+                pass
+            _cfg = _expand_env_vars(_cfg)
+            # Coerce null/missing to {} so a falsy default never clobbers an
+            # already-resolved env value with ``None``.
+            _model_cfg = _cfg.get("model") or {}
+            _cron_cfg_for_model = _cfg.get("cron") or {}
+            if isinstance(_cron_cfg_for_model, dict):
+                _cron_default_model = str(
+                    _cron_cfg_for_model.get("model") or ""
+                ).strip()
+                _cron_default_provider = str(
+                    _cron_cfg_for_model.get("model_provider") or ""
+                ).strip()
+            from hermes_cli.model_routing import resolve_profile_model_config
+            from hermes_cli.profiles import get_active_profile_name
+
+            _profile_model_cfg = resolve_profile_model_config(
+                _cfg, get_active_profile_name() or "default"
+            )
+            if not job.get("model"):
+                if _cron_default_model:
+                    model = _cron_default_model
+                elif _profile_model_cfg.get("model"):
+                    model = _profile_model_cfg["model"]
+                else:
+                    # Shared with Desktop's post-save impact summary so both
+                    # paths compare snapshots against the same global model.
+                    _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                    if _global_model:
+                        model = _global_model
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -5987,11 +5994,15 @@ def run_job(
             return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
         primary_model_for_drift = model
-        configured_provider_for_drift = (
-            str(_model_cfg.get("provider") or "").strip().lower()
-            if isinstance(_model_cfg, dict)
-            else ""
-        )
+        configured_provider_for_drift = str(
+            _profile_model_cfg.get("provider")
+            or (
+                _model_cfg.get("provider")
+                if isinstance(_model_cfg, dict)
+                else ""
+            )
+            or ""
+        ).strip().lower()
         primary_provider_for_drift = (
             str(job.get("provider") or "").strip().lower()
             or configured_provider_for_drift
@@ -6005,9 +6016,12 @@ def run_job(
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
                 # Per-job user pin wins; otherwise the cron-fleet default
-                # provider (cron.model_provider); otherwise resolve from
-                # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                # provider, then the active profile's main provider.
+                "requested": (
+                    job.get("provider")
+                    or _cron_default_provider
+                    or _profile_model_cfg.get("provider")
+                ),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -6017,6 +6031,10 @@ def run_job(
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
+            if not job.get("provider"):
+                for key in ("api_mode", "base_url", "max_tokens"):
+                    if _profile_model_cfg.get(key) not in (None, ""):
+                        runtime[key] = _profile_model_cfg[key]
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
                 or primary_provider_for_drift

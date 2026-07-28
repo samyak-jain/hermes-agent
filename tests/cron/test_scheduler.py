@@ -5,7 +5,7 @@ import itertools
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, call, patch, MagicMock
 
 import pytest
 
@@ -1252,6 +1252,108 @@ class TestRunJobConfigEnvVarExpansion:
         "provider": "openrouter",
         "api_mode": "chat_completions",
     }
+
+    def test_null_model_uses_profile_override_without_local_config(
+        self, tmp_path, monkeypatch
+    ):
+        """A named profile with no config.yaml inherits its managed main route."""
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        managed = {
+            "model": {
+                "default": "claude-fable-5",
+                "provider": "anthropic",
+                "agent_runtime": "codex_app_server",
+            },
+            "agent": {
+                "profile_models": {
+                    "vegapunk": {
+                        "provider": "anthropic",
+                        "model": "claude-opus-5",
+                    }
+                }
+            },
+        }
+        runtime = {
+            "api_key": None,
+            "base_url": None,
+            "provider": "anthropic",
+            "api_mode": "codex_app_server",
+        }
+        job = {
+            "id": "profile-null-model",
+            "name": "profile null model",
+            "prompt": "hi",
+            "model": None,
+            "provider": None,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.managed_scope.apply_managed_overlay",
+                   return_value=managed), \
+             patch("hermes_cli.profiles.get_active_profile_name",
+                   return_value="vegapunk"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=runtime) as resolve_runtime, \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert resolve_runtime.call_args_list[-1] == call(
+            requested="anthropic",
+            target_model="claude-opus-5",
+        )
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "claude-opus-5"
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["api_mode"] == "codex_app_server"
+
+    def test_null_model_uses_bare_global_config(
+        self, tmp_path, monkeypatch
+    ):
+        """The legacy bare ``model: value`` form remains the fallback."""
+        (tmp_path / "config.yaml").write_text(
+            "model: bare-global-model\n", encoding="utf-8"
+        )
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        job = {
+            "id": "bare-global-null-model",
+            "name": "bare global null model",
+            "prompt": "hi",
+            "model": None,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.managed_scope.apply_managed_overlay",
+                   side_effect=lambda cfg: cfg), \
+             patch("hermes_cli.profiles.get_active_profile_name",
+                   return_value="default"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=self._RUNTIME), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["model"] == "bare-global-model"
 
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
