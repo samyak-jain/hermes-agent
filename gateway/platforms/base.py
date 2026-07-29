@@ -6433,6 +6433,29 @@ class BasePlatformAdapter(ABC):
                 response = await self._message_handler(event)
             finally:
                 if receipt_ids:
+                    # A busy runner can consume queued follow-ups in-band
+                    # before this adapter frame regains control.  The runner
+                    # appends those follow-up receipt IDs to the source-bound
+                    # list so this *single* lifecycle completion covers the
+                    # whole ordered turn chain.  Copy the final list back to
+                    # event metadata before removing the temporary binding;
+                    # Discord's completion hook reads metadata, while the
+                    # local list is also used by delivery fencing below.
+                    merged_receipt_ids = list(
+                        dict.fromkeys(
+                            str(value)
+                            for value in getattr(
+                                event.source,
+                                "_gateway_receipt_ids",
+                                receipt_ids,
+                            )
+                            if str(value)
+                        )
+                    )
+                    receipt_ids[:] = merged_receipt_ids
+                    event.metadata[
+                        _GATEWAY_RECEIPT_IDS_KEY
+                    ] = merged_receipt_ids
                     with suppress(AttributeError):
                         delattr(event.source, "_gateway_receipt_ids")
             is_ephemeral_response = isinstance(response, EphemeralReply)

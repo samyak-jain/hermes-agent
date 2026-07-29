@@ -1033,6 +1033,8 @@ async def _run_with_agent(
     scope_id=None,
     event_message_id=None,
     receipt_ids=None,
+    pending_receipt_ids=None,
+    return_source=False,
 ):
     if config_data:
         import yaml
@@ -1074,6 +1076,11 @@ async def _run_with_agent(
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+            metadata=(
+                {"_gateway_receipt_ids": list(pending_receipt_ids)}
+                if pending_receipt_ids
+                else {}
+            ),
         )
 
     result = await runner._run_agent(
@@ -1085,6 +1092,8 @@ async def _run_with_agent(
         session_key=session_key,
         event_message_id=event_message_id,
     )
+    if return_source:
+        return adapter, result, source
     return adapter, result
 
 
@@ -1443,6 +1452,33 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
             "metadata": {"thread_id": "discord-thread"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_message_joins_recovery_receipt_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    QueuedSilenceAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSilenceAgent,
+        session_id="sess-queued-recovery-receipts",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+    )
+
+    assert result["final_response"] == "follow-up processed"
+    assert QueuedSilenceAgent.calls == 2
+    assert source._gateway_receipt_ids == ["456", "457"]
 
 
 @pytest.mark.asyncio

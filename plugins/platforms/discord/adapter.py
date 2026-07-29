@@ -5300,6 +5300,8 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _acquire_discord_side_effect_guard(
         self,
         message_id: str,
+        *,
+        require_claim: bool = False,
     ) -> tuple[bool, Any]:
         """Fence a tracked Discord side effect by claim owner and epoch."""
         claim_epoch = getattr(
@@ -5308,7 +5310,7 @@ class DiscordAdapter(BasePlatformAdapter):
             {},
         ).get(message_id)
         if claim_epoch is None:
-            return True, None
+            return not require_claim, None
         guard = await asyncio.to_thread(
             self._discord_recovery_store.acquire_claim_guard,
             message_id,
@@ -5545,6 +5547,17 @@ class DiscordAdapter(BasePlatformAdapter):
             claim_epoch = self._discord_recovery_claim_epochs.get(
                 recovery_reply_to
             )
+            if recovery_receipt_ids and claim_epoch is None:
+                logger.warning(
+                    "[%s] Refusing Discord recovery send for message %s "
+                    "because this adapter does not own its claim",
+                    self.name,
+                    recovery_reply_to,
+                )
+                return SendResult(
+                    success=False,
+                    error="Discord recovery claim no longer owned",
+                )
             nonce_base = None
             if claim_epoch is not None and (
                 final_delivery
@@ -6019,19 +6032,34 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         try:
+            reply_to_message_id = str(
+                (metadata or {}).get("reply_to_message_id") or ""
+            )
+            claim_epoch = (
+                self._discord_recovery_claim_epochs.get(
+                    reply_to_message_id
+                )
+                if reply_to_message_id
+                else None
+            )
+            if recovery_receipt_ids and claim_epoch is None:
+                logger.warning(
+                    "[%s] Refusing Discord recovery edit for message %s "
+                    "because this adapter does not own its claim",
+                    self.name,
+                    reply_to_message_id,
+                )
+                return SendResult(
+                    success=False,
+                    error="Discord recovery claim no longer owned",
+                )
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
-            reply_to_message_id = str(
-                (metadata or {}).get("reply_to_message_id") or ""
-            )
             nonce_base = None
             if reply_to_message_id:
-                claim_epoch = self._discord_recovery_claim_epochs.get(
-                    reply_to_message_id
-                )
                 if claim_epoch is not None:
                     nonce_base = (
                         reply_to_message_id,
@@ -6329,17 +6357,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
-
-        target_id = str((metadata or {}).get("thread_id") or chat_id)
-        channel = self._client.get_channel(int(target_id))
-        if not channel:
-            channel = await self._client.fetch_channel(int(target_id))
-        if not channel:
-            return SendResult(
-                success=False,
-                error=f"Channel {target_id} not found",
-            )
-
         receipt_ids = [
             str(value)
             for value in (metadata or {}).get(
@@ -6356,7 +6373,8 @@ class DiscordAdapter(BasePlatformAdapter):
             "_gateway_recovery_component_index"
         )
         allowed, guard = await self._acquire_discord_side_effect_guard(
-            reply_to
+            reply_to,
+            require_claim=bool(receipt_ids),
         )
         if not allowed:
             return SendResult(
@@ -6365,6 +6383,19 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         try:
+            target_id = str(
+                (metadata or {}).get("thread_id") or chat_id
+            )
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(
+                    int(target_id)
+                )
+            if not channel:
+                return SendResult(
+                    success=False,
+                    error=f"Channel {target_id} not found",
+                )
             filename = file_name or os.path.basename(file_path)
             logger.info(
                 "[%s] Sending file attachment %s (%s) to %s",
@@ -6481,6 +6512,17 @@ class DiscordAdapter(BasePlatformAdapter):
         component_index = (metadata or {}).get(
             "_gateway_recovery_component_index"
         )
+        if (
+            recovery_receipt_ids
+            and self._discord_recovery_claim_epochs.get(
+                recovery_reply_to
+            )
+            is None
+        ):
+            return SendResult(
+                success=False,
+                error="Discord recovery claim no longer owned",
+            )
 
         try:
             import discord as _discord_mod
@@ -6608,7 +6650,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 side_effect_allowed, chunk_guard = (
                     await self._acquire_discord_side_effect_guard(
-                        recovery_reply_to
+                        recovery_reply_to,
+                        require_claim=bool(recovery_receipt_ids),
                     )
                 )
                 if not side_effect_allowed:
@@ -6763,7 +6806,8 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         target_id = str((metadata or {}).get("thread_id") or chat_id)
         allowed, guard = await self._acquire_discord_side_effect_guard(
-            recovery_reply_to
+            recovery_reply_to,
+            require_claim=bool(receipt_ids),
         )
         if not allowed:
             return SendResult(
