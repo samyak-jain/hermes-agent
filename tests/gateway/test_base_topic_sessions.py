@@ -135,6 +135,147 @@ class TestBasePlatformTopicSessions:
             ("complete", "1", ProcessingOutcome.SUCCESS),
         ]
 
+    @pytest.mark.asyncio
+    async def test_process_message_background_marks_total_send_failure_unsuccessful(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "ack"
+
+        async def failing_send(*_args, **_kwargs):
+            return SendResult(success=False, error="send failed")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter.send = failing_send
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mixed_text_media_requires_every_component_to_succeed(self):
+        adapter = DummyTelegramAdapter()
+        image_metadata = []
+
+        async def handler(_event):
+            return "ack\n![result](https://example.com/result.png)"
+
+        async def failing_images(*_args, **kwargs):
+            image_metadata.append(kwargs["metadata"])
+            return SendResult(success=False, error="image send failed")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter.send_multiple_images = failing_images
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        event.metadata["_gateway_receipt_ids"] = ["1"]
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert adapter.sent[0]["metadata"]["notify"] is False
+        assert (
+            adapter.sent[0]["metadata"][
+                "_gateway_recovery_component_index"
+            ]
+            == 0
+        )
+        assert image_metadata[0]["_gateway_recovery_component_index"] == 1
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_marks_exception_unsuccessful(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            raise RuntimeError("boom")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_marks_cancellation_unsuccessful(self):
+        adapter = DummyTelegramAdapter()
+        release = asyncio.Event()
+
+        async def handler(_event):
+            await release.wait()
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        task = asyncio.create_task(adapter._process_message_background(event, build_session_key(event.source)))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cancel_background_tasks_marks_expected_cancellation_cancelled(self):
+        adapter = DummyTelegramAdapter()
+        release = asyncio.Event()
+
+        async def handler(_event):
+            await release.wait()
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter.handle_message(event)
+        await asyncio.sleep(0)
+
+        await adapter.cancel_background_tasks()
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.CANCELLED),
+        ]
+
 
 class TestTelegramAutoTtsCaptionDelivery:
     @staticmethod
@@ -198,4 +339,3 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "metadata": {"thread_id": "17585", "notify": True},
             }
         ]
-
