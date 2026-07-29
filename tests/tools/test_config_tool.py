@@ -11,6 +11,7 @@ from hermes_cli import config as config_module
 from hermes_cli import managed_scope
 from hermes_cli.agent_config import (
     AgentConfigError,
+    _secret_shaped_path,
     apply_change,
     apply_rollback,
     history,
@@ -407,6 +408,72 @@ def test_nested_benign_path_components_do_not_form_secret_phrases(
 
     assert result["value"]["runtime_options"] == public_options
     assert "redacted_paths" not in result
+
+
+def test_nested_structural_secret_phrases_redact_only_exact_leaves(
+    broker_home: Path,
+):
+    secret_values = {
+        "api": {"key": "SENTINEL_NESTED_API_KEY", "key_rotation_days": 30},
+        "private": {"key": "SENTINEL_NESTED_PRIVATE_KEY", "key_count": 2},
+        "auth": {"token": "SENTINEL_NESTED_AUTH_TOKEN", "token_usage": 17},
+        "client": {
+            "secret": "SENTINEL_NESTED_CLIENT_SECRET",
+            "secret_format": "environment-reference",
+        },
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": secret_values}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    assert result["value"]["runtime_options"] == {
+        "api": {"key": "[REDACTED]", "key_rotation_days": 30},
+        "private": {"key": "[REDACTED]", "key_count": 2},
+        "auth": {"token": "[REDACTED]", "token_usage": 17},
+        "client": {
+            "secret": "[REDACTED]",
+            "secret_format": "environment-reference",
+        },
+    }
+    assert result["redacted_paths"] == [
+        "model.runtime_options.api.key",
+        "model.runtime_options.private.key",
+        "model.runtime_options.auth.token",
+        "model.runtime_options.client.secret",
+    ]
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert "SENTINEL_NESTED_" not in rendered
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "model.runtime_options.api.key",
+        "model.runtime_options.private.key",
+        "model.runtime_options.auth.token",
+        "model.runtime_options.client.secret",
+        "model.runtime_options.api[0].key",
+    ],
+)
+def test_secret_path_classifier_matches_exact_adjacent_structural_phrases(path: str):
+    assert _secret_shaped_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "model.runtime_options.api.key_rotation_days",
+        "model.runtime_options.private.key_count",
+        "model.runtime_options.auth.token_usage",
+        "model.runtime_options.client.secret_format",
+    ],
+)
+def test_secret_path_classifier_preserves_benign_structural_suffixes(path: str):
+    assert not _secret_shaped_path(path)
 
 
 @pytest.mark.parametrize(
