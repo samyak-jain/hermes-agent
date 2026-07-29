@@ -5049,14 +5049,17 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_failed = False
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_failed = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5205,6 +5208,23 @@ class BasePlatformAdapter(ABC):
                     _final_thread_metadata[_GATEWAY_RECEIPT_IDS_KEY] = (
                         _receipt_ids
                     )
+                    # Recovery receipts become terminal only after the complete
+                    # response plan has finished. Each Discord side effect is
+                    # nonce-fenced, so an interrupted mixed text/media response
+                    # can safely retry without a successful first component
+                    # prematurely making the whole turn invisible.
+                    _final_thread_metadata["notify"] = False
+                _delivery_component_index = 0
+
+                def _next_delivery_metadata():
+                    nonlocal _delivery_component_index
+                    metadata = dict(_final_thread_metadata or {})
+                    if _receipt_ids:
+                        metadata["_gateway_recovery_component_index"] = (
+                            _delivery_component_index
+                        )
+                    _delivery_component_index += 1
+                    return metadata
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -5245,7 +5265,7 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                         )
                         _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
@@ -5315,7 +5335,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
+                        metadata=_next_delivery_metadata(),
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -5361,12 +5381,15 @@ class BasePlatformAdapter(ABC):
                         image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -5404,12 +5427,15 @@ class BasePlatformAdapter(ABC):
                         image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -5420,19 +5446,19 @@ class BasePlatformAdapter(ABC):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         elif ext in _VIDEO_EXTS:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         else:
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
 
                         _record_delivery(media_result)
@@ -5440,6 +5466,9 @@ class BasePlatformAdapter(ABC):
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_delivery(
+                            SendResult(success=False, error=str(media_err))
+                        )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -5451,17 +5480,20 @@ class BasePlatformAdapter(ABC):
                             file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         else:
                             file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         _record_delivery(file_result)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_delivery(
+                            SendResult(success=False, error=str(file_err))
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
@@ -5478,7 +5510,11 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                delivery_succeeded and not delivery_failed
+                if delivery_attempted
+                else not bool(response)
+            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
