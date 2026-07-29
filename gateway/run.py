@@ -510,7 +510,25 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
-    return await adapter.send(chat_id, content, metadata=metadata)
+    send_metadata = dict(metadata or {})
+    receipt_ids = send_metadata.get(_GATEWAY_RECEIPT_IDS_KEY) or []
+    reply_to = None
+    if receipt_ids:
+        reply_to = str(
+            send_metadata.get("reply_to_message_id")
+            or receipt_ids[0]
+        )
+        send_metadata["reply_to_message_id"] = reply_to
+        send_metadata["notify"] = False
+        send_metadata["_gateway_recovery_component_index"] = (
+            f"status:{status_key}:{content}"
+        )
+    return await adapter.send(
+        chat_id,
+        content,
+        reply_to=reply_to,
+        metadata=send_metadata or None,
+    )
 
 
 def _resolve_progress_thread_id(platform: Any, source_thread_id: Any, event_message_id: Any) -> Optional[str]:
@@ -19566,12 +19584,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        if (
+            _progress_metadata is None
+            and getattr(source, "_gateway_receipt_ids", None)
+        ):
+            _progress_metadata = self._thread_metadata_for_source(
+                source,
+                event_message_id,
+            )
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
-            if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
+            if (
+                event_message_id
+                and (
+                    source.platform == Platform.DISCORD
+                    or (
+                        source.platform
+                        in (Platform.FEISHU, Platform.MATTERMOST)
+                        and source.thread_id
+                    )
+                )
+            )
             else None
         )
+        _progress_send_index = [0]
+
+        def _next_progress_send_metadata() -> Optional[Dict[str, Any]]:
+            metadata = dict(_progress_metadata or {})
+            receipt_ids = metadata.get(_GATEWAY_RECEIPT_IDS_KEY) or []
+            if receipt_ids:
+                metadata["reply_to_message_id"] = str(
+                    event_message_id or receipt_ids[0]
+                )
+                metadata["notify"] = False
+                metadata["_gateway_recovery_component_index"] = (
+                    f"progress:{_progress_send_index[0]}"
+                )
+                _progress_send_index[0] += 1
+            return metadata or None
 
         async def write_tool_log():
             """Drain log_queue and append tool-call lines to tool_calls.log.
@@ -19728,7 +19779,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=source.chat_id,
                     content=text,
                     reply_to=_progress_reply_to,
-                    metadata=_progress_metadata,
+                    metadata=_next_progress_send_metadata(),
                 )
                 _track_progress_result(result)
                 return result
@@ -19875,7 +19926,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_next_progress_send_metadata(),
                             )
                             if (
                                 _cleanup_progress
@@ -19891,7 +19942,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_next_progress_send_metadata(),
                             )
                         else:
                             # Editing unsupported: send just this line
@@ -19899,7 +19950,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_next_progress_send_metadata(),
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
@@ -20026,6 +20077,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source,
                 event_message_id,
             )
+        _interactive_prompt_index = [0]
+
+        def _next_interactive_prompt_metadata() -> Optional[Dict[str, Any]]:
+            metadata = dict(_status_thread_metadata or {})
+            receipt_ids = list(
+                getattr(source, "_gateway_receipt_ids", None) or []
+            )
+            if receipt_ids:
+                metadata[_GATEWAY_RECEIPT_IDS_KEY] = receipt_ids
+                metadata["reply_to_message_id"] = str(
+                    event_message_id or receipt_ids[0]
+                )
+                metadata["notify"] = False
+                metadata["_gateway_recovery_component_index"] = (
+                    f"interactive:{_interactive_prompt_index[0]}"
+                )
+                _interactive_prompt_index[0] += 1
+            return metadata or None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -20243,7 +20312,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         display_text,
-                        metadata=_status_thread_metadata,
+                        reply_to=_progress_reply_to,
+                        metadata=_next_progress_send_metadata(),
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20590,11 +20660,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
                     return
+                metadata = _non_conversational_metadata(
+                    _next_progress_send_metadata(),
+                    platform=source.platform,
+                )
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                        reply_to=_progress_reply_to,
+                        metadata=metadata,
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20679,6 +20754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
                 send_ok = False
+                clarify_metadata = _next_interactive_prompt_metadata()
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
                         chat_id=_status_chat_id,
@@ -20686,7 +20762,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         choices=list(choices) if choices else None,
                         clarify_id=clarify_id,
                         session_key=session_key or "",
-                        metadata=_status_thread_metadata,
+                        metadata=clarify_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20818,6 +20894,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (send_exec_approval) and plain-text fallback paths below use
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
+                approval_metadata = (
+                    _next_interactive_prompt_metadata()
+                )
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -20830,7 +20909,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=approval_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
@@ -20869,7 +20948,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            reply_to=(
+                                (approval_metadata or {}).get(
+                                    "reply_to_message_id"
+                                )
+                            ),
+                            metadata=approval_metadata,
                         ),
                         _loop_for_step,
                         logger=logger,
@@ -21707,13 +21791,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
-                                await _warn_adapter.send(
-                                    source.chat_id,
+                                warning_text = (
                                     f"⚠️ No activity for {_elapsed_warn} min. "
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    f"You can continue waiting or use /reset."
+                                )
+                                await _send_or_update_status_coro(
+                                    _warn_adapter,
+                                    source.chat_id,
+                                    "inactivity-warning",
+                                    warning_text,
+                                    _status_thread_metadata,
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
