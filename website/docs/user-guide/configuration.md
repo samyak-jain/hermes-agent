@@ -2125,6 +2125,9 @@ delegation:
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
   subagent_grant_toolsets: []               # Toolsets available to children even when disabled on the parent
+  profile_subagent_tool_grants: {}          # Profile-specific exact grants; currently only config is accepted
+  child_terminal: {}                        # Optional shared task-scoped child backend
+  profile_child_terminal: {}                # Profile-specific backend; matching entry wins
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
@@ -2141,6 +2144,15 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
 **Child-only toolsets:** Set `agent.disabled_toolsets` to hide a capability from the main agent, then list it under `delegation.subagent_grant_toolsets` to make it available only to delegated children. For example, `agent.disabled_toolsets: [browser]` together with `delegation.subagent_grant_toolsets: [browser]` keeps browser schemas out of main-agent calls while allowing the main agent to delegate browsing tasks. Security-blocked child capabilities such as delegation and memory cannot be restored through this setting. The `delegate_task` description tells the main model which child-only toolsets are available.
+
+**Profile-scoped coordinator children:** Infrastructure-managed deployments can
+route one profile's children to a different task backend with
+`delegation.profile_child_terminal.<profile>`. A matching entry replaces the
+shared `child_terminal` mapping for that profile only. The companion
+`profile_subagent_tool_grants.<profile>` exact-name list can move the `config`
+broker from a coordinator's main schema to its children. `config` is the only
+accepted normally-blocked exception; recursive delegation, memory, SOUL,
+messaging, scheduling, and user interaction remain blocked.
 
 ### Exact tool policies
 

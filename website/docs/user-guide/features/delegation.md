@@ -322,6 +322,10 @@ delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
   # subagent_grant_toolsets: [browser]       # Grant toolsets even when the parent has them disabled
   # child_tool_policy: {mode: all_configured} # All configured tools minus the child disabled-toolset boundary
+  # profile_subagent_tool_grants:            # Exact child-only exception for a named profile
+  #   coding-coordinator: [config]            # Only config is accepted
+  # child_terminal: {}                       # Shared task-scoped child backend
+  # profile_child_terminal: {}               # Per-profile backend override
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
@@ -350,6 +354,13 @@ delegation:
 Granted toolsets still pass through the child security blocklist. The dynamic
 `delegate_task` description advertises configured grants so the main model
 knows it can delegate work that requires a tool it cannot call directly.
+
+For a coordinator profile that must delegate every operational action, use
+`profile_child_terminal.<profile>` to select its child execution environment.
+This leaves the shared child backend unchanged for every other profile.
+`profile_subagent_tool_grants.<profile>: [config]` additionally exposes the
+validated configuration broker only to that profile's children. No other
+normally blocked child tool can be restored through this setting.
 
 When `base_url` points at an Anthropic-compatible endpoint — for example a path ending in `/anthropic`, an Azure Foundry Claude route, or a MiniMax `/anthropic` proxy — `api_mode` is auto-detected as `anthropic_messages` so the subagent uses the right wire format without you setting anything. Set `api_mode` explicitly when the auto-detection guess is wrong (rare).
 

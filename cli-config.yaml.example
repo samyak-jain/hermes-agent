@@ -1137,6 +1137,15 @@ delegation:
                                               # The parent TUI owns stdin, so blocking would deadlock; non-interactive resolution is required.
                                               # Both choices emit a logger.warning audit line. Flip to true only for cron/batch pipelines.
   # inherit_mcp_toolsets: true                # When explicit child toolsets are narrowed, also keep the parent's MCP toolsets (default: true). Set false for strict intersection.
+  # profile_subagent_tool_grants:             # Narrow exact-name child grants for one profile.
+  #   coding-coordinator: [config]             # Currently only the config broker is grantable.
+  # child_terminal: {}                        # Shared task-scoped child backend.
+  # profile_child_terminal:                   # Matching profile wins over child_terminal.
+  #   coding-coordinator:
+  #     backend: ssh
+  #     cwd: /workspace
+  #     ssh_host: 10.0.0.20
+  #     ssh_user: agent
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
