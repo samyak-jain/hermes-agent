@@ -861,6 +861,46 @@ async def test_image_only_delivery_records_success_and_response_evidence(
 
 
 @pytest.mark.asyncio
+async def test_recovery_image_batch_fails_if_any_image_is_missing(
+    adapter,
+    tmp_path,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    image_path = tmp_path / "result.png"
+    image_path.write_bytes(b"png")
+    missing_path = tmp_path / "missing.png"
+    channel = SimpleNamespace(
+        id=123,
+        type=0,
+        send=AsyncMock(return_value=SimpleNamespace(id=701)),
+    )
+    adapter._client.get_channel = lambda _id: channel
+
+    result = await adapter.send_multiple_images(
+        "123",
+        [
+            (image_path.as_uri(), ""),
+            (missing_path.as_uri(), ""),
+        ],
+        metadata={
+            "notify": True,
+            "reply_to_message_id": message_id,
+            "_gateway_receipt_ids": [message_id],
+        },
+    )
+
+    assert result.success is False
+    assert "Missing recovery image" in result.error
+    channel.send.assert_awaited_once()
+    assert (
+        adapter._discord_message_is_persistently_complete(message_id)
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_forum_media_uses_fenced_bounded_nonce(
     adapter,
     tmp_path,

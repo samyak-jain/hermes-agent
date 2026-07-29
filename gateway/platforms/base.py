@@ -5362,12 +5362,26 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_next_delivery_metadata(),
-                    )
+                    if receipt_ids and delivery_adapter is not self:
+                        # Discord recovery claim ownership is adapter-instance
+                        # scoped. A reconnect replacement has transport access
+                        # but not this in-flight turn's claim epoch, so sending
+                        # through it would bypass the side-effect fence. Fail
+                        # closed and let reconnect recovery retry the receipt.
+                        result = SendResult(
+                            success=False,
+                            error=(
+                                "Recovery delivery adapter was replaced; "
+                                "retrying from durable receipt"
+                            ),
+                        )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_next_delivery_metadata(),
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:

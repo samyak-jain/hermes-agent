@@ -13475,7 +13475,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
-                await self._send_voice_reply(event, response)
+                voice_succeeded = await self._send_voice_reply(
+                    event,
+                    response,
+                )
+                if (
+                    event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+                    and not voice_succeeded
+                ):
+                    event.metadata[
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                    ] = True
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -14501,7 +14511,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(
+        self,
+        event: MessageEvent,
+        text: str,
+    ) -> bool:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
         audio_path = None
@@ -14511,7 +14525,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             tts_text = _strip_markdown_for_tts(text[:4000])
             if not tts_text:
-                return
+                return False
 
             # Telegram's adapter only sends native voice bubbles for OGG/Opus.
             # Other platforms keep the existing MP3 default.
@@ -14529,23 +14543,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
+                return False
 
             # Use the actual file path from result (may differ after opus conversion)
             actual_path = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual_path):
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
 
             adapter = self._adapter_for_source(event.source)
+            receipt_ids = event.metadata.get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+            )
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
             if (guild_id
+                    and not receipt_ids
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
+                return bool(
+                    await adapter.play_in_voice_channel(
+                        guild_id,
+                        actual_path,
+                    )
+                )
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -14556,7 +14579,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # final voice reply as a normal notification instead of a
                 # silent message.  Clone first so we don't mutate metadata
                 # shared with concurrent typing-indicator state.
-                if thread_meta is not None:
+                if receipt_ids:
+                    thread_meta = self._next_stream_delivery_metadata(
+                        event,
+                        thread_meta,
+                    )
+                elif thread_meta is not None:
                     thread_meta = dict(thread_meta)
                     thread_meta["notify"] = True
                 else:
@@ -14567,9 +14595,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                send_result = await adapter.send_voice(**send_kwargs)
+                return bool(getattr(send_result, "success", False))
+            return False
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in {audio_path, actual_path} - {None}:
                 try:
@@ -19971,7 +20002,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            # Recovery receipts must reach the stream consumer even when the
+            # conversation has no platform thread/progress lane (Discord DMs,
+            # free-response channels, and no-thread channels).
+            _status_thread_metadata = self._thread_metadata_for_source(
+                source,
+                event_message_id,
+            )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -22199,17 +22236,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
+                            metadata=_sc._metadata_for_send(
+                                final=True,
+                            ),
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(edit_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit streamed message for session %s: %s",
+                                session_key or "?",
+                                getattr(
+                                    edit_result,
+                                    "error",
+                                    "unknown edit failure",
+                                ),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

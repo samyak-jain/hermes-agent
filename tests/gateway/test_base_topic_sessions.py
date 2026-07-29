@@ -253,6 +253,39 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_recovery_final_send_fails_closed_on_adapter_replacement(
+        self,
+    ):
+        adapter = DummyTelegramAdapter()
+        replacement = DummyTelegramAdapter()
+        adapter.gateway_runner = SimpleNamespace(
+            _adapter_for_source=lambda _source: replacement,
+        )
+
+        async def handler(_event):
+            return "recovered answer"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_event("-1001", "17585")
+        event.metadata["_gateway_receipt_ids"] = ["1"]
+
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert adapter.sent == []
+        assert replacement.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

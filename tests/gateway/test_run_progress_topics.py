@@ -115,6 +115,31 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class FailingFinalEditProgressCaptureAdapter(
+    MetadataEditProgressCaptureAdapter
+):
+    async def edit_message(
+        self,
+        chat_id,
+        message_id,
+        content,
+        *,
+        finalize: bool = False,
+        metadata=None,
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        if finalize and "[plugin appended this]" in content:
+            return SendResult(success=False, error="edit rejected")
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -788,6 +813,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    event_message_id=None,
+    receipt_ids=None,
 ):
     if config_data:
         import yaml
@@ -814,7 +841,10 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        message_id=event_message_id,
     )
+    if receipt_ids:
+        source._gateway_receipt_ids = list(receipt_ids)
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
@@ -833,6 +863,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
     return adapter, result
 
@@ -1112,6 +1143,85 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_unthreaded_discord_stream_carries_merged_receipts(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-discord-recovery-stream",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+        event_message_id="456",
+        receipt_ids=["456", "457"],
+    )
+
+    assert result.get("already_sent") is True
+    delivery_metadata = [
+        call.get("metadata")
+        for call in adapter.sent + adapter.edits
+        if (call.get("metadata") or {}).get("_gateway_receipt_ids")
+    ]
+    assert delivery_metadata
+    assert all(
+        metadata["_gateway_receipt_ids"] == ["456", "457"]
+        and metadata["reply_to_message_id"] == "456"
+        and metadata["notify"] is False
+        for metadata in delivery_metadata
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_transformed_stream_edit_keeps_normal_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-edit-failure",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FailingFinalEditProgressCaptureAdapter,
+        event_message_id="456",
+        receipt_ids=["456"],
+    )
+
+    assert result.get("already_sent") is not True
+    assert result["final_response"].endswith("[plugin appended this]")
 
 
 @pytest.mark.asyncio
