@@ -42,6 +42,23 @@ def test_recovery_stream_final_does_not_complete_receipts_early():
     }
 
 
+def test_recovery_stream_new_messages_get_ordered_chunk_indices():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(final=False)
+    second = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert first["_gateway_receipt_ids"] == ["456"]
+    assert second["_gateway_receipt_ids"] == ["456"]
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -820,7 +837,13 @@ class TestSegmentBreakOnToolBoundary:
         adapter.MAX_MESSAGE_LENGTH = 610
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
-        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            config,
+            initial_reply_to_id="456",
+            metadata={"_gateway_receipt_ids": ["456"]},
+        )
 
         prefix = "Hello world"
         tail = "x" * 620
@@ -836,6 +859,13 @@ class TestSegmentBreakOnToolBoundary:
         assert len(sent_texts) == 3
         assert sent_texts[0].startswith(prefix)
         assert sum(len(t) for t in sent_texts[1:]) == len(tail)
+        recovery_indices = [
+            call.kwargs["metadata"][
+                "_gateway_recovery_text_chunk_index"
+            ]
+            for call in adapter.send.call_args_list
+        ]
+        assert recovery_indices == [0, 1, 2]
 
     @pytest.mark.asyncio
     async def test_fallback_final_sends_full_text_at_tool_boundary(self):

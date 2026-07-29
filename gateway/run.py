@@ -22001,13 +22001,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
+                            _first_send_result = await adapter.send(
                                 source.chat_id,
                                 first_response,
                                 metadata=_status_thread_metadata,
                             )
+                            if (
+                                getattr(
+                                    source,
+                                    "_gateway_receipt_ids",
+                                    None,
+                                )
+                                and not getattr(
+                                    _first_send_result,
+                                    "success",
+                                    False,
+                                )
+                            ):
+                                setattr(
+                                    source,
+                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                                    True,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                            if getattr(
+                                source,
+                                "_gateway_receipt_ids",
+                                None,
+                            ):
+                                setattr(
+                                    source,
+                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                                    True,
+                                )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
