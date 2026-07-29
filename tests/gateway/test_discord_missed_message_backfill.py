@@ -1465,9 +1465,7 @@ async def test_reclaimed_lease_fences_actual_outbound_send(adapter, forum):
 
     def record_response_under_guard(**kwargs):
         guard = kwargs.get("claim_guard")
-        guarded_records.append(
-            bool(guard is not None and guard.in_transaction)
-        )
+        guarded_records.append(guard is not None)
         return original_record_response(**kwargs)
 
     replacement._record_discord_response = record_response_under_guard
@@ -2150,6 +2148,278 @@ async def test_silent_ambient_decision_advances_only_after_routing_finishes(
     finish_routing.set()
     assert await task is None
     assert adapter._discord_recovery_cursor("123") == str(message_id)
+
+
+@pytest.mark.asyncio
+async def test_slow_send_guard_does_not_block_unrelated_live_claim(adapter):
+    first_id, second_id = [str(value) for value in _recent_snowflakes(2)]
+    first = make_message(message_id=int(first_id))
+    second = make_message(message_id=int(second_id))
+    assert adapter._claim_live_discord_message(first) == "claimed"
+
+    send_started = asyncio.Event()
+    finish_send = asyncio.Event()
+    channel = FakeChannel(channel_id=123)
+
+    async def slow_send(**_kwargs):
+        send_started.set()
+        await finish_send.wait()
+        return SimpleNamespace(id=9012)
+
+    channel.send = AsyncMock(side_effect=slow_send)
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda _channel_id: channel,
+    )
+    adapter._reply_to_mode = "off"
+
+    send_task = asyncio.create_task(
+        adapter.send(
+            "123",
+            "first response",
+            reply_to=first_id,
+            metadata={"notify": True},
+        )
+    )
+    await send_started.wait()
+
+    assert adapter._claim_live_discord_message(second) == "claimed"
+
+    finish_send.set()
+    assert (await send_task).success is True
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_starter_is_rejected_before_durable_claim(adapter):
+    starter_id = str(_recent_snowflakes(1)[0])
+    adapter._auto_thread_starters.is_duplicate(starter_id)
+    starter = make_message(message_id=int(starter_id))
+
+    assert await adapter._dispatch_discord_message(starter) is False
+    assert starter_id not in adapter._discord_recovery_claim_heartbeats
+    assert starter_id not in adapter._discord_recovery_message_channels
+    assert adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT 1 FROM discord_messages WHERE message_id=?",
+            (starter_id,),
+        ).fetchone()
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_active_foreign_lease_processes_older_work_and_schedules_rescan(
+    adapter,
+    monkeypatch,
+):
+    older_id, active_id = _recent_snowflakes(2)
+    channel = FakeChannel(channel_id=123)
+    older = make_message(message_id=older_id, channel=channel)
+    active = make_message(message_id=active_id, channel=channel)
+    adapter.config.extra["free_response_channels"] = "123"
+
+    owner = DiscordAdapter(PlatformConfig(enabled=True, token="owner"))
+    owner._client = adapter._client
+    assert owner._claim_live_discord_message(active) == "claimed"
+
+    async def candidates(_channels):
+        yield older
+        yield active
+
+    monkeypatch.setattr(
+        adapter,
+        "_known_missed_message_backfill_channels",
+        AsyncMock(return_value={"123"}),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_iter_missed_message_backfill_candidates",
+        candidates,
+    )
+
+    await adapter._run_missed_message_backfill()
+
+    adapter._handle_message.assert_awaited_once_with(
+        older,
+        role_authorized=False,
+        recovered=True,
+    )
+    assert adapter._discord_recovery_cursor("123") == str(older_id)
+    retry_task = adapter._missed_message_backfill_retry_task
+    assert retry_task is not None and not retry_task.done()
+    retry_task.cancel()
+    await asyncio.gather(retry_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_triggers_do_not_consume_dispatch_bound(
+    adapter,
+    monkeypatch,
+):
+    ids = _recent_snowflakes(3)
+    bot_user = adapter._client.user
+    allowed = make_message(
+        message_id=ids[0],
+        author_id=42,
+        content=f"<@{bot_user.id}> allowed",
+        mentions=[bot_user],
+    )
+    denied = [
+        make_message(
+            message_id=message_id,
+            author_id=100 + index,
+            content=f"<@{bot_user.id}> denied",
+            mentions=[bot_user],
+        )
+        for index, message_id in enumerate(ids[1:])
+    ]
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setattr(
+        adapter,
+        "_is_allowed_user",
+        lambda user_id, *_args, **_kwargs: user_id == "42",
+    )
+
+    async def candidates(_channels):
+        for message in [allowed, *denied]:
+            yield message
+
+    monkeypatch.setattr(
+        adapter,
+        "_known_missed_message_backfill_channels",
+        AsyncMock(return_value={"123"}),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_iter_missed_message_backfill_candidates",
+        candidates,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_missed_message_backfill_max_dispatches",
+        lambda: 1,
+    )
+
+    await adapter._run_missed_message_backfill()
+
+    adapter._handle_message.assert_awaited_once_with(
+        allowed,
+        role_authorized=False,
+        recovered=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovered_auto_thread_reuses_durable_routing_thread(
+    adapter,
+    monkeypatch,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    adapter._record_discord_routing_thread(message_id, "777")
+    existing_thread = SimpleNamespace(id=777)
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: (
+            existing_thread if channel_id == 777 else None
+        ),
+    )
+    adapter.handle_message = AsyncMock()
+    create_thread = AsyncMock()
+    monkeypatch.setattr(adapter, "_auto_create_thread", create_thread)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    admitted = await DiscordAdapter._handle_message(
+        adapter,
+        message,
+        recovered=True,
+    )
+
+    assert admitted is True
+    create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.thread_id == "777"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_failure_keeps_live_receipt_retryable(
+    adapter,
+    monkeypatch,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    channel = FakeChannel(channel_id=123)
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=9000))
+    message = make_message(message_id=int(message_id), channel=channel)
+    adapter._handle_message = DiscordAdapter._handle_message.__get__(
+        adapter,
+        DiscordAdapter,
+    )
+    adapter.handle_message = AsyncMock()
+    monkeypatch.setattr(
+        adapter,
+        "_auto_create_thread",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Discord auto-thread routing failed",
+    ):
+        await adapter._dispatch_discord_message(message)
+
+    assert adapter._discord_recovery_cursor("123") is None
+    assert adapter._discord_message_has_active_claim(message_id) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_inline_clarification_does_not_advance_cursor(adapter):
+    from tools import clarify_gateway
+
+    message_id = str(_recent_snowflakes(1)[0])
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    event = MessageEvent(
+        text="The second option",
+        source=source,
+        message_id=message_id,
+        metadata={"_gateway_receipt_ids": [message_id]},
+    )
+    raw_message = make_message(message_id=int(message_id))
+    event.raw_message = raw_message
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._register_discord_recovery_receipt("123", message_id)
+    assert adapter._claim_live_discord_message(raw_message) == "claimed"
+    adapter._start_discord_processing_claim_heartbeats([message_id])
+    adapter._message_handler = AsyncMock(
+        side_effect=RuntimeError("clarification resolver failed")
+    )
+    clarify_gateway.register(
+        "clarify-failure-recovery-test",
+        session_key,
+        "Which option?",
+        ["The first option", "The second option"],
+    )
+    try:
+        await adapter._dispatch_discord_event(event, recovered=False)
+    finally:
+        clarify_gateway.clear_session(session_key)
+        adapter._active_sessions.pop(session_key, None)
+
+    assert adapter._discord_recovery_cursor("123") is None
+    assert adapter._discord_message_has_active_claim(message_id) is False
 
 
 @pytest.mark.asyncio
