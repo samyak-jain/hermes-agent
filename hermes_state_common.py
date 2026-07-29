@@ -383,6 +383,13 @@ CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     failure_streak INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS discord_recovery_cursors (
+    channel_id TEXT PRIMARY KEY,
+    last_message_id TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    boundary_reason TEXT
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,

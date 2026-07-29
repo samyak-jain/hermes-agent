@@ -2195,11 +2195,11 @@ DEFAULT_CONFIG = {
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "missed_message_backfill": {
-            "enabled": False,             # Replay missed Discord messages after reconnect/startup
-            "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
+            "enabled": True,              # Replay missed human Discord messages after reconnect/startup
+            "channels": "",               # Extra channel IDs; known DMs/home/active channels are included automatically
             "window_seconds": 21600,      # Only inspect messages from the last 6 hours
-            "limit": 100,                 # Global cap on messages scanned per reconnect
-            "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
+            "limit": 100,                 # Per-channel cap on messages scanned per reconnect
+            "max_dispatches": 10,         # Per-channel cap on recovered human turns
         },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         # Discord Gateway transport health. These settings inspect the active
