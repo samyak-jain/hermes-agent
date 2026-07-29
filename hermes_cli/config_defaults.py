@@ -1945,6 +1945,10 @@ DEFAULT_CONFIG = {
         # Toolsets granted to every child independently of the parent's loaded
         # schemas. The normal subagent security blocklist still applies.
         "subagent_grant_toolsets": [],
+        # Exact blocked-tool exceptions for children of one named profile.
+        # Only tools explicitly supported by the delegation runtime are
+        # accepted; currently this is limited to the config broker.
+        "profile_subagent_tool_grants": {},
         # legacy preserves parent/toolset inheritance. all_configured uses the
         # complete configured universe, then applies the delegated-child
         # disabled_toolsets boundary (plus an exact residual deny for tools
@@ -1955,6 +1959,9 @@ DEFAULT_CONFIG = {
         # only when the remote intentionally needs the host's Hermes files.
         # Credentials must not cross the boundary by default.
         "child_terminal": {},
+        # Per-profile child backend override. A matching profile entry wins
+        # over child_terminal; other profiles retain the shared default.
+        "profile_child_terminal": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
