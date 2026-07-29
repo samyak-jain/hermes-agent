@@ -57,6 +57,90 @@ class DiscordRecoveryStore:
             logger.warning("Discord recovery ledger unavailable: %s", exc)
             return default
 
+    def acquire_claim_guard(
+        self,
+        message_id: str,
+        claim_owner: str,
+        claim_epoch: int,
+        *,
+        allow_responded: bool = False,
+    ) -> sqlite3.Connection | None:
+        """Hold the cross-process writer lock while an owned side effect runs."""
+        conn: sqlite3.Connection | None = None
+        try:
+            with self._lock:
+                path = self.path()
+                conn = sqlite3.connect(
+                    path,
+                    timeout=0.1,
+                    check_same_thread=False,
+                )
+                if not self._initialized:
+                    self._initialize(conn)
+                    self._initialized = True
+                    conn.commit()
+                    with suppress(OSError):
+                        os.chmod(path, 0o600)
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM discord_messages
+                     WHERE message_id=?
+                       AND claim_owner=?
+                       AND claim_epoch=?
+                       AND (
+                           status IN ('queued', 'processing')
+                           OR (? AND status='responded')
+                       )
+                    """,
+                    (
+                        message_id,
+                        claim_owner,
+                        claim_epoch,
+                        1 if allow_responded else 0,
+                    ),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    conn.close()
+                    return None
+                conn.execute(
+                    """
+                    UPDATE discord_messages
+                       SET updated_at=?
+                     WHERE message_id=?
+                       AND claim_owner=?
+                       AND claim_epoch=?
+                    """,
+                    (
+                        dt.datetime.now(dt.timezone.utc).isoformat(),
+                        message_id,
+                        claim_owner,
+                        claim_epoch,
+                    ),
+                )
+                return conn
+        except Exception as exc:
+            if conn is not None:
+                with suppress(Exception):
+                    conn.rollback()
+                with suppress(Exception):
+                    conn.close()
+            logger.warning(
+                "Discord recovery claim guard unavailable: %s",
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def release_claim_guard(conn: sqlite3.Connection) -> None:
+        try:
+            conn.commit()
+        finally:
+            conn.close()
+
     def _initialize(self, conn: sqlite3.Connection) -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS discord_messages (
@@ -74,9 +158,26 @@ class DiscordRecoveryStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_attempt_at TEXT,
                 last_error TEXT,
+                claim_owner TEXT,
+                claim_epoch INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             )
         """)
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(discord_messages)"
+            ).fetchall()
+        }
+        if "claim_owner" not in columns:
+            conn.execute(
+                "ALTER TABLE discord_messages ADD COLUMN claim_owner TEXT"
+            )
+        if "claim_epoch" not in columns:
+            conn.execute(
+                "ALTER TABLE discord_messages "
+                "ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS discord_recovery_scans (
                 scan_id TEXT PRIMARY KEY,
