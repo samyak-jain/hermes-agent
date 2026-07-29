@@ -35,6 +35,10 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
     datetimes.  Compute the wall-clock boundary in the configured Hermes
     timezone, then convert it back before comparing so timezone support does
     not require a persisted timestamp migration.
+
+    A local date always maps to one instant: ambiguous fall-back hours use
+    ``fold=0`` (the first occurrence), while nonexistent spring-forward hours
+    use ZoneInfo's ``fold=0`` offset and normalize forward by the DST gap.
     """
     was_naive = now.tzinfo is None
     instant = now.astimezone() if was_naive else now
@@ -47,14 +51,24 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
         if configured_tz is not None
         else instant
     )
-    boundary = configured_now.replace(
-        hour=at_hour,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    if configured_now.hour < at_hour:
-        boundary -= timedelta(days=1)
+
+    def boundary_for(local_date) -> datetime:
+        wall_time = datetime(
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            at_hour,
+            tzinfo=configured_now.tzinfo,
+            fold=0,
+        )
+        return datetime.fromtimestamp(
+            wall_time.timestamp(),
+            configured_now.tzinfo,
+        )
+
+    boundary = boundary_for(configured_now.date())
+    if boundary.timestamp() > instant.timestamp():
+        boundary = boundary_for(configured_now.date() - timedelta(days=1))
 
     if was_naive:
         return datetime.fromtimestamp(boundary.timestamp())
