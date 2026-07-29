@@ -185,6 +185,18 @@ class DiscordRecoveryStore:
             )
             return None
 
+    def acquire_channel_lock(
+        self,
+        channel_id: str,
+        *,
+        timeout: float = 5.0,
+    ) -> DiscordClaimGuard | None:
+        """Fence receipt insertion and cursor commits for one Discord lane."""
+        return self.acquire_message_lock(
+            f"channel:{channel_id}",
+            timeout=timeout,
+        )
+
     @staticmethod
     def release_claim_guard(guard: DiscordClaimGuard) -> None:
         try:
