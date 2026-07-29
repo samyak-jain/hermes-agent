@@ -103,12 +103,30 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        if (
+            idempotency_key
+            and await self.async_session_store.reset_idempotency_applied(
+                session_key,
+                idempotency_key,
+            )
+        ):
+            logger.info(
+                "Skipping already-applied receipt-backed reset %s for %s",
+                idempotency_key,
+                session_key,
+            )
+            return EphemeralReply(t("gateway.reset.header_default"))
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -201,7 +219,15 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
+        if idempotency_key:
+            new_entry = await self.async_session_store.reset_session(
+                session_key,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            new_entry = await self.async_session_store.reset_session(
+                session_key
+            )
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)

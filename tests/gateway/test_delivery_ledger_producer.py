@@ -120,6 +120,17 @@ class TestProducerHook:
         assert _rows() == []
 
     @pytest.mark.asyncio
+    async def test_durable_platform_receipt_owns_replay_exclusively(self):
+        adapter = _Adapter()
+        event = _event()
+        event.metadata["_gateway_receipt_ids"] = ["msg-42"]
+
+        await _run(adapter, event)
+
+        assert adapter.sent == ["final answer"]
+        assert _rows() == []
+
+    @pytest.mark.asyncio
     async def test_disabled_gate_skips_recording_but_sends(self):
         adapter = _Adapter()
         with patch("gateway.delivery_ledger.ledger_enabled", return_value=False):

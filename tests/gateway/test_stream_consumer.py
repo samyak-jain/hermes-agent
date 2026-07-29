@@ -25,6 +25,113 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+def test_recovery_stream_final_does_not_complete_receipts_early():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={
+            "_gateway_receipt_ids": ["456", "457"],
+        },
+    )
+
+    assert consumer._metadata_for_send(final=True) == {
+        "_gateway_receipt_ids": ["456", "457"],
+        "reply_to_message_id": "456",
+        "notify": False,
+    }
+
+
+def test_recovery_stream_new_messages_get_ordered_chunk_indices():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(final=False)
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
+    second = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert first["_gateway_receipt_ids"] == ["456"]
+    assert second["_gateway_receipt_ids"] == ["456"]
+
+
+def test_recovery_stream_failed_new_send_reuses_chunk_index():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(final=False)
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=False),
+    )
+    retry = consumer._metadata_for_new_send(final=True)
+    consumer._mark_new_send_delivered(
+        retry,
+        SimpleNamespace(success=True),
+    )
+    next_segment = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert retry["_gateway_recovery_text_chunk_index"] == 0
+    assert next_segment["_gateway_recovery_text_chunk_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_edits_keep_current_segment_chunk_index():
+    adapter = MagicMock()
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="m1")
+    )
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
+    await consumer._edit_message(
+        message_id="m1",
+        content="first segment",
+        finalize=True,
+    )
+    second = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        second,
+        SimpleNamespace(success=True),
+    )
+    await consumer._edit_message(
+        message_id="m2",
+        content="second segment",
+        finalize=True,
+    )
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert [
+        call.kwargs["metadata"][
+            "_gateway_recovery_text_chunk_index"
+        ]
+        for call in adapter.edit_message.await_args_list
+    ] == [0, 1]
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -803,7 +910,13 @@ class TestSegmentBreakOnToolBoundary:
         adapter.MAX_MESSAGE_LENGTH = 610
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
-        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            config,
+            initial_reply_to_id="456",
+            metadata={"_gateway_receipt_ids": ["456"]},
+        )
 
         prefix = "Hello world"
         tail = "x" * 620
@@ -819,6 +932,13 @@ class TestSegmentBreakOnToolBoundary:
         assert len(sent_texts) == 3
         assert sent_texts[0].startswith(prefix)
         assert sum(len(t) for t in sent_texts[1:]) == len(tail)
+        recovery_indices = [
+            call.kwargs["metadata"][
+                "_gateway_recovery_text_chunk_index"
+            ]
+            for call in adapter.send.call_args_list
+        ]
+        assert recovery_indices == [0, 1, 2]
 
     @pytest.mark.asyncio
     async def test_fallback_final_sends_full_text_at_tool_boundary(self):

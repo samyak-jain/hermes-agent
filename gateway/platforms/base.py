@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -2104,6 +2105,14 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class DeferredCommandReply:
+    """Commit an irreversible receipt-backed command after its reply lands."""
+
+    def __init__(self, response, commit):
+        self.response = response
+        self.commit = commit
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -2124,6 +2133,12 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
 
 
 _GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
+_GATEWAY_INLINE_OUTCOME_KEY = "_gateway_inline_processing_outcome"
+_GATEWAY_STREAM_DELIVERY_FAILED_KEY = "_gateway_stream_delivery_failed"
+_GATEWAY_DELIVERY_STATE_KEY = "_gateway_delivery_state"
+_GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY = (
+    "_gateway_recovery_text_chunk_index"
+)
 
 
 def _merge_gateway_receipt_ids(existing: MessageEvent, event: MessageEvent) -> None:
@@ -4757,7 +4772,14 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
-            _text, _eph_ttl = self._unwrap_ephemeral(response)
+            deferred = (
+                response
+                if isinstance(response, DeferredCommandReply)
+                else None
+            )
+            _text, _eph_ttl = self._unwrap_ephemeral(
+                deferred.response if deferred is not None else response
+            )
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
             # condition fix — issue #18912).  Previously the send happened
@@ -4771,18 +4793,57 @@ class BasePlatformAdapter(ABC):
                     len(_text),
                     event.source.chat_id,
                 )
+                _send_metadata = _mark_notify_metadata(thread_meta)
+                _receipt_ids = list(
+                    dict.fromkeys(
+                        str(value)
+                        for value in event.metadata.get(
+                            _GATEWAY_RECEIPT_IDS_KEY,
+                            [],
+                        )
+                        if str(value)
+                    )
+                )
+                if deferred is not None and _receipt_ids:
+                    # A receipt-backed /stop or /new reply is confirmation
+                    # that the control action is ABOUT to commit, not evidence
+                    # that it already committed.  Keep this send nonce-fenced
+                    # but nonterminal; normal processing completion advances
+                    # the durable receipt only after deferred.commit() returns.
+                    _send_metadata[_GATEWAY_RECEIPT_IDS_KEY] = _receipt_ids
+                    _send_metadata["reply_to_message_id"] = str(
+                        _reply_anchor_for_event(event) or _receipt_ids[0]
+                    )
+                    _send_metadata["notify"] = False
+                    _send_metadata[
+                        "_gateway_recovery_component_index"
+                    ] = f"deferred-command-{cmd}"
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_send_metadata,
                 )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
+                if (
+                    event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+                    and not getattr(_r, "success", False)
+                ):
+                    raise RuntimeError(
+                        getattr(_r, "error", None)
+                        or f"Failed to deliver '/{cmd}' response"
+                    )
+                if (
+                    _eph_ttl > 0
+                    and getattr(_r, "success", False)
+                    and _r.message_id
+                ):
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
                         message_id=_r.message_id,
                         ttl_seconds=_eph_ttl,
                     )
+            if deferred is not None:
+                await deferred.commit()
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -4857,8 +4918,14 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 if cmd in {"stop", "new", "reset"}:
                     self._discard_text_debounce(session_key)
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.FAILURE.value
+                    )
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
+                        event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                            ProcessingOutcome.SUCCESS.value
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
@@ -4873,6 +4940,9 @@ class BasePlatformAdapter(ABC):
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,
                 )
+                event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                    ProcessingOutcome.FAILURE.value
+                )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
@@ -4884,12 +4954,29 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
+                        if (
+                            event.metadata.get(
+                                _GATEWAY_RECEIPT_IDS_KEY
+                            )
+                            and not getattr(_r, "success", False)
+                        ):
+                            raise RuntimeError(
+                                getattr(_r, "error", None)
+                                or f"Failed to deliver '/{cmd}' response"
+                            )
+                        if (
+                            _eph_ttl > 0
+                            and getattr(_r, "success", False)
+                            and _r.message_id
+                        ):
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.SUCCESS.value
+                    )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -4924,6 +5011,9 @@ class BasePlatformAdapter(ABC):
                         "[%s] Routing message to clarify text-intercept for %s",
                         self.name, session_key,
                     )
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.FAILURE.value
+                    )
                     try:
                         _thread_meta = _thread_metadata_for_source(
                             event.source, _reply_anchor_for_event(event)
@@ -4937,12 +5027,29 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
+                            if (
+                                event.metadata.get(
+                                    _GATEWAY_RECEIPT_IDS_KEY
+                                )
+                                and not getattr(_r, "success", False)
+                            ):
+                                raise RuntimeError(
+                                    getattr(_r, "error", None)
+                                    or "Failed to deliver clarification response"
+                                )
+                            if (
+                                _eph_ttl > 0
+                                and getattr(_r, "success", False)
+                                and _r.message_id
+                            ):
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                            ProcessingOutcome.SUCCESS.value
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
@@ -5030,14 +5137,50 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_failed = False
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_failed = True
+
+        receipt_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in event.metadata.get(
+                    _GATEWAY_RECEIPT_IDS_KEY,
+                    [],
+                )
+                if str(value)
+            )
+        )
+        if receipt_ids:
+            # The gateway's streaming consumer is created inside the message
+            # handler, before this adapter regains control for final delivery.
+            # Carry the complete (possibly batch-merged) receipt set on the
+            # per-event source so all in-handler sends can be fenced too.
+            setattr(
+                event.source,
+                "_gateway_receipt_ids",
+                receipt_ids,
+            )
+            delivery_state = getattr(
+                event.source,
+                _GATEWAY_DELIVERY_STATE_KEY,
+                None,
+            )
+            if not isinstance(delivery_state, dict):
+                delivery_state = {"failed": False}
+                setattr(
+                    event.source,
+                    _GATEWAY_DELIVERY_STATE_KEY,
+                    delivery_state,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5076,8 +5219,72 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
 
-            # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            # Call the handler (this can take a while with tool calls).
+            # Receipt metadata only belongs to this inbound event; remove the
+            # temporary source binding before the source can be reused by a
+            # later synthetic/background turn.
+            try:
+                response = await self._message_handler(event)
+            finally:
+                delivery_state = getattr(
+                    event.source,
+                    _GATEWAY_DELIVERY_STATE_KEY,
+                    None,
+                )
+                if (
+                    getattr(
+                        event.source,
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                        False,
+                    )
+                    or (
+                        isinstance(delivery_state, dict)
+                        and delivery_state.get("failed")
+                    )
+                ):
+                    # The runner can deliver the first response of an in-band
+                    # queued turn before this lifecycle frame resumes.  Keep a
+                    # failed fenced send attached to the outer event so the
+                    # complete hook leaves every merged receipt retryable.
+                    event.metadata[
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                    ] = True
+                with suppress(AttributeError):
+                    delattr(
+                        event.source,
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                    )
+                with suppress(AttributeError):
+                    delattr(
+                        event.source,
+                        _GATEWAY_DELIVERY_STATE_KEY,
+                    )
+                if receipt_ids:
+                    # A busy runner can consume queued follow-ups in-band
+                    # before this adapter frame regains control.  The runner
+                    # appends those follow-up receipt IDs to the source-bound
+                    # list so this *single* lifecycle completion covers the
+                    # whole ordered turn chain.  Copy the final list back to
+                    # event metadata before removing the temporary binding;
+                    # Discord's completion hook reads metadata, while the
+                    # local list is also used by delivery fencing below.
+                    merged_receipt_ids = list(
+                        dict.fromkeys(
+                            str(value)
+                            for value in getattr(
+                                event.source,
+                                "_gateway_receipt_ids",
+                                receipt_ids,
+                            )
+                            if str(value)
+                        )
+                    )
+                    receipt_ids[:] = merged_receipt_ids
+                    event.metadata[
+                        _GATEWAY_RECEIPT_IDS_KEY
+                    ] = merged_receipt_ids
+                    with suppress(AttributeError):
+                        delattr(event.source, "_gateway_receipt_ids")
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5169,6 +5376,40 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _receipt_ids = list(
+                    dict.fromkeys(
+                        str(value)
+                        for value in event.metadata.get(
+                            _GATEWAY_RECEIPT_IDS_KEY,
+                            [],
+                        )
+                        if str(value)
+                    )
+                )
+                if _receipt_ids:
+                    _final_thread_metadata = dict(
+                        _final_thread_metadata or {}
+                    )
+                    _final_thread_metadata[_GATEWAY_RECEIPT_IDS_KEY] = (
+                        _receipt_ids
+                    )
+                    # Recovery receipts become terminal only after the complete
+                    # response plan has finished. Each Discord side effect is
+                    # nonce-fenced, so an interrupted mixed text/media response
+                    # can safely retry without a successful first component
+                    # prematurely making the whole turn invisible.
+                    _final_thread_metadata["notify"] = False
+                _delivery_component_index = 0
+
+                def _next_delivery_metadata():
+                    nonlocal _delivery_component_index
+                    metadata = dict(_final_thread_metadata or {})
+                    if _receipt_ids:
+                        metadata["_gateway_recovery_component_index"] = (
+                            _delivery_component_index
+                        )
+                    _delivery_component_index += 1
+                    return metadata
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -5209,8 +5450,9 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -5242,9 +5484,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not receipt_ids
+                        and not is_ephemeral_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -5274,12 +5520,26 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if receipt_ids and delivery_adapter is not self:
+                        # Discord recovery claim ownership is adapter-instance
+                        # scoped. A reconnect replacement has transport access
+                        # but not this in-flight turn's claim epoch, so sending
+                        # through it would bypass the side-effect fence. Fail
+                        # closed and let reconnect recovery retry the receipt.
+                        result = SendResult(
+                            success=False,
+                            error=(
+                                "Recovery delivery adapter was replaced; "
+                                "retrying from durable receipt"
+                            ),
+                        )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_next_delivery_metadata(),
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -5321,14 +5581,18 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -5363,14 +5627,18 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
-                            metadata=_final_thread_metadata,
+                            metadata=_next_delivery_metadata(),
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(
+                            SendResult(success=False, error=str(batch_err))
+                        )
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -5381,25 +5649,29 @@ class BasePlatformAdapter(ABC):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         elif ext in _VIDEO_EXTS:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         else:
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_delivery(
+                            SendResult(success=False, error=str(media_err))
+                        )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -5408,19 +5680,23 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_next_delivery_metadata(),
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_delivery(
+                            SendResult(success=False, error=str(file_err))
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
@@ -5437,7 +5713,15 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                delivery_succeeded and not delivery_failed
+                if delivery_attempted
+                else not bool(response)
+            )
+            if event.metadata.get(
+                _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+            ):
+                processing_ok = False
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
@@ -5496,13 +5780,31 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                if receipt_ids:
+                    _thread_metadata = dict(_thread_metadata or {})
+                    _thread_metadata[_GATEWAY_RECEIPT_IDS_KEY] = list(
+                        receipt_ids
+                    )
+                    _thread_metadata["reply_to_message_id"] = str(
+                        _reply_anchor_for_event(event)
+                        or receipt_ids[0]
+                    )
+                    _thread_metadata["notify"] = False
+                    _thread_metadata[
+                        "_gateway_recovery_component_index"
+                    ] = "handler-error"
+                error_reply_to = (
+                    (_thread_metadata or {}).get(
+                        "reply_to_message_id"
+                    )
+                    or _reply_anchor_for_event(event)
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -5510,6 +5812,7 @@ class BasePlatformAdapter(ABC):
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
                     ),
+                    reply_to=error_reply_to,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:
@@ -5517,6 +5820,15 @@ class BasePlatformAdapter(ABC):
                     "[%s] Failed to send error notification to user: %s",
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
+            finally:
+                # A Discord recovery failure becomes side-effect-ineligible
+                # once its claim is terminal. Attempt the nonce-addressed
+                # error notice while the claim is still processing.
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    event,
+                    ProcessingOutcome.FAILURE,
+                )
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not

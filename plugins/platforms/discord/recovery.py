@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +21,28 @@ _DB_FILENAME = "discord_message_recovery.db"
 _RETENTION_DAYS = 30
 
 
+class _LocalLockEntry:
+    """Reference-counted process-local half of a recovery lock."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+class DiscordClaimGuard:
+    """Per-message cross-process lock held while a Discord side effect runs."""
+
+    def __init__(
+        self,
+        handle: Any,
+        key: str,
+        entry: _LocalLockEntry,
+    ) -> None:
+        self.handle = handle
+        self.key = key
+        self.entry = entry
+
+
 class DiscordRecoveryStore:
     """Small profile-scoped SQLite ledger for completed Discord messages."""
 
@@ -26,6 +50,7 @@ class DiscordRecoveryStore:
         self._lock = threading.Lock()
         self._initialized = False
         self._hermes_home = Path(hermes_home or get_hermes_home())
+        self._message_locks: dict[str, _LocalLockEntry] = {}
 
     def path(self) -> Path:
         directory = self._hermes_home / "gateway"
@@ -59,27 +84,15 @@ class DiscordRecoveryStore:
         claim_epoch: int,
         *,
         allow_responded: bool = False,
-    ) -> sqlite3.Connection | None:
-        """Hold the cross-process writer lock while an owned side effect runs."""
-        conn: sqlite3.Connection | None = None
-        try:
-            with self._lock:
-                path = self.path()
-                conn = sqlite3.connect(
-                    path,
-                    timeout=0.1,
-                    check_same_thread=False,
-                )
-                if not self._initialized:
-                    self._initialize(conn)
-                    self._initialized = True
-                    conn.commit()
-                    with suppress(OSError):
-                        os.chmod(path, 0o600)
-                conn.commit()
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    """
+    ) -> DiscordClaimGuard | None:
+        """Fence one owned side effect without locking the whole SQLite DB."""
+        guard = self.acquire_message_lock(message_id)
+        if guard is None:
+            return None
+
+        def _owned(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                """
                     SELECT 1
                       FROM discord_messages
                      WHERE message_id=?
@@ -90,51 +103,144 @@ class DiscordRecoveryStore:
                            OR (? AND status='responded')
                        )
                     """,
-                    (
-                        message_id,
-                        claim_owner,
-                        claim_epoch,
-                        1 if allow_responded else 0,
-                    ),
-                ).fetchone()
-                if row is None:
-                    conn.rollback()
-                    conn.close()
-                    return None
-                conn.execute(
-                    """
-                    UPDATE discord_messages
-                       SET updated_at=?
-                     WHERE message_id=?
-                       AND claim_owner=?
-                       AND claim_epoch=?
-                    """,
-                    (
-                        dt.datetime.now(dt.timezone.utc).isoformat(),
-                        message_id,
-                        claim_owner,
-                        claim_epoch,
-                    ),
-                )
-                return conn
+                (
+                    message_id,
+                    claim_owner,
+                    claim_epoch,
+                    1 if allow_responded else 0,
+                ),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """
+                UPDATE discord_messages
+                   SET updated_at=?
+                 WHERE message_id=?
+                   AND claim_owner=?
+                   AND claim_epoch=?
+                """,
+                (
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                    message_id,
+                    claim_owner,
+                    claim_epoch,
+                ),
+            )
+            return True
+
+        if self.call(_owned, False):
+            return guard
+        self.release_claim_guard(guard)
+        return None
+
+    def acquire_message_lock(
+        self,
+        message_id: str,
+        *,
+        timeout: float = 5.0,
+    ) -> DiscordClaimGuard | None:
+        """Acquire a lock scoped to one Discord snowflake.
+
+        SQLite has database-wide writer locks, so holding ``BEGIN IMMEDIATE``
+        across a network await stalls unrelated channel ingress. A small
+        advisory lock file gives the same crash-released, cross-process fence
+        while allowing other message IDs to keep claiming and completing.
+        """
+        key = hashlib.sha256(str(message_id).encode()).hexdigest()
+        with self._lock:
+            entry = self._message_locks.setdefault(
+                key,
+                _LocalLockEntry(),
+            )
+            entry.users += 1
+        if not entry.lock.acquire(timeout=max(0.0, timeout)):
+            self._release_local_lock_reference(key, entry)
+            return None
+
+        lock_dir = self._hermes_home / "gateway" / "discord_recovery_locks"
+        handle = None
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            handle = (lock_dir / f"{key}.lock").open("a+b")
+            with suppress(OSError):
+                os.chmod(handle.name, 0o600)
+            try:
+                import fcntl
+            except ImportError:
+                # Windows has no fcntl; the process-local lock still prevents
+                # duplicate callbacks within the only supported local daemon.
+                return DiscordClaimGuard(handle, key, entry)
+
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    return DiscordClaimGuard(handle, key, entry)
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        handle.close()
+                        entry.lock.release()
+                        self._release_local_lock_reference(key, entry)
+                        return None
+                    time.sleep(0.01)
         except Exception as exc:
-            if conn is not None:
+            if handle is not None:
                 with suppress(Exception):
-                    conn.rollback()
-                with suppress(Exception):
-                    conn.close()
+                    handle.close()
+            entry.lock.release()
+            self._release_local_lock_reference(key, entry)
             logger.warning(
-                "Discord recovery claim guard unavailable: %s",
+                "Discord recovery message lock unavailable: %s",
                 exc,
             )
             return None
 
-    @staticmethod
-    def release_claim_guard(conn: sqlite3.Connection) -> None:
+    def acquire_channel_lock(
+        self,
+        channel_id: str,
+        *,
+        timeout: float = 5.0,
+    ) -> DiscordClaimGuard | None:
+        """Fence receipt insertion and cursor commits for one Discord lane."""
+        return self.acquire_message_lock(
+            f"channel:{channel_id}",
+            timeout=timeout,
+        )
+
+    def _release_local_lock_reference(
+        self,
+        key: str,
+        entry: _LocalLockEntry,
+    ) -> None:
+        with self._lock:
+            entry.users -= 1
+            if (
+                entry.users == 0
+                and not entry.lock.locked()
+                and self._message_locks.get(key) is entry
+            ):
+                self._message_locks.pop(key, None)
+
+    def release_claim_guard(self, guard: DiscordClaimGuard) -> None:
         try:
-            conn.commit()
+            try:
+                import fcntl
+            except ImportError:
+                pass
+            else:
+                with suppress(OSError):
+                    fcntl.flock(guard.handle.fileno(), fcntl.LOCK_UN)
+            guard.handle.close()
         finally:
-            conn.close()
+            guard.entry.lock.release()
+            self._release_local_lock_reference(
+                guard.key,
+                guard.entry,
+            )
 
     def _initialize(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -156,23 +262,24 @@ class DiscordRecoveryStore:
                 last_error TEXT,
                 claim_owner TEXT,
                 claim_epoch INTEGER NOT NULL DEFAULT 0,
+                routing_thread_id TEXT,
                 updated_at TEXT NOT NULL
             )
         """)
         columns = {
             row[1]
-            for row in conn.execute(
-                "PRAGMA table_info(discord_messages)"
-            ).fetchall()
+            for row in conn.execute("PRAGMA table_info(discord_messages)").fetchall()
         }
         if "claim_owner" not in columns:
-            conn.execute(
-                "ALTER TABLE discord_messages ADD COLUMN claim_owner TEXT"
-            )
+            conn.execute("ALTER TABLE discord_messages ADD COLUMN claim_owner TEXT")
         if "claim_epoch" not in columns:
             conn.execute(
                 "ALTER TABLE discord_messages "
                 "ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "routing_thread_id" not in columns:
+            conn.execute(
+                "ALTER TABLE discord_messages ADD COLUMN routing_thread_id TEXT"
             )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS discord_recovery_scans (
