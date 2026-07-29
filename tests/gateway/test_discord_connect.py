@@ -191,6 +191,86 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
 
 
 @pytest.mark.asyncio
+async def test_on_ready_closes_backfill_barrier_before_first_await(
+    monkeypatch,
+):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token")
+    )
+    resolution_started = asyncio.Event()
+    allow_resolution = asyncio.Event()
+    created = {}
+
+    async def slow_resolution():
+        resolution_started.set()
+        await allow_resolution.wait()
+
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock",
+        lambda scope, identity: None,
+    )
+    intents = SimpleNamespace(
+        message_content=False,
+        dm_messages=False,
+        guild_messages=False,
+        members=False,
+        voice_states=False,
+    )
+    monkeypatch.setattr(
+        discord_platform.Intents,
+        "default",
+        lambda: intents,
+    )
+
+    def fake_bot_factory(**kwargs):
+        bot = FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        )
+        created["bot"] = bot
+        return bot
+
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        fake_bot_factory,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_allowed_usernames",
+        slow_resolution,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_ensure_missed_message_backfill_task",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_run_post_connect_initialization",
+        AsyncMock(),
+    )
+    adapter._discord_recovery_barrier.set()
+
+    connecting = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(resolution_started.wait(), timeout=1)
+
+    assert adapter._discord_recovery_barrier.is_set() is False
+    assert adapter._ready_event.is_set() is False
+
+    allow_resolution.set()
+    assert await asyncio.wait_for(connecting, timeout=1) is True
+    adapter._ensure_missed_message_backfill_task.assert_called_once_with()
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial_allowed",
     [
