@@ -76,6 +76,11 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
     return boundary.astimezone(now.tzinfo)
 
 
+def _is_before_daily_reset(updated_at: datetime, boundary: datetime) -> bool:
+    """Compare reset instants without losing naive server-local ``fold``."""
+    return updated_at.timestamp() < boundary.timestamp()
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -836,6 +841,8 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        if self.updated_at.fold:
+            result["updated_at_fold"] = self.updated_at.fold
         return result
     
     @classmethod
@@ -878,11 +885,16 @@ class SessionEntry:
                 "Invalid session_key: potential directory traversal detected"
             )
 
+        updated_at = datetime.fromisoformat(data["updated_at"])
+        updated_at_fold = data.get("updated_at_fold")
+        if type(updated_at_fold) is int and updated_at_fold in (0, 1):
+            updated_at = updated_at.replace(fold=updated_at_fold)
+
         return cls(
             session_key=session_key,
             session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            updated_at=updated_at,
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -1717,7 +1729,7 @@ class SessionStore:
 
         if policy.mode in {"daily", "both"}:
             today_reset = _daily_reset_boundary(now, policy.at_hour)
-            if entry.updated_at < today_reset:
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return True
 
         return False
@@ -1814,7 +1826,7 @@ class SessionStore:
         if policy.mode in {"daily", "both"}:
             today_reset = _daily_reset_boundary(now, policy.at_hour)
             
-            if entry.updated_at < today_reset:
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return "daily"
         
         return None
