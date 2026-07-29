@@ -201,6 +201,37 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_stream_delivery_failure_marks_turn_unsuccessful(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(event):
+            assert getattr(
+                event.source,
+                "_gateway_receipt_ids",
+            ) == ["1", "2"]
+            event.metadata["_gateway_stream_delivery_failed"] = True
+            return None
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        event.metadata["_gateway_receipt_ids"] = ["1", "2"]
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert not hasattr(event.source, "_gateway_receipt_ids")
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import _GATEWAY_RECEIPT_IDS_KEY
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
@@ -382,8 +383,13 @@ class GatewayStreamConsumer:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if expect_edits:
             meta["expect_edits"] = True
-        if final:
+        if final and not meta.get(_GATEWAY_RECEIPT_IDS_KEY):
             meta["notify"] = True
+        elif meta.get(_GATEWAY_RECEIPT_IDS_KEY):
+            # Streaming text is only one component of the response plan.
+            # The adapter completion hook owns the terminal cursor update
+            # after post-stream media/footer delivery also succeeds.
+            meta["notify"] = False
         return meta or None
 
     @property

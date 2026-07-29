@@ -25,6 +25,23 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+def test_recovery_stream_final_does_not_complete_receipts_early():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={
+            "_gateway_receipt_ids": ["456", "457"],
+        },
+    )
+
+    assert consumer._metadata_for_send(final=True) == {
+        "_gateway_receipt_ids": ["456", "457"],
+        "reply_to_message_id": "456",
+        "notify": False,
+    }
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 

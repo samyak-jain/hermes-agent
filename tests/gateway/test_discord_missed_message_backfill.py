@@ -1594,6 +1594,35 @@ def test_durable_live_claim_is_atomic_across_adapter_instances(adapter):
     assert sorted(results) == ["active", "claimed"]
 
 
+def test_recovery_message_lock_entries_are_evicted_after_release(adapter):
+    store = adapter._discord_recovery_store
+
+    for message_id in range(100):
+        guard = store.acquire_message_lock(str(message_id))
+        assert guard is not None
+        store.release_claim_guard(guard)
+
+    assert store._message_locks == {}
+
+
+def test_recovery_message_lock_timeout_keeps_only_active_entry(adapter):
+    store = adapter._discord_recovery_store
+    guard = store.acquire_message_lock("same-message")
+    assert guard is not None
+
+    assert (
+        store.acquire_message_lock(
+            "same-message",
+            timeout=0,
+        )
+        is None
+    )
+    assert len(store._message_locks) == 1
+
+    store.release_claim_guard(guard)
+    assert store._message_locks == {}
+
+
 @pytest.mark.asyncio
 async def test_reclaimed_lease_fences_stale_owner_and_cursor(adapter):
     message_id = str(_recent_snowflakes(1)[0])
