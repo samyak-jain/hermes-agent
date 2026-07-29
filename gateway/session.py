@@ -777,6 +777,11 @@ class SessionEntry:
     # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
+
+    # Receipt id of the Discord recovery command that created this fresh
+    # session. A replay after a crash between the reset and receipt completion
+    # must observe the already-applied reset instead of rotating again.
+    last_reset_idempotency_key: Optional[str] = None
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -837,6 +842,7 @@ class SessionEntry:
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
+            "last_reset_idempotency_key": self.last_reset_idempotency_key,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -919,6 +925,9 @@ class SessionEntry:
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
+            last_reset_idempotency_key=data.get(
+                "last_reset_idempotency_key"
+            ),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -2384,7 +2393,13 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -2397,6 +2412,12 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+            if (
+                idempotency_key
+                and old_entry.last_reset_idempotency_key
+                == str(idempotency_key)
+            ):
+                return old_entry
             db_end_session_id = old_entry.session_id
 
             now = _now()
@@ -2412,6 +2433,9 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                last_reset_idempotency_key=(
+                    str(idempotency_key) if idempotency_key else None
+                ),
             )
 
             self._entries[session_key] = new_entry
@@ -2454,6 +2478,23 @@ class SessionStore:
                 logger.debug("Session DB operation failed: %s", e)
 
         return new_entry
+
+    def reset_idempotency_applied(
+        self,
+        session_key: str,
+        idempotency_key: str,
+    ) -> bool:
+        """Return whether a receipt-backed reset already rotated this lane."""
+        if not idempotency_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return bool(
+                entry is not None
+                and entry.last_reset_idempotency_key
+                == str(idempotency_key)
+            )
 
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.

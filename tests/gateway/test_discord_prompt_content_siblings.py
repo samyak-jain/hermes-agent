@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord.adapter import (
+    DiscordAdapter,
+    ExecApprovalView,
+    SlashConfirmView,
+)
 
 
 def _capture_channel(adapter):
@@ -64,6 +68,64 @@ async def test_slash_confirm_truncates_long_message_in_content():
     assert result.success is True
     assert len(sent["content"]) <= adapter.MAX_MESSAGE_LENGTH
     assert "... [truncated]" in sent["content"]
+
+
+@pytest.mark.asyncio
+async def test_slash_confirm_routes_recovery_prompt_through_side_effect_guard():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    _capture_channel(adapter)
+    guarded_send = AsyncMock(
+        return_value=SimpleNamespace(id=444)
+    )
+    adapter._send_discord_interactive_prompt = guarded_send
+    metadata = {
+        "_gateway_receipt_ids": ["333"],
+        "reply_to_message_id": "333",
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+
+    result = await adapter.send_slash_confirm(
+        chat_id="555",
+        title="Reset session?",
+        message="This will clear the current conversation history.",
+        session_key="discord:555",
+        confirm_id="c3",
+        metadata=metadata,
+    )
+
+    assert result.success is True
+    guarded_send.assert_awaited_once()
+    assert guarded_send.await_args.kwargs["metadata"] is metadata
+    assert guarded_send.await_args.kwargs["component"] == "slash-confirm"
+
+
+def test_replayed_interactive_views_keep_remote_component_ids():
+    approval_kwargs = {
+        "session_key": "discord:555",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_approval = ExecApprovalView(**approval_kwargs)
+    replayed_approval = ExecApprovalView(**approval_kwargs)
+    assert [
+        child.custom_id for child in first_approval.children
+    ] == [
+        child.custom_id for child in replayed_approval.children
+    ]
+
+    confirm_kwargs = {
+        "session_key": "discord:555",
+        "confirm_id": "stable-confirm",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_confirm = SlashConfirmView(**confirm_kwargs)
+    replayed_confirm = SlashConfirmView(**confirm_kwargs)
+    assert [
+        child.custom_id for child in first_confirm.children
+    ] == [
+        child.custom_id for child in replayed_confirm.children
+    ]
 
 
 @pytest.mark.asyncio

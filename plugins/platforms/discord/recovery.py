@@ -21,16 +21,26 @@ _DB_FILENAME = "discord_message_recovery.db"
 _RETENTION_DAYS = 30
 
 
+class _LocalLockEntry:
+    """Reference-counted process-local half of a recovery lock."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
 class DiscordClaimGuard:
     """Per-message cross-process lock held while a Discord side effect runs."""
 
     def __init__(
         self,
         handle: Any,
-        local_lock: threading.Lock,
+        key: str,
+        entry: _LocalLockEntry,
     ) -> None:
         self.handle = handle
-        self.local_lock = local_lock
+        self.key = key
+        self.entry = entry
 
 
 class DiscordRecoveryStore:
@@ -40,7 +50,7 @@ class DiscordRecoveryStore:
         self._lock = threading.Lock()
         self._initialized = False
         self._hermes_home = Path(hermes_home or get_hermes_home())
-        self._message_locks: dict[str, threading.Lock] = {}
+        self._message_locks: dict[str, _LocalLockEntry] = {}
 
     def path(self) -> Path:
         directory = self._hermes_home / "gateway"
@@ -144,11 +154,13 @@ class DiscordRecoveryStore:
         """
         key = hashlib.sha256(str(message_id).encode()).hexdigest()
         with self._lock:
-            local_lock = self._message_locks.setdefault(
+            entry = self._message_locks.setdefault(
                 key,
-                threading.Lock(),
+                _LocalLockEntry(),
             )
-        if not local_lock.acquire(timeout=max(0.0, timeout)):
+            entry.users += 1
+        if not entry.lock.acquire(timeout=max(0.0, timeout)):
+            self._release_local_lock_reference(key, entry)
             return None
 
         lock_dir = self._hermes_home / "gateway" / "discord_recovery_locks"
@@ -163,7 +175,7 @@ class DiscordRecoveryStore:
             except ImportError:
                 # Windows has no fcntl; the process-local lock still prevents
                 # duplicate callbacks within the only supported local daemon.
-                return DiscordClaimGuard(handle, local_lock)
+                return DiscordClaimGuard(handle, key, entry)
 
             deadline = time.monotonic() + max(0.0, timeout)
             while True:
@@ -172,18 +184,20 @@ class DiscordRecoveryStore:
                         handle.fileno(),
                         fcntl.LOCK_EX | fcntl.LOCK_NB,
                     )
-                    return DiscordClaimGuard(handle, local_lock)
+                    return DiscordClaimGuard(handle, key, entry)
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
                         handle.close()
-                        local_lock.release()
+                        entry.lock.release()
+                        self._release_local_lock_reference(key, entry)
                         return None
                     time.sleep(0.01)
         except Exception as exc:
             if handle is not None:
                 with suppress(Exception):
                     handle.close()
-            local_lock.release()
+            entry.lock.release()
+            self._release_local_lock_reference(key, entry)
             logger.warning(
                 "Discord recovery message lock unavailable: %s",
                 exc,
@@ -202,8 +216,21 @@ class DiscordRecoveryStore:
             timeout=timeout,
         )
 
-    @staticmethod
-    def release_claim_guard(guard: DiscordClaimGuard) -> None:
+    def _release_local_lock_reference(
+        self,
+        key: str,
+        entry: _LocalLockEntry,
+    ) -> None:
+        with self._lock:
+            entry.users -= 1
+            if (
+                entry.users == 0
+                and not entry.lock.locked()
+                and self._message_locks.get(key) is entry
+            ):
+                self._message_locks.pop(key, None)
+
+    def release_claim_guard(self, guard: DiscordClaimGuard) -> None:
         try:
             try:
                 import fcntl
@@ -214,7 +241,11 @@ class DiscordRecoveryStore:
                     fcntl.flock(guard.handle.fileno(), fcntl.LOCK_UN)
             guard.handle.close()
         finally:
-            guard.local_lock.release()
+            guard.entry.lock.release()
+            self._release_local_lock_reference(
+                guard.key,
+                guard.entry,
+            )
 
     def _initialize(self, conn: sqlite3.Connection) -> None:
         conn.execute("""
