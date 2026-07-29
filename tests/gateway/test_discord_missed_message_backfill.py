@@ -1221,11 +1221,38 @@ async def test_final_stream_edit_marks_original_request_complete(adapter):
         "9009",
         "complete streamed response",
         finalize=True,
-        metadata={"reply_to_message_id": "102"},
+        metadata={
+            "reply_to_message_id": "102",
+            "notify": True,
+        },
     )
 
     assert result.success is True
     assert adapter._discord_message_is_persistently_complete("102") is True
+
+
+@pytest.mark.asyncio
+async def test_final_stream_edit_waits_for_response_plan_completion(adapter):
+    channel = FakeChannel(channel_id=123)
+    message = SimpleNamespace(edit=AsyncMock())
+    channel.fetch_message = AsyncMock(return_value=message)
+    adapter._client.get_channel = lambda _channel_id: channel
+
+    result = await adapter.edit_message(
+        "123",
+        "9010",
+        "streamed text before media",
+        finalize=True,
+        metadata={
+            "reply_to_message_id": "103",
+            "_gateway_receipt_ids": ["103", "104"],
+            "notify": False,
+        },
+    )
+
+    assert result.success is True
+    assert adapter._discord_message_is_persistently_complete("103") is False
+    assert adapter._discord_message_is_persistently_complete("104") is False
 
 
 def test_disabled_recovery_does_not_create_hot_path_ledger(adapter, monkeypatch):
@@ -2026,7 +2053,10 @@ async def test_final_overflow_edit_records_recovery_completion(adapter):
         "9015",
         "x" * (adapter.MAX_MESSAGE_LENGTH + 1),
         finalize=True,
-        metadata={"reply_to_message_id": message_id},
+        metadata={
+            "reply_to_message_id": message_id,
+            "notify": True,
+        },
     )
 
     assert result.success is True

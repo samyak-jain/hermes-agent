@@ -6078,7 +6078,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         reply_to=reply_to_message_id,
                         result=result,
                         content=content,
-                        final=True,
+                        final=bool(
+                            (metadata or {}).get("notify")
+                        ),
                         claim_guard=claim_guard,
                         receipt_ids=recovery_receipt_ids,
                     )
@@ -6124,7 +6126,9 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to=reply_to_message_id,
                             result=result,
                             content=content,
-                            final=True,
+                            final=bool(
+                                (metadata or {}).get("notify")
+                            ),
                             claim_guard=claim_guard,
                             receipt_ids=recovery_receipt_ids,
                         )
@@ -6148,7 +6152,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     reply_to=reply_to_message_id,
                     result=result,
                     content=content,
-                    final=True,
+                    final=bool(
+                        (metadata or {}).get("notify")
+                    ),
                     claim_guard=claim_guard,
                     receipt_ids=recovery_receipt_ids,
                 )
