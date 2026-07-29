@@ -8,15 +8,24 @@ Verifies that:
 - resume_pending_expired auto-reset sets the correct reason and DB end_reason
 """
 
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import hermes_time
+import pytest
 
 from gateway.config import (
     GatewayConfig,
     Platform,
     SessionResetPolicy,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    _daily_reset_boundary,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +50,58 @@ def _make_store(policy=None, tmp_path=None, has_active_processes_fn=None):
         has_active_processes_fn=has_active_processes_fn,
     )
     return store
+
+
+@pytest.fixture
+def configure_timezone(monkeypatch):
+    def configure(name):
+        monkeypatch.setenv("HERMES_TIMEZONE", name)
+        hermes_time.reset_cache()
+
+    yield configure
+    hermes_time.reset_cache()
+
+
+@pytest.fixture
+def server_local_new_york(monkeypatch):
+    if not hasattr(time, "tzset"):
+        pytest.skip("server-local DST tests require time.tzset()")
+
+    with monkeypatch.context() as local:
+        local.setenv("TZ", "America/New_York")
+        local.delenv("HERMES_TIMEZONE", raising=False)
+        local.setattr(hermes_time, "_resolve_timezone_name", lambda: "")
+        time.tzset()
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone() is None
+        yield
+
+    time.tzset()
+    hermes_time.reset_cache()
+
+
+@pytest.fixture
+def configured_kolkata_on_new_york(monkeypatch):
+    if not hasattr(time, "tzset"):
+        pytest.skip("cross-zone DST tests require time.tzset()")
+
+    with monkeypatch.context() as local:
+        local.setenv("TZ", "America/New_York")
+        local.setenv("HERMES_TIMEZONE", "Asia/Kolkata")
+        time.tzset()
+        hermes_time.reset_cache()
+        assert str(hermes_time.get_timezone()) == "Asia/Kolkata"
+        yield
+
+    time.tzset()
+    hermes_time.reset_cache()
+
+
+def _daily_reset_decision(store, entry, source, now, path):
+    with patch("gateway.session._now", return_value=now):
+        if path == "proactive":
+            return store._is_session_expired(entry)
+        return store._should_reset(entry, source)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +151,449 @@ class TestShouldResetReason:
         )
         source = _make_source()
         assert store._should_reset(entry, source) == "daily"
+
+    def test_daily_boundary_uses_configured_timezone(self, tmp_path, monkeypatch):
+        """04:00 Asia/Kolkata must not be interpreted as 04:00 UTC."""
+        monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Kolkata")
+        hermes_time.reset_cache()
+        try:
+            # 22:45 UTC is 04:15 the following day in Asia/Kolkata. Activity
+            # at 22:25 UTC (03:55 IST) is therefore across the 04:00 boundary.
+            now = datetime(2026, 7, 28, 22, 45, tzinfo=timezone.utc)
+            store = _make_store(
+                SessionResetPolicy(mode="daily", at_hour=4),
+                tmp_path,
+            )
+            entry = SessionEntry(
+                session_key="test",
+                session_id="s1",
+                created_at=datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 7, 28, 22, 25, tzinfo=timezone.utc),
+                platform=Platform.TELEGRAM,
+            )
+            source = _make_source()
+
+            with patch("gateway.session._now", return_value=now):
+                assert store._should_reset(entry, source) == "daily"
+                assert store._is_session_expired(entry) is True
+
+                monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+                hermes_time.reset_cache()
+                assert store._should_reset(entry, source) is None
+                assert store._is_session_expired(entry) is False
+        finally:
+            hermes_time.reset_cache()
+
+    def test_fall_back_boundary_is_monotonic(
+        self,
+        configure_timezone,
+    ):
+        """The first 01:00 occurs once and remains the day's boundary."""
+        configure_timezone("America/New_York")
+        moments = [
+            datetime(2026, 11, 1, 4, 30, tzinfo=timezone.utc),  # 00:30
+            datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),   # 01:00 fold=0
+            datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),  # 01:30 fold=0
+            datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),  # 01:30 fold=1
+            datetime(2026, 11, 1, 7, 30, tzinfo=timezone.utc),  # 02:30
+        ]
+        boundaries = [_daily_reset_boundary(now, 1) for now in moments]
+
+        configured_tz = hermes_time.get_timezone()
+        assert [moment.astimezone(configured_tz).fold for moment in moments[2:4]] == [
+            0,
+            1,
+        ]
+        assert boundaries == [
+            datetime(2026, 10, 31, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+        ]
+        assert boundaries == sorted(boundaries)
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    @pytest.mark.parametrize(
+        ("now", "updated_at", "expected"),
+        [
+            (
+                datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 1, 4, 59, tzinfo=timezone.utc),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 1, 4, 59, tzinfo=timezone.utc),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 1, 5, 15, tzinfo=timezone.utc),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 7, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 1, 5, 15, tzinfo=timezone.utc),
+                False,
+            ),
+        ],
+        ids=[
+            "fold-0-before-boundary",
+            "fold-1-before-boundary",
+            "exact-boundary",
+            "fold-1-activity-after-boundary",
+            "after-fold-activity-after-boundary",
+        ],
+    )
+    def test_fall_back_resets_once_in_both_paths(
+        self,
+        tmp_path,
+        configure_timezone,
+        path,
+        now,
+        updated_at,
+        expected,
+    ):
+        configure_timezone("America/New_York")
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=1),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 10, 31, tzinfo=timezone.utc),
+            updated_at=updated_at,
+            platform=Platform.TELEGRAM,
+        )
+
+        decision = _daily_reset_decision(
+            store,
+            entry,
+            _make_source(),
+            now,
+            path,
+        )
+        expected_decision = (
+            expected if path == "proactive" else "daily" if expected else None
+        )
+        assert decision == expected_decision
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    def test_spring_forward_nonexistent_hour_resets_once(
+        self,
+        tmp_path,
+        configure_timezone,
+        path,
+    ):
+        """02:00 normalizes to 03:00 EDT, one instant for the local date."""
+        configure_timezone("America/New_York")
+        before = datetime(2026, 3, 8, 6, 59, tzinfo=timezone.utc)
+        boundary = datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc)
+        after = datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc)
+
+        assert _daily_reset_boundary(before, 2) == datetime(
+            2026, 3, 7, 7, 0, tzinfo=timezone.utc,
+        )
+        assert _daily_reset_boundary(boundary, 2) == boundary
+        assert _daily_reset_boundary(after, 2) == boundary
+
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=2),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 3, 7, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc),
+            platform=Platform.TELEGRAM,
+        )
+        assert _daily_reset_decision(
+            store, entry, _make_source(), boundary, path,
+        ) == (True if path == "proactive" else "daily")
+
+        for updated_at in (
+            boundary,
+            datetime(2026, 3, 8, 7, 15, tzinfo=timezone.utc),
+        ):
+            entry.updated_at = updated_at
+            assert _daily_reset_decision(
+                store, entry, _make_source(), after, path,
+            ) == (False if path == "proactive" else None)
+
+    def test_non_dst_boundary_is_stable(
+        self,
+        configure_timezone,
+    ):
+        configure_timezone("Asia/Kolkata")
+        moments = [
+            datetime(2026, 7, 28, 22, 29, tzinfo=timezone.utc),
+            datetime(2026, 7, 28, 22, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+        ]
+
+        assert [_daily_reset_boundary(now, 4) for now in moments] == [
+            datetime(2026, 7, 27, 22, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 28, 22, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 28, 22, 30, tzinfo=timezone.utc),
+        ]
+
+    def test_cross_zone_fall_back_boundary_is_monotonic(
+        self,
+        configured_kolkata_on_new_york,
+    ):
+        moments = [
+            datetime(2026, 11, 1, 0, 30),
+            datetime(2026, 11, 1, 1, 30, fold=0),
+            datetime(2026, 11, 1, 1, 15, fold=1),
+            datetime(2026, 11, 1, 1, 45, fold=1),
+        ]
+        boundaries = [_daily_reset_boundary(now, 11) for now in moments]
+
+        assert boundaries == [
+            datetime(2026, 10, 31, 1, 30),
+            datetime(2026, 11, 1, 1, 30),
+            datetime(2026, 11, 1, 1, 30),
+            datetime(2026, 11, 1, 1, 30),
+        ]
+        boundary_instants = [boundary.timestamp() for boundary in boundaries]
+        assert boundary_instants == sorted(boundary_instants)
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    @pytest.mark.parametrize(
+        ("updated_at", "expected"),
+        [
+            (datetime(2026, 11, 1, 1, 15, fold=0), True),
+            (datetime(2026, 11, 1, 1, 30, fold=0), False),
+            (datetime(2026, 11, 1, 1, 15, fold=1), False),
+            (datetime(2026, 11, 1, 1, 30, fold=1), False),
+            (datetime(2026, 11, 1, 1, 45, fold=1), False),
+        ],
+        ids=[
+            "fold-0-before-boundary",
+            "exact-boundary",
+            "fold-1-earlier-wall-time-after-boundary",
+            "fold-1-same-wall-time-after-boundary",
+            "fold-1-later-wall-time-after-boundary",
+        ],
+    )
+    def test_cross_zone_fall_back_compares_absolute_instants_in_both_paths(
+        self,
+        tmp_path,
+        configured_kolkata_on_new_york,
+        path,
+        updated_at,
+        expected,
+    ):
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=11),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 10, 31),
+            updated_at=updated_at,
+            platform=Platform.TELEGRAM,
+        )
+        entry = SessionEntry.from_dict(entry.to_dict())
+
+        decision = _daily_reset_decision(
+            store,
+            entry,
+            _make_source(),
+            datetime(2026, 11, 1, 1, 45, fold=1),
+            path,
+        )
+        expected_decision = (
+            expected if path == "proactive" else "daily" if expected else None
+        )
+        assert decision == expected_decision
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            (SessionResetPolicy(mode="none"), False),
+            (SessionResetPolicy(mode="idle", idle_minutes=60), False),
+            (SessionResetPolicy(mode="idle", idle_minutes=15), True),
+        ],
+        ids=["none", "idle-fresh", "idle-expired"],
+    )
+    def test_cross_zone_instant_comparison_does_not_change_non_daily_modes(
+        self,
+        tmp_path,
+        configured_kolkata_on_new_york,
+        path,
+        policy,
+        expected,
+    ):
+        store = _make_store(policy, tmp_path)
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 10, 31),
+            updated_at=datetime(2026, 11, 1, 1, 15, fold=1),
+            platform=Platform.TELEGRAM,
+        )
+
+        decision = _daily_reset_decision(
+            store,
+            entry,
+            _make_source(),
+            datetime(2026, 11, 1, 1, 45, fold=1),
+            path,
+        )
+        expected_decision = (
+            expected if path == "proactive" else "idle" if expected else None
+        )
+        assert decision == expected_decision
+
+    def test_server_local_fall_back_boundary_is_monotonic(
+        self,
+        server_local_new_york,
+    ):
+        moments = [
+            datetime(2026, 11, 1, 0, 30),
+            datetime(2026, 11, 1, 1, 0, fold=0),
+            datetime(2026, 11, 1, 1, 30, fold=0),
+            datetime(2026, 11, 1, 1, 30, fold=1),
+            datetime(2026, 11, 1, 2, 30),
+        ]
+        boundaries = [_daily_reset_boundary(now, 1) for now in moments]
+
+        assert boundaries == [
+            datetime(2026, 10, 31, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+        ]
+        assert boundaries == sorted(boundaries)
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    @pytest.mark.parametrize(
+        ("now", "updated_at", "expected"),
+        [
+            (
+                datetime(2026, 11, 1, 1, 30, fold=0),
+                datetime(2026, 11, 1, 0, 59),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=1),
+                datetime(2026, 11, 1, 0, 59),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=0),
+                datetime(2026, 11, 1, 1, 0),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=1),
+                datetime(2026, 11, 1, 1, 15, fold=1),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 2, 30),
+                datetime(2026, 11, 1, 1, 15, fold=1),
+                False,
+            ),
+        ],
+        ids=[
+            "fold-0-before-boundary",
+            "fold-1-before-boundary",
+            "exact-boundary",
+            "fold-1-activity-after-boundary",
+            "after-fold-activity-after-boundary",
+        ],
+    )
+    def test_server_local_fall_back_resets_once_in_both_paths(
+        self,
+        tmp_path,
+        server_local_new_york,
+        path,
+        now,
+        updated_at,
+        expected,
+    ):
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=1),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 10, 31),
+            updated_at=updated_at,
+            platform=Platform.TELEGRAM,
+        )
+
+        decision = _daily_reset_decision(
+            store,
+            entry,
+            _make_source(),
+            now,
+            path,
+        )
+        expected_decision = (
+            expected if path == "proactive" else "daily" if expected else None
+        )
+        assert decision == expected_decision
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    def test_server_local_spring_forward_nonexistent_hour_resets_once(
+        self,
+        tmp_path,
+        server_local_new_york,
+        path,
+    ):
+        before = datetime(2026, 3, 8, 1, 59)
+        boundary = datetime(2026, 3, 8, 3, 0)
+        after = datetime(2026, 3, 8, 3, 30)
+        boundaries = [
+            _daily_reset_boundary(moment, 2)
+            for moment in (before, boundary, after)
+        ]
+
+        assert boundaries == [
+            datetime(2026, 3, 7, 2, 0),
+            boundary,
+            boundary,
+        ]
+        assert boundaries == sorted(boundaries)
+
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=2),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 3, 7),
+            updated_at=datetime(2026, 3, 8, 1, 30),
+            platform=Platform.TELEGRAM,
+        )
+        assert _daily_reset_decision(
+            store, entry, _make_source(), boundary, path,
+        ) == (True if path == "proactive" else "daily")
+
+        for updated_at in (
+            boundary,
+            datetime(2026, 3, 8, 3, 15),
+        ):
+            entry.updated_at = updated_at
+            assert _daily_reset_decision(
+                store, entry, _make_source(), after, path,
+            ) == (False if path == "proactive" else None)
 
     def test_returns_none_when_mode_is_none(self, tmp_path):
         store = _make_store(
@@ -254,6 +758,19 @@ class TestResetPolicyNotify:
 # ---------------------------------------------------------------------------
 
 class TestSessionEntryAutoResetRoundtrip:
+    def test_updated_at_fold_persists_across_roundtrip(self):
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 11, 1),
+            updated_at=datetime(2026, 11, 1, 1, 15, fold=1),
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.updated_at.fold == 1
+        assert restored.updated_at.timestamp() == entry.updated_at.timestamp()
+
     def test_was_auto_reset_persists_across_roundtrip(self, tmp_path):
         """was_auto_reset=True survives to_dict() → from_dict() (gateway restart)."""
         store = _make_store(
