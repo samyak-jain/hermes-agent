@@ -1666,7 +1666,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
-def mark_job_dispatch_error(job_id: str, error: str) -> bool:
+def mark_job_dispatch_error(
+    job_id: str,
+    error: str,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> bool:
     """Record a terminal executor-dispatch failure without completing the job.
 
     ``tick()`` advances recurring schedules before handing work to the executor.
@@ -1674,6 +1679,12 @@ def mark_job_dispatch_error(job_id: str, error: str) -> bool:
     ``last_*`` fields, but it must not increment a finite repeat counter,
     recompute ``next_run_at``, or remove/disable a one-shot job that never
     reached ``claim_dispatch()``.
+
+    A one-shot is durably claimed by ``get_due_jobs()`` before executor
+    submission. Release only the exact claim returned to the rejecting tick;
+    if another executor has since replaced it, preserve that live owner's
+    claim. Recurring jobs do not carry ``run_claim`` and retain their already
+    advanced next-run timestamp unchanged.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1684,6 +1695,13 @@ def mark_job_dispatch_error(job_id: str, error: str) -> bool:
             job["last_status"] = "error"
             job["last_error"] = error
             job["last_delivery_error"] = None
+            claim = job.get("run_claim")
+            if (
+                expected_run_claim_owner
+                and isinstance(claim, dict)
+                and claim.get("by") == expected_run_claim_owner
+            ):
+                job["run_claim"] = None
             save_jobs(jobs)
             return True
 

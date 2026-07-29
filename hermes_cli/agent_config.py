@@ -91,12 +91,40 @@ GUARDED_BUILTIN_PATTERNS = frozenset(
 )
 
 # Configuration may describe where a credential comes from, but the broker
-# must never read or write credential material.  Match whole dotted segments
-# so harmless names such as ``token_usage`` are not rejected accidentally.
-_SECRET_SEGMENT_RE = re.compile(
-    r"(?:^|_)(?:api_?key|secret|password|passwd|token|credential|cookie|"
-    r"private_?key|client_?secret|authorization)(?:$|_)",
-    re.IGNORECASE,
+# must never read or write credential material. Key classification first
+# canonicalizes camelCase boundaries and every punctuation/whitespace run to
+# one lowercase underscore. This makes ``clientSecret``, ``client-secret``,
+# ``client.secret``, and ``CLIENT SECRET`` equivalent without treating an
+# ordinary public key or operational counter such as ``token_usage`` as secret.
+_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_NON_ALNUM_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
+_SECRET_KEY_PHRASES = frozenset(
+    {
+        ("api", "key"),
+        ("auth", "token"),
+        ("access", "token"),
+        ("refresh", "token"),
+        ("bearer", "token"),
+        ("client", "secret"),
+        ("pass", "word"),
+        ("private", "key"),
+        ("key", "material"),
+        ("raw", "secret"),
+        ("secret", "input"),
+        ("secret", "value"),
+    }
+)
+_SECRET_KEY_WORDS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "passwd",
+        "password",
+        "secret",
+    }
 )
 _OBVIOUS_SECRET_VALUE_RE = re.compile(
     r"(?:"
@@ -215,8 +243,38 @@ def _path_class(path: str, config: dict) -> Optional[str]:
     return None
 
 
+def _canonicalize_config_key(key: Any) -> str:
+    """Canonicalize a config key for semantic secret classification.
+
+    Camel/acronym boundaries become separators, then underscores, hyphens,
+    dots, whitespace, and all other punctuation collapse to one underscore.
+    Matching is case-insensitive via ``casefold``.
+    """
+    text = str(key)
+    text = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", text)
+    text = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", text)
+    return _NON_ALNUM_KEY_RE.sub("_", text).strip("_").casefold()
+
+
+def _is_secret_config_key(key: Any) -> bool:
+    """Return whether one key names credential material after canonicalization."""
+    canonical = _canonicalize_config_key(key)
+    if not canonical:
+        return False
+    words = tuple(part for part in canonical.split("_") if part)
+    if any(word in _SECRET_KEY_WORDS for word in words):
+        return True
+    if canonical == "token" or (words and words[-1] == "token"):
+        return True
+    return any(
+        words[index : index + len(phrase)] == phrase
+        for phrase in _SECRET_KEY_PHRASES
+        for index in range(len(words) - len(phrase) + 1)
+    )
+
+
 def _secret_shaped_path(path: str) -> bool:
-    return any(_SECRET_SEGMENT_RE.search(segment) for segment in path.split("."))
+    return any(_is_secret_config_key(segment) for segment in path.split("."))
 
 
 def _value_looks_secret(value: Any) -> bool:
@@ -243,7 +301,7 @@ def _value_looks_secret(value: Any) -> bool:
         return any(_value_looks_secret(item) for item in value)
     if isinstance(value, dict):
         return any(
-            _SECRET_SEGMENT_RE.search(str(key)) or _value_looks_secret(item)
+            _is_secret_config_key(key) or _value_looks_secret(item)
             for key, item in value.items()
         )
     return False

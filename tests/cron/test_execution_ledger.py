@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -15,6 +17,33 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def _point_jobs(monkeypatch, tmp_path):
+    import cron.jobs as jobs
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    return jobs
+
+
+def _due_oneshot(now: datetime) -> dict:
+    run_at = (now - timedelta(seconds=1)).isoformat()
+    return {
+        "id": "rejected-once",
+        "name": "rejected-once",
+        "prompt": "retry after executor recovery",
+        "schedule": {"kind": "once", "run_at": run_at},
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": run_at,
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "last_delivery_error": None,
+        "repeat": {"times": 1, "completed": 0},
+    }
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
@@ -229,7 +258,9 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     monkeypatch.setattr(
         scheduler,
         "mark_job_dispatch_error",
-        lambda job_id, error: marked.append((job_id, error)),
+        lambda job_id, error, **kwargs: marked.append(
+            (job_id, error, kwargs.get("expected_run_claim_owner"))
+        ),
     )
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
@@ -241,9 +272,62 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert marked == [
-        ("submit-fail", "Executor dispatch failed: executor rejected")
+        ("submit-fail", "Executor dispatch failed: executor rejected", None)
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_rejected_oneshot_is_due_next_tick_and_attempt_ledger_stays_consistent(
+    monkeypatch,
+    tmp_path,
+):
+    import cron.scheduler as scheduler
+
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    executions = _point_ledger(monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    job = _due_oneshot(now)
+    jobs.save_jobs([job])
+
+    class RejectingPool:
+        def submit(self, _callable):
+            raise RuntimeError("executor rejected")
+
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: RejectingPool())
+    monkeypatch.setattr(scheduler, "_interpreter_shutting_down", lambda *_args: False)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    rejected = jobs.get_job(job["id"])
+    assert rejected["enabled"] is True
+    assert rejected["state"] == "scheduled"
+    assert rejected["repeat"] == {"times": 1, "completed": 0}
+    assert rejected["next_run_at"] == job["next_run_at"]
+    assert rejected["last_run_at"]
+    assert rejected["last_status"] == "error"
+    assert rejected["run_claim"] is None
+
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda _job, *, defer_agent_teardown=None: (
+            True,
+            "output",
+            "response",
+            None,
+        ),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: pool)
+        assert scheduler.tick(verbose=False, sync=True) == 1
+
+    assert jobs.get_job(job["id"]) is None
+    attempts = executions.list_executions(job_id=job["id"], limit=10)
+    assert [attempt["status"] for attempt in attempts] == ["completed", "failed"]
+    assert attempts[0]["error"] is None
+    assert attempts[1]["error"] == "Executor dispatch failed: executor rejected"
 
 
 def test_dispatch_failure_records_error_without_consuming_schedule(
@@ -252,9 +336,7 @@ def test_dispatch_failure_records_error_without_consuming_schedule(
 ):
     import cron.jobs as jobs
 
-    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
-    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
-    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    jobs = _point_jobs(monkeypatch, tmp_path)
 
     job = jobs.create_job(
         prompt="retry after executor recovery",
@@ -276,6 +358,34 @@ def test_dispatch_failure_records_error_without_consuming_schedule(
     assert recorded["next_run_at"] == advanced["next_run_at"]
     assert recorded["repeat"]["completed"] == original_completed
     assert recorded["enabled"] is True
+
+
+def test_dispatch_failure_does_not_clear_another_executor_run_claim(
+    monkeypatch,
+    tmp_path,
+):
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    job = _due_oneshot(now)
+    job["run_claim"] = {
+        "at": now.isoformat(),
+        "by": "replacement-live-owner",
+    }
+    jobs.save_jobs([job])
+
+    assert jobs.mark_job_dispatch_error(
+        job["id"],
+        "old executor rejected",
+        expected_run_claim_owner="original-owner",
+    )
+
+    recorded = jobs.get_job(job["id"])
+    assert recorded["last_status"] == "error"
+    assert recorded["last_error"] == "old executor rejected"
+    assert recorded["run_claim"] == {
+        "at": now.isoformat(),
+        "by": "replacement-live-owner",
+    }
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
