@@ -5676,6 +5676,128 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+    source: str = "config.yaml"
+    path: str = ""
+
+
+_CHANNEL_OVERRIDE_FIELDS = frozenset(
+    {
+        "model",
+        "provider",
+        "system_prompt",
+        "tool_policy",
+        "profile_tool_policies",
+    }
+)
+_TOOL_POLICY_FIELDS = frozenset({"mode", "tools", "gateway_override_authority"})
+_SESSION_RESET_FIELDS = frozenset(
+    {
+        "mode",
+        "at_hour",
+        "idle_minutes",
+        "notify",
+        "notify_exclude_platforms",
+        "bg_process_max_age_hours",
+    }
+)
+_STREAMING_FIELDS = frozenset(
+    {
+        "enabled",
+        "transport",
+        "mode",
+        "edit_interval",
+        "buffer_threshold",
+        "cursor",
+        "fresh_final_after_seconds",
+    }
+)
+
+
+def _typed_unknown_key_issues(
+    config: Dict[str, Any],
+    *,
+    source: str,
+    severity: str,
+) -> List["ConfigIssue"]:
+    """Find unknown keys in closed-world dataclass-backed config blocks."""
+    issues: List[ConfigIssue] = []
+
+    def add(path: str) -> None:
+        issues.append(
+            ConfigIssue(
+                severity,
+                f"Unknown typed config key from {source}: {path}",
+                "Move the key to its documented dotted path or remove it; "
+                "this Hermes version would otherwise ignore it.",
+                source=source,
+                path=path,
+            )
+        )
+
+    def check_mapping(value: Any, prefix: str, allowed: frozenset[str]) -> None:
+        if not isinstance(value, dict):
+            return
+        for key in value:
+            if str(key) not in allowed:
+                add(f"{prefix}.{key}")
+
+    def check_channel_overrides(platform_block: Any, prefix: str) -> None:
+        if not isinstance(platform_block, dict):
+            return
+        overrides = platform_block.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            return
+        for channel_id, override in overrides.items():
+            override_path = f"{prefix}.channel_overrides.{channel_id}"
+            if not isinstance(override, dict):
+                continue
+            check_mapping(override, override_path, _CHANNEL_OVERRIDE_FIELDS)
+            check_mapping(
+                override.get("tool_policy"),
+                f"{override_path}.tool_policy",
+                _TOOL_POLICY_FIELDS,
+            )
+            profile_policies = override.get("profile_tool_policies")
+            if isinstance(profile_policies, dict):
+                for profile, policy in profile_policies.items():
+                    check_mapping(
+                        policy,
+                        f"{override_path}.profile_tool_policies.{profile}",
+                        _TOOL_POLICY_FIELDS,
+                    )
+
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        for platform, block in platforms.items():
+            check_channel_overrides(block, f"platforms.{platform}")
+    gateway = config.get("gateway")
+    gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    if isinstance(gateway_platforms, dict):
+        for platform, block in gateway_platforms.items():
+            check_channel_overrides(block, f"gateway.platforms.{platform}")
+    # Legacy root platform blocks remain supported. Only inspect a root mapping
+    # that actually declares channel_overrides so arbitrary skill config is not
+    # mistaken for a gateway platform.
+    for root_key, block in config.items():
+        if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
+            continue
+        if "channel_overrides" in block:
+            check_channel_overrides(block, str(root_key))
+
+    check_mapping(config.get("session_reset"), "session_reset", _SESSION_RESET_FIELDS)
+    check_mapping(config.get("streaming"), "streaming", _STREAMING_FIELDS)
+    if isinstance(gateway, dict):
+        check_mapping(
+            gateway.get("session_reset"),
+            "gateway.session_reset",
+            _SESSION_RESET_FIELDS,
+        )
+        check_mapping(
+            gateway.get("streaming"),
+            "gateway.streaming",
+            _STREAMING_FIELDS,
+        )
+    return issues
 
 
 def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
@@ -5700,7 +5822,12 @@ def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
             )
 
 
-def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
+def validate_config_structure(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    source: str = "config.yaml",
+    unknown_severity: str = "warning",
+) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
     Catches common YAML formatting mistakes that produce confusing runtime
@@ -5715,6 +5842,13 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+    issues.extend(
+        _typed_unknown_key_issues(
+            config,
+            source=source,
+            severity=unknown_severity,
+        )
+    )
 
     # Exact-name tool policy. Invalid explicit policy is a security error: the
     # runtime denies all tools rather than silently reverting to legacy scope.
@@ -9330,13 +9464,13 @@ def config_command(args):
         print()
         print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         current_ver, latest_ver = check_config_version()
         if current_ver >= latest_ver:
             print(f"  Config version: {current_ver} ✓")
         else:
             print(color(f"  Config version: {current_ver} → {latest_ver} (update available)", Colors.YELLOW))
-        
+
         print()
         print(color("  Required:", Colors.BOLD))
         for var_name in REQUIRED_ENV_VARS:
@@ -9344,7 +9478,7 @@ def config_command(args):
                 print(f"    ✓ {var_name}")
             else:
                 print(color(f"    ✗ {var_name} (missing)", Colors.RED))
-        
+
         print()
         print(color("  Optional:", Colors.BOLD))
         for var_name, info in OPTIONAL_ENV_VARS.items():
@@ -9354,14 +9488,75 @@ def config_command(args):
                 tools = info.get("tools", [])
                 tools_str = f" → {', '.join(tools[:2])}" if tools else ""
                 print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
-        
+
         missing_config = get_missing_config_fields()
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
-        
+
         print()
+
+    elif subcmd == "validate":
+        managed_path = getattr(args, "managed", None)
+        config_path = Path(managed_path).expanduser() if managed_path else get_config_path()
+        source = f"managed:{config_path}" if managed_path else f"user:{config_path}"
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                candidate = yaml.safe_load(handle) or {}
+            if not isinstance(candidate, dict):
+                issues = [
+                    ConfigIssue(
+                        "error",
+                        f"{source} must contain a YAML mapping",
+                        "Replace the document root with a mapping of dotted config sections.",
+                        source=source,
+                        path="",
+                    )
+                ]
+            else:
+                issues = validate_config_structure(
+                    candidate,
+                    source=source,
+                    unknown_severity="error" if managed_path else "warning",
+                )
+        except (OSError, yaml.YAMLError) as exc:
+            issues = [
+                ConfigIssue(
+                    "error",
+                    f"Could not validate {source}: {exc}",
+                    "Fix the path, permissions, or YAML syntax and retry.",
+                    source=source,
+                    path="",
+                )
+            ]
+
+        result = {
+            "success": not any(issue.severity == "error" for issue in issues),
+            "source": source,
+            "issues": [
+                {
+                    "severity": issue.severity,
+                    "source": issue.source,
+                    "path": issue.path,
+                    "message": issue.message,
+                    "hint": issue.hint,
+                }
+                for issue in issues
+            ],
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif not issues:
+            print(color(f"✓ Configuration is valid: {source}", Colors.GREEN))
+        else:
+            for issue in issues:
+                marker = "✗" if issue.severity == "error" else "⚠"
+                print(f"{marker} [{issue.severity}] {issue.message}")
+                if issue.hint:
+                    print(f"  {issue.hint}")
+        if not result["success"]:
+            sys.exit(1)
     
     else:
         print(f"Unknown config command: {subcmd}")
@@ -9373,6 +9568,7 @@ def config_command(args):
         print("  hermes config set <key> <value>   Set a config value")
         print("  hermes config unset <key>        Remove a config value")
         print("  hermes config check     Check for missing/outdated config")
+        print("  hermes config validate  Validate non-secret config structure")
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")
