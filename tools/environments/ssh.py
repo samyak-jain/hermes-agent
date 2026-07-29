@@ -124,16 +124,21 @@ class SSHEnvironment(BaseEnvironment):
         self._remote_executable_cache: dict[str, str] = {}
 
         self.control_dir = _get_control_dir()
-        # Keep the socket filename short and deterministic so the full path
-        # stays under the 104-byte sun_path limit that macOS enforces on
-        # Unix domain sockets. A raw ``user@host:port`` — especially with an
-        # IPv6 host — plus the 16-byte random suffix SSH appends in
-        # ControlMaster mode easily exceeds the limit under macOS's
-        # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Hashing the
-        # triple keeps the path stable across reconnects so ControlMaster
-        # reuse still works.
+        # Keep the socket filename short so the full path stays under the
+        # 104-byte sun_path limit that macOS enforces on Unix domain sockets.
+        # A raw ``user@host:port`` — especially with an IPv6 host — plus the
+        # 16-byte random suffix SSH appends in ControlMaster mode easily
+        # exceeds the limit under macOS's deeply-nested $TMPDIR (e.g.
+        # /var/folders/xx/yy/T/).
+        #
+        # Each environment must own its master exclusively. Environments for
+        # concurrent tasks can target the same host, and cleanup() terminates
+        # its master with ``ssh -O exit``. Sharing a deterministic socket made
+        # one task's cleanup disconnect another task's active foreground
+        # command, surfacing completed remote side effects as local exit 255.
+        # Commands within this environment still reuse this stable socket.
         _socket_id = hashlib.sha256(
-            f"{user}@{host}:{port}".encode()
+            f"{user}@{host}:{port}:{uuid.uuid4().hex}".encode()
         ).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
