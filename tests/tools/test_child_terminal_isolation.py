@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 
 from tools import terminal_tool
-from tools.delegate_tool import _get_child_terminal_overrides, _seed_child_session_cwd
+from tools.delegate_tool import (
+    _get_child_terminal_overrides,
+    _get_profile_subagent_tool_grants,
+    _seed_child_session_cwd,
+)
 from tools.environments import ssh as ssh_env
 from tools.file_tools import _terminal_env_type_for_task
 
@@ -54,6 +58,52 @@ def test_child_ssh_config_fails_closed_without_runtime_host(tmp_path: Path):
                 }
             }
         )
+
+
+def test_profile_child_terminal_overrides_shared_default(tmp_path: Path):
+    general_host = tmp_path / "general-ip"
+    operator_host = tmp_path / "operator-ip"
+    general_host.write_text("10.233.1.2\n", encoding="utf-8")
+    operator_host.write_text("10.233.2.2\n", encoding="utf-8")
+
+    config = {
+        "child_terminal": {
+            "backend": "ssh",
+            "ssh_host_file": str(general_host),
+            "ssh_user": "root",
+        },
+        "profile_child_terminal": {
+            "vegapunk": {
+                "backend": "ssh",
+                "cwd": "/data",
+                "ssh_host_file": str(operator_host),
+                "ssh_user": "root",
+            }
+        },
+    }
+
+    vegapunk = _get_child_terminal_overrides(config, profile="vegapunk")
+    lena = _get_child_terminal_overrides(config, profile="default")
+
+    assert vegapunk["ssh_host"] == "10.233.2.2"
+    assert vegapunk["cwd"] == "/data"
+    assert lena["ssh_host"] == "10.233.1.2"
+
+
+def test_profile_subagent_tool_grants_only_allows_config(caplog):
+    grants = _get_profile_subagent_tool_grants(
+        {
+            "profile_subagent_tool_grants": {
+                "vegapunk": ["config", "memory", "spawn_agent", "terminal"]
+            }
+        },
+        profile="vegapunk",
+    )
+
+    assert grants == frozenset({"config"})
+    assert "memory" in caplog.text
+    assert "spawn_agent" in caplog.text
+    assert "terminal" in caplog.text
 
 
 def test_child_ssh_file_sync_is_opt_in():

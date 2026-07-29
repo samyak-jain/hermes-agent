@@ -306,6 +306,48 @@ class TestStripBlockedTools(unittest.TestCase):
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
 
+    def test_profile_grant_moves_config_to_child_only(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["spawn"]
+        parent.disabled_toolsets = []
+        delegation_config = {
+            "child_tool_policy": {"mode": "all_configured"},
+            "profile_subagent_tool_grants": {
+                "vegapunk": ["config"],
+            },
+        }
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value=delegation_config,
+            ),
+            patch(
+                "hermes_cli.profiles.get_active_profile_name",
+                return_value="vegapunk",
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Change an agent-owned setting",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["enabled_toolsets"], ["all"])
+        self.assertNotIn("config", kwargs["disabled_toolsets"])
+        self.assertNotIn("config", kwargs["tool_policy"].denied_names)
+        for blocked in ("memory", "soul", "cronjob", "clarify"):
+            self.assertIn(blocked, DELEGATE_BLOCKED_TOOLS)
+
 
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
