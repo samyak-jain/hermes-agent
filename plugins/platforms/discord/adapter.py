@@ -5300,7 +5300,11 @@ class DiscordAdapter(BasePlatformAdapter):
         message_id: str,
     ) -> tuple[bool, Any]:
         """Fence a tracked Discord side effect by claim owner and epoch."""
-        claim_epoch = self._discord_recovery_claim_epochs.get(message_id)
+        claim_epoch = getattr(
+            self,
+            "_discord_recovery_claim_epochs",
+            {},
+        ).get(message_id)
         if claim_epoch is None:
             return True, None
         guard = await asyncio.to_thread(
