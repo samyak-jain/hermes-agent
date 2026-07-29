@@ -99,6 +99,7 @@ GUARDED_BUILTIN_PATTERNS = frozenset(
 _CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 _NON_ALNUM_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
+_LIST_INDEX_SUFFIX_RE = re.compile(r"(?:\[\d+\])+$")
 _SECRET_KEY_PHRASES = frozenset(
     {
         ("api", "key"),
@@ -275,12 +276,21 @@ def _is_secret_config_key(key: Any) -> bool:
 
 
 def _secret_shaped_path(path: str) -> bool:
-    # A dotted config path is composed from distinct mapping keys. Classify
-    # those segments independently so benign parent/child combinations cannot
-    # form a credential phrase across the hierarchy boundary. Literal dotted
-    # mapping keys are classified before path composition in
-    # ``_redact_non_secret_view`` below.
-    return any(_is_secret_config_key(segment) for segment in path.split("."))
+    # Match declared phrases across exact adjacent mapping keys, including
+    # intervening list indexes. Requiring each structural segment to equal one
+    # phrase word keeps suffix/context fields such as ``api.key_rotation_days``
+    # and ``auth.token_usage`` public. Literal dotted mapping keys are still
+    # classified independently before path composition below.
+    raw_segments = path.split(".")
+    segments = tuple(
+        _canonicalize_config_key(_LIST_INDEX_SUFFIX_RE.sub("", segment))
+        for segment in raw_segments
+    )
+    return any(_is_secret_config_key(segment) for segment in raw_segments) or any(
+        segments[index : index + len(phrase)] == phrase
+        for phrase in _SECRET_KEY_PHRASES
+        for index in range(len(segments) - len(phrase) + 1)
+    )
 
 
 def _value_looks_secret(value: Any) -> bool:
