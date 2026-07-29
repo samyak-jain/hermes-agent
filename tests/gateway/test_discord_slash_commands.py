@@ -428,6 +428,85 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapter):
+    """If a message contains only mention syntax, the stripped content is
+    empty — fall back to the 'Hermes' default rather than ''."""
+    thread = SimpleNamespace(id=999, name="Hermes")
+    message = SimpleNamespace(
+        content="<@&1490963422786093149>",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    await adapter._auto_create_thread(message)
+
+    name = message.create_thread.await_args[1]["name"]
+    assert name == "Hermes"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_truncates_long_names(adapter):
+    long_text = "a" * 200
+    thread = SimpleNamespace(id=999, name="truncated")
+    message = SimpleNamespace(
+        content=long_text,
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    call_kwargs = message.create_thread.await_args[1]
+    assert len(call_kwargs["name"]) <= 80
+    assert call_kwargs["name"].endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_falls_back_to_seed_message(adapter):
+    thread = SimpleNamespace(id=555, name="Hello")
+    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    message = SimpleNamespace(
+        id=123,
+        content="Hello",
+        create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        channel=SimpleNamespace(send=AsyncMock(return_value=seed_message)),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+    assert result is thread
+    message.channel.send.assert_awaited_once_with(
+        "🧵 Thread created by Hermes: **Hello**",
+        nonce=adapter._discord_recovery_nonce(
+            "123",
+            "auto-thread-seed",
+        ),
+    )
+    assert len(message.channel.send.await_args.kwargs["nonce"]) <= 25
+    seed_message.create_thread.assert_awaited_once_with(
+        name="Hello",
+        auto_archive_duration=1440,
+        reason="Auto-threaded from mention by Jezza",
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_returns_none_when_direct_and_fallback_fail(adapter):
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        channel=SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("send failed"))),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     thread = SimpleNamespace(
         id=999,
@@ -600,5 +679,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
-

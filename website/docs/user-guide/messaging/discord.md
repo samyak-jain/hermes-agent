@@ -520,9 +520,9 @@ discord:
 
 #### `discord.missed_message_backfill`
 
-**Type:** object — **Default:** disabled
+**Type:** object — **Default:** enabled
 
-Discord's WebSocket resume window can expire during a restart or network outage. Messages sent during that gap are not delivered as live gateway events. When this option is enabled, Hermes scans a bounded set of configured channel and thread histories after Discord reconnects, then sends still-unhandled messages through the same authorization, mention, channel, deduplication, and dispatch path as live events.
+Discord's WebSocket resume window can expire during a restart or network outage. Messages sent during that gap are not delivered as live gateway events. Hermes scans a bounded set of configured channel and thread histories after Discord reconnects, then sends still-unhandled messages through the same authorization, mention, channel, deduplication, and dispatch path as live events. Set `enabled: false` to opt out.
 
 ```yaml
 discord:
@@ -534,7 +534,7 @@ discord:
     max_dispatches: 10
 ```
 
-If `channels` is empty, Hermes uses `discord.free_response_channels`. Set it to `"*"` only when the bot should inspect every reachable server text channel. The recovery ledger is stored per profile under `gateway/discord_message_recovery.db`, preventing a successfully answered message from being replayed again after a later restart.
+If `channels` is empty, Hermes automatically includes known DMs, the home and agents-room channels, active chats, configured free-response channels, and channels with an existing recovery cursor. Set it to `"*"` only when the bot should inspect every reachable server text channel. Durable completion cursors live in the profile's `state.db`; the per-message claim and response-evidence ledger lives under `gateway/discord_message_recovery.db`.
 
 #### `group_sessions_per_user`
 
@@ -927,5 +927,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 
