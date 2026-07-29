@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -114,3 +114,53 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
         event.source, runner._reply_anchor_for_event(event)
     )
     assert "notify" not in fresh
+
+
+@pytest.mark.asyncio
+async def test_recovery_voice_reply_is_nonterminal_and_reports_failure(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    _fake_tts_call(monkeypatch)
+
+    send_voice = AsyncMock(
+        return_value=SendResult(
+            success=False,
+            error="upload failed",
+        )
+    )
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(
+        send_voice=send_voice,
+        is_in_voice_channel=lambda *_a, **_k: True,
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    event = MessageEvent(
+        text="hi",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            user_id="user",
+            chat_type="dm",
+            message_id="456",
+        ),
+        message_id="456",
+        metadata={"_gateway_receipt_ids": ["456", "457"]},
+    )
+    event.source._gateway_receipt_ids = ["456", "457"]
+
+    succeeded = await runner._send_voice_reply(
+        event,
+        "Hello there.",
+    )
+
+    assert succeeded is False
+    send_voice.assert_awaited_once()
+    assert send_voice.await_args.kwargs["metadata"] == {
+        "_gateway_receipt_ids": ["456", "457"],
+        "reply_to_message_id": "456",
+        "notify": False,
+        "_gateway_recovery_component_index": 0,
+    }

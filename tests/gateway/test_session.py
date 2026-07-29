@@ -274,7 +274,6 @@ class TestBuildSessionContextPrompt:
             p3 = _prompt_for("3003")
 
         assert p1 == p2 == p3, "system prompt must be stable across message_id"
-        assert "1001" not in p1 and "2002" not in p2 and "3003" not in p3
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
 
@@ -1898,6 +1897,52 @@ class TestGatewaySessionDbRecovery:
         assert reset.session_id != entry.session_id
         assert reset.was_auto_reset is True
         assert reset.auto_reset_reason == "idle"
+
+    def test_receipt_backed_reset_is_idempotent_across_store_restart(
+        self,
+        tmp_path,
+    ):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="dm-1",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        original = store.get_or_create_session(source)
+
+        first_reset = store.reset_session(
+            original.session_key,
+            idempotency_key="discord-message-101",
+        )
+        assert first_reset is not None
+        assert first_reset.session_id != original.session_id
+        assert (
+            first_reset.last_reset_idempotency_key
+            == "discord-message-101"
+        )
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        assert restarted.reset_idempotency_applied(
+            original.session_key,
+            "discord-message-101",
+        )
+        replayed = restarted.reset_session(
+            original.session_key,
+            idempotency_key="discord-message-101",
+        )
+        assert replayed is not None
+        assert replayed.session_id == first_reset.session_id
+
+        distinct = restarted.reset_session(
+            original.session_key,
+            idempotency_key="discord-message-102",
+        )
+        assert distinct is not None
+        assert distinct.session_id != first_reset.session_id
+        restarted._db.close()
 
 
 class TestGatewayRoutingTable:

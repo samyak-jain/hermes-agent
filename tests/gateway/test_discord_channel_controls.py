@@ -315,7 +315,11 @@ async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkey
     channel = FakeTextChannel(channel_id=800)
     channel.send = AsyncMock()
     message = make_message(channel=channel, content="hello")
-    await adapter._handle_message(message)
+    with pytest.raises(
+        RuntimeError,
+        match="Discord auto-thread routing failed",
+    ):
+        await adapter._handle_message(message)
 
     adapter._auto_create_thread.assert_awaited_once()
     # Agent must NOT be invoked when the routing target failed.
@@ -329,12 +333,12 @@ async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkey
 
 
 @pytest.mark.asyncio
-async def test_auto_thread_failure_notify_error_does_not_crash(adapter, monkeypatch):
-    """If even the failure-notification send raises, we still skip the agent.
+async def test_auto_thread_failure_notify_error_remains_retryable(adapter, monkeypatch):
+    """If even the failure-notification send raises, the routing failure escapes.
 
     ``message.channel.send`` itself can fail (the same connect issue that
-    killed thread creation often kills plain sends too). The handler should
-    swallow the secondary error and still avoid invoking the agent.
+    killed thread creation often kills plain sends too). The normal recovery
+    wrapper must see the routing failure so it cannot advance the cursor.
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
@@ -348,8 +352,11 @@ async def test_auto_thread_failure_notify_error_does_not_crash(adapter, monkeypa
     channel.send = AsyncMock(side_effect=RuntimeError("Cannot connect to host discord.com:443"))
     message = make_message(channel=channel, content="hello")
 
-    # No exception must propagate.
-    await adapter._handle_message(message)
+    with pytest.raises(
+        RuntimeError,
+        match="Discord auto-thread routing failed",
+    ):
+        await adapter._handle_message(message)
 
     adapter._auto_create_thread.assert_awaited_once()
     adapter.handle_message.assert_not_awaited()

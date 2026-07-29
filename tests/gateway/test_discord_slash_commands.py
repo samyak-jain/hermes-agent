@@ -659,6 +659,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     thread = SimpleNamespace(id=555, name="Hello")
     seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
     message = SimpleNamespace(
+        id=123,
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
         channel=SimpleNamespace(send=AsyncMock(return_value=seed_message)),
@@ -667,7 +668,14 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
 
     result = await adapter._auto_create_thread(message)
     assert result is thread
-    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
+    message.channel.send.assert_awaited_once_with(
+        "🧵 Thread created by Hermes: **Hello**",
+        nonce=adapter._discord_recovery_nonce(
+            "123",
+            "auto-thread-seed",
+        ),
+    )
+    assert len(message.channel.send.await_args.kwargs["nonce"]) <= 25
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
         auto_archive_duration=1440,

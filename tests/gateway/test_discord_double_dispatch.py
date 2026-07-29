@@ -156,7 +156,7 @@ class TestThreadStarterDedup:
 
         Simulates the exact Discord bug: after thread creation, Discord
         fires MESSAGE_CREATE again with message.id == thread.id.  The
-        adapter's on_message guard calls _dedup.is_duplicate(str(message.id))
+        adapter's ingress guard checks the dedicated starter deduplicator
         before dispatching.  With the fix the duplicate is dropped; without
         it there would be two agent runs.
         """
@@ -183,13 +183,13 @@ class TestThreadStarterDedup:
 
         # 2) Discord fires a second MESSAGE_CREATE for the thread starter.
         #    Its message.id == thread.id (this is the Discord quirk).
-        #    Simulate what on_message does: check _dedup.is_duplicate first.
+        #    Simulate what ingress does: check the starter cache first.
         #
-        #    The fix pre-seeded thread.id via _dedup.is_duplicate(str(thread.id))
+        #    The fix pre-seeded thread.id in _auto_thread_starters
         #    inside _handle_message.  That call already marked thread.id as seen.
         #    So this second call with the same id returns True → drop the duplicate.
         starter_msg_id = str(thread_id)
-        is_dup = adapter._dedup.is_duplicate(starter_msg_id)
+        is_dup = adapter._auto_thread_starters.contains(starter_msg_id)
         assert is_dup is True, (
             "Thread starter message (id == thread.id) should be in dedup cache "
             "after _auto_create_thread returns, so the duplicate event is dropped"
@@ -202,7 +202,7 @@ class TestThreadStarterDedup:
 
     @pytest.mark.asyncio
     async def test_thread_id_pre_seeded_in_dedup_cache(self, adapter, monkeypatch):
-        """After _handle_message with auto-thread, thread.id is in _dedup._seen."""
+        """After auto-threading, thread.id is in the starter-only cache."""
         monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
         monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
 
@@ -219,8 +219,8 @@ class TestThreadStarterDedup:
         await adapter._handle_message(user_msg)
 
         # Thread id must be in the dedup internal cache
-        assert str(thread_id) in adapter._dedup._seen, (
-            f"thread.id={thread_id} should be pre-seeded in _dedup._seen "
+        assert str(thread_id) in adapter._auto_thread_starters._seen, (
+            f"thread.id={thread_id} should be pre-seeded in the starter cache "
             "after _auto_create_thread returns a thread"
         )
 
@@ -249,14 +249,18 @@ class TestThreadStarterDedup:
         )
 
         user_msg = _make_message(msg_id=42, channel=channel, content="hello")
-        await adapter._handle_message(user_msg)
+        with pytest.raises(
+            RuntimeError,
+            match="Discord auto-thread routing failed",
+        ):
+            await adapter._handle_message(user_msg)
 
         # Fail-closed: the agent must NOT run when the required thread route
         # could not be created (#20243).
         adapter.handle_message.assert_not_awaited()
 
         # The phantom thread id should NOT be in the dedup cache
-        assert str(phantom_thread_id) not in adapter._dedup._seen, (
+        assert str(phantom_thread_id) not in adapter._auto_thread_starters._seen, (
             "thread.id should NOT be pre-seeded when thread creation fails"
         )
 
@@ -281,7 +285,7 @@ class TestThreadStarterDedup:
         # _auto_create_thread should NOT have been called
         assert not auto_create_called, "_auto_create_thread should not run when disabled"
         # thread.id should NOT be pre-seeded
-        assert "55555" not in adapter._dedup._seen, (
+        assert "55555" not in adapter._auto_thread_starters._seen, (
             "thread.id should not be in dedup when auto-threading is disabled"
         )
 
@@ -310,7 +314,7 @@ class TestThreadStarterDedup:
         adapter.handle_message.assert_awaited_once()
 
         # Thread id IS pre-seeded even with direct dispatch path
-        assert str(thread_id) in adapter._dedup._seen, (
+        assert str(thread_id) in adapter._auto_thread_starters._seen, (
             "thread.id must be pre-seeded regardless of text_batch_delay setting"
         )
 
@@ -336,12 +340,12 @@ class TestThreadStarterDedup:
         await adapter._handle_message(user_msg)
 
         # The thread.id (99999) is pre-seeded
-        assert str(thread_id) in adapter._dedup._seen, (
+        assert str(thread_id) in adapter._auto_thread_starters._seen, (
             f"thread.id={thread_id} must be pre-seeded after auto-thread creation"
         )
 
         # A second MESSAGE_CREATE with message.id=thread.id is caught as duplicate
-        assert adapter._dedup.is_duplicate(str(thread_id)) is True, (
+        assert adapter._auto_thread_starters.contains(str(thread_id)) is True, (
             "Subsequent is_duplicate(thread.id) must return True"
         )
 
@@ -515,11 +519,11 @@ class TestDedupCacheIntegrity:
 
         # All three thread ids should be pre-seeded
         for tid in thread_ids:
-            assert str(tid) in adapter._dedup._seen, (
-                f"thread.id={tid} should be pre-seeded in _dedup._seen "
+            assert str(tid) in adapter._auto_thread_starters._seen, (
+                f"thread.id={tid} should be pre-seeded in the starter cache "
                 "after its thread was created"
             )
             # And they should be detected as duplicates now
-            assert adapter._dedup.is_duplicate(str(tid)) is True, (
+            assert adapter._auto_thread_starters.contains(str(tid)) is True, (
                 f"thread.id={tid} should be treated as duplicate"
             )
