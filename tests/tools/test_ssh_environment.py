@@ -126,12 +126,57 @@ class TestControlSocketPath:
             f"{env.control_socket} (+{self._SSH_CONTROLMASTER_SUFFIX} = {total_len})"
         )
 
-    def test_path_is_deterministic_across_instances(self):
-        """Same (user, host, port) must yield the same control socket so
-        ControlMaster reuse works across reconnects."""
+    def test_path_is_owned_by_each_environment(self):
+        """Same-target environments must not share teardown authority."""
         first = SSHEnvironment(host="example.com", user="alice", port=2222)
         second = SSHEnvironment(host="example.com", user="alice", port=2222)
-        assert first.control_socket == second.control_socket
+        assert first.control_socket != second.control_socket
+
+    @pytest.mark.parametrize(
+        ("cleaned_task", "active_task"),
+        [
+            ("cron", "interactive"),
+            ("interactive", "cron"),
+        ],
+    )
+    def test_cleanup_cannot_close_another_same_target_environment(
+        self,
+        monkeypatch,
+        cleaned_task,
+        active_task,
+    ):
+        """Same-target cleanup must not disconnect another active task."""
+        commands = []
+
+        def fake_run(command, *args, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(ssh_env.subprocess, "run", fake_run)
+        cleaned = SSHEnvironment(
+            host="operator", user="root", task_id=cleaned_task
+        )
+        active = SSHEnvironment(host="operator", user="root", task_id=active_task)
+        cleaned.control_socket.touch()
+        active.control_socket.touch()
+
+        cleaned.cleanup()
+
+        exit_commands = [
+            command for command in commands if "-O" in command and "exit" in command
+        ]
+        assert exit_commands == [
+            [
+                "ssh",
+                "-o",
+                f"ControlPath={cleaned.control_socket}",
+                "-O",
+                "exit",
+                "root@operator",
+            ]
+        ]
+        assert not cleaned.control_socket.exists()
+        assert active.control_socket.exists()
 
     def test_path_differs_for_different_targets(self):
         """Different (user, host, port) triples must produce different paths."""
