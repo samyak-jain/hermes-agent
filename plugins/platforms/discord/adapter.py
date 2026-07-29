@@ -4428,7 +4428,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     author_id=excluded.author_id,
                     created_at=COALESCE(discord_messages.created_at, excluded.created_at),
                     status=?,
-                    updated_at=excluded.updated_at
+                    updated_at=CASE
+                        WHEN discord_messages.status IN (
+                            'queued', 'processing'
+                        )
+                        THEN discord_messages.updated_at
+                        ELSE excluded.updated_at
+                    END
                 """,
                 (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, now, final_status),
             )
@@ -4512,11 +4518,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 ) = existing
                 if (
                     status in {"queued", "processing"}
-                    and (
-                        updated_at >= active_cutoff
-                        or claim_owner
-                        == self._discord_recovery_claim_owner
-                    )
+                    and updated_at >= active_cutoff
                 ):
                     return "active"
                 if status == "processed" or (
