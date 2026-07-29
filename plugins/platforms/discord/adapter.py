@@ -3877,6 +3877,32 @@ class DiscordAdapter(BasePlatformAdapter):
         digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
         return f"hr-{digest[:22]}"
 
+    def _discord_recovery_interaction_key(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        component: str,
+    ) -> Optional[str]:
+        """Return a replay-stable key for Discord component custom IDs."""
+        receipt_ids = (metadata or {}).get(
+            _GATEWAY_RECEIPT_IDS_KEY,
+            [],
+        )
+        if not receipt_ids:
+            return None
+        reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or receipt_ids[0]
+        )
+        component_index = (metadata or {}).get(
+            "_gateway_recovery_component_index",
+            component,
+        )
+        return self._discord_recovery_nonce(
+            reply_to,
+            "interaction",
+            component_index,
+        )
+
     def _message_channel_ids(self, message: Any) -> tuple[str, Optional[str], Optional[str]]:
         channel = getattr(message, "channel", None)
         channel_id = str(getattr(channel, "id", "") or "")
@@ -9537,6 +9563,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 admin_user_ids=admin_user_ids,
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
+                interaction_key=(
+                    self._discord_recovery_interaction_key(
+                        metadata,
+                        "exec-approval",
+                    )
+                ),
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -9598,6 +9630,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 confirm_id=confirm_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                interaction_key=(
+                    self._discord_recovery_interaction_key(
+                        metadata,
+                        "slash-confirm",
+                    )
+                ),
             )
 
             msg = await self._send_discord_interactive_prompt(
@@ -10926,6 +10964,7 @@ def _define_discord_view_classes() -> None:
             admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True,
             smart_denied: bool = False,
+            interaction_key: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -10944,6 +10983,11 @@ def _define_discord_view_classes() -> None:
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
                 self.remove_item(self.allow_always)
+            if interaction_key:
+                for index, child in enumerate(self.children):
+                    child.custom_id = (
+                        f"exec:{interaction_key}:{index}"
+                    )
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized.
@@ -11085,6 +11129,7 @@ def _define_discord_view_classes() -> None:
             confirm_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            interaction_key: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -11092,6 +11137,11 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
+            if interaction_key:
+                for index, child in enumerate(self.children):
+                    child.custom_id = (
+                        f"confirm:{interaction_key}:{index}"
+                    )
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(

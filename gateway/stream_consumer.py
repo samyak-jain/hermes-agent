@@ -232,6 +232,7 @@ class GatewayStreamConsumer:
         self._before_finalize_notified = False
         self._recovery_text_chunk_index = 0
         self._active_recovery_text_chunk_index: int | None = None
+        self._pending_recovery_send_metadata: dict | None = None
 
     def _metadata_for_send(
         self,
@@ -276,6 +277,12 @@ class GatewayStreamConsumer:
         index advances once per logical new message, while transport retries
         reuse the same metadata (and therefore the same nonce).
         """
+        if self._pending_recovery_send_metadata is not None:
+            pending = dict(self._pending_recovery_send_metadata)
+            self._active_recovery_text_chunk_index = pending.get(
+                _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+            )
+            return pending
         meta = dict(
             self._metadata_for_send(
                 final=final,
@@ -291,7 +298,28 @@ class GatewayStreamConsumer:
                 self._active_recovery_text_chunk_index
             )
             self._recovery_text_chunk_index += 1
+            self._pending_recovery_send_metadata = dict(meta)
         return meta or None
+
+    def _mark_new_send_delivered(
+        self,
+        metadata: dict | None,
+        result: Any,
+    ) -> None:
+        """Release a logical send nonce only after confirmed delivery."""
+        if not getattr(result, "success", False):
+            return
+        if self._pending_recovery_send_metadata is None:
+            return
+        if (
+            (metadata or {}).get(
+                _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+            )
+            == self._pending_recovery_send_metadata.get(
+                _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+            )
+        ):
+            self._pending_recovery_send_metadata = None
 
     @property
     def already_sent(self) -> bool:
@@ -991,15 +1019,17 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
+            send_metadata = self._metadata_for_new_send(
+                final=final,
+                expect_edits=True,
+            )
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=self._metadata_for_new_send(
-                    final=final,
-                    expect_edits=True,
-                ),
+                metadata=send_metadata,
             )
+            self._mark_new_send_delivered(send_metadata, result)
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
@@ -1150,6 +1180,10 @@ class GatewayStreamConsumer:
                     content=chunk,
                     metadata=chunk_metadata,
                 )
+                self._mark_new_send_delivered(
+                    chunk_metadata,
+                    result,
+                )
                 if result.success:
                     break
                 retry_delay = self._fallback_flood_retry_delay(result)
@@ -1245,6 +1279,10 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=final_text,
                     metadata=fallback_metadata,
+                )
+                self._mark_new_send_delivered(
+                    fallback_metadata,
+                    result,
                 )
             except Exception as exc:
                 logger.debug("Empty fallback final send failed: %s", exc)
@@ -1433,10 +1471,15 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
+            tail_metadata = self._metadata_for_new_send()
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self._metadata_for_new_send(),
+                metadata=tail_metadata,
+            )
+            self._mark_new_send_delivered(
+                tail_metadata,
+                result,
             )
             if result.success:
                 self._already_sent = True
@@ -1470,10 +1513,15 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
+            commentary_metadata = self._metadata_for_new_send()
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_new_send(),
+                metadata=commentary_metadata,
+            )
+            self._mark_new_send_delivered(
+                commentary_metadata,
+                result,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1609,10 +1657,15 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
+            fresh_metadata = self._metadata_for_new_send(final=True)
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_new_send(final=True),
+                metadata=fresh_metadata,
+            )
+            self._mark_new_send_delivered(
+                fresh_metadata,
+                result,
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1990,14 +2043,19 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
+                first_send_metadata = self._metadata_for_new_send(
+                    final=finalize,
+                    expect_edits=True,
+                )
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_new_send(
-                        final=finalize,
-                        expect_edits=True,
-                    ),
+                    metadata=first_send_metadata,
+                )
+                self._mark_new_send_delivered(
+                    first_send_metadata,
+                    result,
                 )
                 if result.success:
                     if result.message_id:

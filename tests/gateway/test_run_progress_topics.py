@@ -267,6 +267,34 @@ async def test_recovery_status_fallback_is_reply_anchored_and_component_scoped()
     ]
 
 
+def test_recovery_interaction_id_is_replay_stable_and_component_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    first = {
+        "_gateway_receipt_ids": ["456"],
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+    replay = dict(first)
+    later = {
+        "_gateway_receipt_ids": ["456"],
+        "_gateway_recovery_component_index": "interactive:1",
+    }
+
+    assert gateway_run._stable_recovery_interaction_id(
+        first,
+        "clarify",
+    ) == gateway_run._stable_recovery_interaction_id(
+        replay,
+        "clarify",
+    )
+    assert gateway_run._stable_recovery_interaction_id(
+        first,
+        "clarify",
+    ) != gateway_run._stable_recovery_interaction_id(
+        later,
+        "clarify",
+    )
+
+
 @pytest.mark.asyncio
 async def test_discord_recovery_tool_progress_send_is_nonce_component_scoped(
     monkeypatch,

@@ -51,12 +51,41 @@ def test_recovery_stream_new_messages_get_ordered_chunk_indices():
     )
 
     first = consumer._metadata_for_new_send(final=False)
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
     second = consumer._metadata_for_new_send(final=True)
 
     assert first["_gateway_recovery_text_chunk_index"] == 0
     assert second["_gateway_recovery_text_chunk_index"] == 1
     assert first["_gateway_receipt_ids"] == ["456"]
     assert second["_gateway_receipt_ids"] == ["456"]
+
+
+def test_recovery_stream_failed_new_send_reuses_chunk_index():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(final=False)
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=False),
+    )
+    retry = consumer._metadata_for_new_send(final=True)
+    consumer._mark_new_send_delivered(
+        retry,
+        SimpleNamespace(success=True),
+    )
+    next_segment = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert retry["_gateway_recovery_text_chunk_index"] == 0
+    assert next_segment["_gateway_recovery_text_chunk_index"] == 1
 
 
 @pytest.mark.asyncio
@@ -73,12 +102,20 @@ async def test_recovery_stream_edits_keep_current_segment_chunk_index():
     )
 
     first = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
     await consumer._edit_message(
         message_id="m1",
         content="first segment",
         finalize=True,
     )
     second = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        second,
+        SimpleNamespace(success=True),
+    )
     await consumer._edit_message(
         message_id="m2",
         content="second segment",
