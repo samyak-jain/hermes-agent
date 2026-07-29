@@ -1325,6 +1325,19 @@ async def test_final_stream_edit_marks_original_request_complete(adapter):
 
 @pytest.mark.asyncio
 async def test_final_stream_edit_waits_for_response_plan_completion(adapter):
+    first_id, second_id = [
+        str(value) for value in _recent_snowflakes(2)
+    ]
+    for receipt_id in (first_id, second_id):
+        receipt = make_message(message_id=int(receipt_id))
+        adapter._register_discord_recovery_receipt(
+            "123",
+            receipt_id,
+        )
+        assert (
+            adapter._claim_live_discord_message(receipt)
+            == "claimed"
+        )
     channel = FakeChannel(channel_id=123)
     message = SimpleNamespace(edit=AsyncMock())
     channel.fetch_message = AsyncMock(return_value=message)
@@ -1336,15 +1349,21 @@ async def test_final_stream_edit_waits_for_response_plan_completion(adapter):
         "streamed text before media",
         finalize=True,
         metadata={
-            "reply_to_message_id": "103",
-            "_gateway_receipt_ids": ["103", "104"],
+            "reply_to_message_id": first_id,
+            "_gateway_receipt_ids": [first_id, second_id],
             "notify": False,
         },
     )
 
     assert result.success is True
-    assert adapter._discord_message_is_persistently_complete("103") is False
-    assert adapter._discord_message_is_persistently_complete("104") is False
+    assert (
+        adapter._discord_message_is_persistently_complete(first_id)
+        is False
+    )
+    assert (
+        adapter._discord_message_is_persistently_complete(second_id)
+        is False
+    )
 
 
 def test_disabled_recovery_does_not_create_hot_path_ledger(adapter, monkeypatch):
@@ -1894,6 +1913,63 @@ async def test_reclaimed_lease_fences_actual_outbound_send(adapter, forum):
     else:
         channel.send.assert_awaited_once()
         replacement_forum_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replacement_adapter_without_epoch_fences_tracked_delivery(
+    adapter,
+    tmp_path,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    channel = FakeChannel(channel_id=123)
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=9012))
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(edit=AsyncMock())
+    )
+    replacement = DiscordAdapter(
+        PlatformConfig(enabled=True, token="fake-token")
+    )
+    replacement._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda _channel_id: channel,
+    )
+    metadata = {
+        "_gateway_receipt_ids": [message_id],
+        "reply_to_message_id": message_id,
+        "notify": True,
+    }
+
+    text_result = await replacement.send(
+        "123",
+        "unfenced text",
+        reply_to=message_id,
+        metadata=metadata,
+    )
+    edit_result = await replacement.edit_message(
+        "123",
+        "9011",
+        "unfenced edit",
+        finalize=True,
+        metadata=metadata,
+    )
+    attachment = tmp_path / "answer.txt"
+    attachment.write_text("answer", encoding="utf-8")
+    file_result = await replacement.send_document(
+        "123",
+        str(attachment),
+        metadata=metadata,
+    )
+
+    assert text_result.success is False
+    assert edit_result.success is False
+    assert file_result.success is False
+    assert {
+        text_result.error,
+        edit_result.error,
+        file_result.error,
+    } == {"Discord recovery claim no longer owned"}
+    channel.send.assert_not_awaited()
+    channel.fetch_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -286,6 +286,61 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_in_band_followup_receipts_join_outer_lifecycle(self):
+        class ReceiptCaptureAdapter(DummyTelegramAdapter):
+            async def on_processing_complete(
+                self,
+                event: MessageEvent,
+                outcome: ProcessingOutcome,
+            ) -> None:
+                self.processing_hooks.append(
+                    (
+                        "complete",
+                        list(
+                            event.metadata.get(
+                                "_gateway_receipt_ids",
+                                [],
+                            )
+                        ),
+                        outcome,
+                    )
+                )
+
+        adapter = ReceiptCaptureAdapter()
+
+        async def handler(event):
+            receipt_ids = getattr(
+                event.source,
+                "_gateway_receipt_ids",
+            )
+            receipt_ids.append("2")
+            return None
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_event("-1001", "17585")
+        event.metadata["_gateway_receipt_ids"] = ["1"]
+
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert not hasattr(event.source, "_gateway_receipt_ids")
+        assert event.metadata["_gateway_receipt_ids"] == ["1", "2"]
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            (
+                "complete",
+                ["1", "2"],
+                ProcessingOutcome.SUCCESS,
+            ),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

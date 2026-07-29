@@ -22050,6 +22050,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_session_key = session_key
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    # BasePlatformAdapter binds the admitted Discord recovery
+                    # receipts to ``source`` for the lifetime of one normal
+                    # processing frame.  A queued follow-up is drained here,
+                    # recursively, inside that same frame, so extend the
+                    # *same list object* before any follow-up work.  This makes
+                    # every recursive delivery use the full ordered receipt
+                    # set and lets the outer lifecycle hook acknowledge all
+                    # receipts only after the entire chain returns.
+                    active_receipt_ids = getattr(
+                        source,
+                        "_gateway_receipt_ids",
+                        None,
+                    )
+                    pending_receipt_ids = (
+                        pending_event.metadata.get(
+                            _GATEWAY_RECEIPT_IDS_KEY,
+                        )
+                        or []
+                    )
+                    if active_receipt_ids is not None:
+                        for receipt_id in pending_receipt_ids:
+                            receipt_id = str(receipt_id)
+                            if (
+                                receipt_id
+                                and receipt_id not in active_receipt_ids
+                            ):
+                                active_receipt_ids.append(receipt_id)
+                        setattr(
+                            next_source,
+                            "_gateway_receipt_ids",
+                            active_receipt_ids,
+                        )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
