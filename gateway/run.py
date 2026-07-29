@@ -10458,6 +10458,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interrupt completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
                 if event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY):
+                    _reset_idempotency_key = str(
+                        event.metadata[_GATEWAY_RECEIPT_IDS_KEY][0]
+                    )
+
                     async def _commit_new() -> None:
                         await self._interrupt_and_clear_session(
                             _quick_key,
@@ -10465,7 +10469,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             interrupt_reason=_INTERRUPT_REASON_RESET,
                             invalidation_reason="new_command",
                         )
-                        await self._handle_reset_command(event)
+                        await self._handle_reset_command(
+                            event,
+                            idempotency_key=_reset_idempotency_key,
+                        )
 
                     return DeferredCommandReply(
                         EphemeralReply(
@@ -10921,7 +10928,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
                 return self._telegram_topic_root_new_message()
+            _reset_receipt_ids = event.metadata.get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            _reset_idempotency_key = (
+                str(_reset_receipt_ids[0])
+                if _reset_receipt_ids
+                else None
+            )
+
             async def _do_reset():
+                if _reset_idempotency_key:
+                    return await self._handle_reset_command(
+                        event,
+                        idempotency_key=_reset_idempotency_key,
+                    )
                 return await self._handle_reset_command(event)
             return await self._maybe_confirm_destructive_slash(
                 event=event,
