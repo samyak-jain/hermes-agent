@@ -91,12 +91,39 @@ GUARDED_BUILTIN_PATTERNS = frozenset(
 )
 
 # Configuration may describe where a credential comes from, but the broker
-# must never read or write credential material.  Match whole dotted segments
-# so harmless names such as ``token_usage`` are not rejected accidentally.
-_SECRET_SEGMENT_RE = re.compile(
-    r"(?:^|_)(?:api_?key|secret|password|passwd|token|credential|cookie|"
-    r"private_?key|client_?secret|authorization)(?:$|_)",
-    re.IGNORECASE,
+# must never read or write credential material. Key classification first
+# canonicalizes camelCase boundaries and every punctuation/whitespace run to
+# one lowercase underscore. This makes ``clientSecret``, ``client-secret``,
+# ``client.secret``, and ``CLIENT SECRET`` equivalent without treating an
+# ordinary public key or operational counter such as ``token_usage`` as secret.
+_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_NON_ALNUM_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
+_SECRET_KEY_PHRASES = frozenset(
+    {
+        ("api", "key"),
+        ("auth", "token"),
+        ("access", "token"),
+        ("refresh", "token"),
+        ("bearer", "token"),
+        ("client", "secret"),
+        ("pass", "word"),
+        ("private", "key"),
+        ("key", "material"),
+        ("raw", "secret"),
+        ("secret", "input"),
+        ("secret", "value"),
+    }
+)
+_SECRET_KEY_WORDS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "passwd",
+        "password",
+    }
 )
 _OBVIOUS_SECRET_VALUE_RE = re.compile(
     r"(?:"
@@ -135,6 +162,10 @@ _NEXT_SESSION_PREFIXES = (
 
 class AgentConfigError(RuntimeError):
     """A validated agent configuration operation was rejected."""
+
+    def __init__(self, message: str, *, details: Optional[dict] = None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 def _matches(path: str, pattern: str) -> bool:
@@ -211,8 +242,45 @@ def _path_class(path: str, config: dict) -> Optional[str]:
     return None
 
 
+def _canonicalize_config_key(key: Any) -> str:
+    """Canonicalize a config key for semantic secret classification.
+
+    Camel/acronym boundaries become separators, then underscores, hyphens,
+    dots, whitespace, and all other punctuation collapse to one underscore.
+    Matching is case-insensitive via ``casefold``.
+    """
+    text = str(key)
+    text = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", text)
+    text = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", text)
+    return _NON_ALNUM_KEY_RE.sub("_", text).strip("_").casefold()
+
+
+def _is_secret_config_key(key: Any) -> bool:
+    """Return whether one key names credential material after canonicalization."""
+    canonical = _canonicalize_config_key(key)
+    if not canonical:
+        return False
+    words = tuple(part for part in canonical.split("_") if part)
+    if any(word in _SECRET_KEY_WORDS for word in words):
+        return True
+    if canonical == "secret" or (words and words[-1] == "secret"):
+        return True
+    if canonical == "token" or (words and words[-1] == "token"):
+        return True
+    return any(
+        words[index : index + len(phrase)] == phrase
+        for phrase in _SECRET_KEY_PHRASES
+        for index in range(len(words) - len(phrase) + 1)
+    )
+
+
 def _secret_shaped_path(path: str) -> bool:
-    return any(_SECRET_SEGMENT_RE.search(segment) for segment in path.split("."))
+    # A dotted config path is composed from distinct mapping keys. Classify
+    # those segments independently so benign parent/child combinations cannot
+    # form a credential phrase across the hierarchy boundary. Literal dotted
+    # mapping keys are classified before path composition in
+    # ``_redact_non_secret_view`` below.
+    return any(_is_secret_config_key(segment) for segment in path.split("."))
 
 
 def _value_looks_secret(value: Any) -> bool:
@@ -239,10 +307,52 @@ def _value_looks_secret(value: Any) -> bool:
         return any(_value_looks_secret(item) for item in value)
     if isinstance(value, dict):
         return any(
-            _SECRET_SEGMENT_RE.search(str(key)) or _value_looks_secret(item)
+            _is_secret_config_key(key) or _value_looks_secret(item)
             for key, item in value.items()
         )
     return False
+
+
+_REDACTED_VALUE = "[REDACTED]"
+
+
+def _redact_non_secret_view(
+    value: Any,
+    path: str,
+    *,
+    inherited_sensitive: bool = False,
+) -> tuple[Any, list[str]]:
+    """Return a shape-preserving view with every sensitive scalar redacted."""
+    sensitive = inherited_sensitive or _secret_shaped_path(path)
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        redacted: list[str] = []
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            child_value, child_redacted = _redact_non_secret_view(
+                child,
+                child_path,
+                inherited_sensitive=sensitive or _is_secret_config_key(key),
+            )
+            out[key] = child_value
+            redacted.extend(child_redacted)
+        return out, redacted
+    if isinstance(value, list):
+        out = []
+        redacted: list[str] = []
+        for index, child in enumerate(value):
+            child_path = f"{path}[{index}]"
+            child_value, child_redacted = _redact_non_secret_view(
+                child,
+                child_path,
+                inherited_sensitive=sensitive,
+            )
+            out.append(child_value)
+            redacted.extend(child_redacted)
+        return out, redacted
+    if sensitive or _value_looks_secret(value):
+        return _REDACTED_VALUE, [path]
+    return value, []
 
 
 def _is_mcp_env_reference_map(path: str, value: Any) -> bool:
@@ -332,6 +442,58 @@ def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     return out
 
 
+def _managed_shadow_report(path: str, value: Any, effective: dict) -> dict:
+    """Describe managed leaves that would override a proposed parent write."""
+    from hermes_cli import managed_scope
+
+    proposed = _flatten(value, path) if isinstance(value, dict) else {path: value}
+    managed_keys = managed_scope.managed_config_keys()
+    shadowed: list[dict[str, Any]] = []
+    shadowed_paths: set[str] = set()
+    marker = object()
+    for managed_path in sorted(managed_keys):
+        overlaps = managed_path in proposed or any(
+            managed_path.startswith(proposed_path + ".")
+            for proposed_path in proposed
+        )
+        if not overlaps:
+            continue
+        effective_value = _nested(effective, managed_path, marker)
+        if effective_value is marker:
+            continue
+        safe_value, _ = _redact_non_secret_view(effective_value, managed_path)
+        shadowed.append(
+            {
+                "path": managed_path,
+                "source": "managed",
+                "effective_value": safe_value,
+            }
+        )
+        shadowed_paths.add(managed_path)
+
+    if not shadowed:
+        return {}
+    unshadowed = sorted(
+        proposed_path
+        for proposed_path in proposed
+        if proposed_path not in shadowed_paths
+        and not any(
+            managed_path.startswith(proposed_path + ".")
+            for managed_path in shadowed_paths
+        )
+    )
+    return {
+        "status": "rejected",
+        "shadowed_leaves": shadowed,
+        "unshadowed_leaves": unshadowed,
+        "wholly_shadowed": not unshadowed,
+        "warning": (
+            "The managed overlay would override the listed leaves. "
+            "No parent mapping was written."
+        ),
+    }
+
+
 def _nested(config: dict, path: str, missing: Any) -> Any:
     node: Any = config
     for part in path.split("."):
@@ -415,25 +577,32 @@ def inspect_config(path: Optional[str] = None) -> dict:
     effective_flat = _flatten(effective)
 
     if path:
-        classification = _assert_path_allowed(path, effective, for_write=False)
         marker = object()
         value = _nested(effective, path, marker)
         if value is marker:
             raise AgentConfigError(f"Configuration leaf '{path}' is not set.")
-        if isinstance(value, dict) or _value_looks_secret(value):
+        if not isinstance(value, (dict, list)) and (
+            _secret_shaped_path(path) or _value_looks_secret(value)
+        ):
             raise AgentConfigError(
-                f"'{path}' cannot be returned through the non-secret configuration view."
+                f"Requested scalar '{path}' is sensitive and cannot be returned "
+                "through the non-secret configuration view."
             )
+        classification = _assert_path_allowed(path, effective, for_write=False)
+        safe_value, redacted_paths = _redact_non_secret_view(value, path)
         source = _source_for(path, raw, managed)
-        return {
+        result = {
             "success": True,
             "path": path,
-            "value": value,
+            "value": safe_value,
             "source": source,
             "editable": source != "managed",
             "classification": classification,
             "apply": _apply_mode(path),
         }
+        if redacted_paths:
+            result["redacted_paths"] = redacted_paths
+        return result
 
     settings = []
     for dotted in sorted(effective_flat):
@@ -613,7 +782,16 @@ def prepare_change(
         raise AgentConfigError("The change reason appears to contain credential material.")
     if operation == "set":
         value = _normalize_structured_input(path, value, effective)
-        _validate_value(path, value)
+        shadow_report = _managed_shadow_report(path, value, effective)
+        try:
+            _validate_value(path, value)
+        except AgentConfigError as exc:
+            if shadow_report:
+                raise AgentConfigError(
+                    str(exc),
+                    details=shadow_report,
+                ) from exc
+            raise
         if _value_looks_secret(value) and not _is_mcp_env_reference_map(path, value):
             raise AgentConfigError(
                 "The proposed value resembles credential material. Use the "

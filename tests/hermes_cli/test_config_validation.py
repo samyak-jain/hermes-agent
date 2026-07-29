@@ -1,6 +1,12 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
 
+import argparse
+import json
+
+import pytest
+import yaml
+
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _EXTRA_KNOWN_ROOT_KEYS,
@@ -142,6 +148,77 @@ class TestExactToolPolicyValidation:
             for issue in issues
         )
 
+    def test_profile_policy_in_channel_override_is_retained_typed_config(self):
+        """The deployed profile-scoped channel policy is a supported field."""
+        from gateway.config import ChannelOverride
+
+        raw_override = {
+            "profile_tool_policies": {
+                "vegapunk": {
+                    "mode": "denylist",
+                    "tools": ["delegate_task"],
+                }
+            }
+        }
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": raw_override,
+                        }
+                    }
+                }
+            },
+            source="managed:/etc/hermes/config.yaml",
+            unknown_severity="error",
+        )
+
+        assert not [
+            issue
+            for issue in issues
+            if "profile_tool_policies.vegapunk" in issue.path
+        ]
+        assert ChannelOverride.from_dict(raw_override).profile_tool_policies == {
+            "vegapunk": {
+                "mode": "denylist",
+                "tools": ["delegate_task"],
+            }
+        }
+
+    def test_unknown_profile_policy_key_surfaces_source_and_dotted_path(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": {
+                                "profile_tool_policies": {
+                                    "vegapunk": {
+                                        "mode": "denylist",
+                                        "tools": ["delegate_task"],
+                                        "toolsets": ["terminal"],
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            source="managed:/nix/store/kumo-config.yaml",
+            unknown_severity="error",
+        )
+
+        issue = next(issue for issue in issues if issue.path.endswith(".toolsets"))
+        assert issue.severity == "error"
+        assert issue.source == "managed:/nix/store/kumo-config.yaml"
+        assert issue.path == (
+            "platforms.discord.channel_overrides.operator-room."
+            "profile_tool_policies.vegapunk.toolsets"
+        )
+        assert issue.source in issue.message
+        assert issue.path in issue.message
+
 
 class TestConfigIssueDataclass:
     """ConfigIssue should be a proper dataclass."""
@@ -179,6 +256,55 @@ class TestVoiceSubmitModeValidation:
         )
 
 
+def test_managed_config_validate_command_is_ci_strict_and_value_free(
+    tmp_path,
+    capsys,
+):
+    from hermes_cli.config import config_command
+
+    managed = tmp_path / "managed-config.yaml"
+    managed.write_text(
+        yaml.safe_dump(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": {
+                                "profile_tool_policies": {
+                                    "vegapunk": {
+                                        "mode": "denylist",
+                                        "tools": ["delegate_task"],
+                                        "ignored_typo": "private-value-must-not-print",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        config_command(
+            argparse.Namespace(
+                config_command="validate",
+                managed=str(managed),
+                json=True,
+            )
+        )
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["success"] is False
+    assert payload["issues"][0]["severity"] == "error"
+    assert payload["issues"][0]["path"].endswith(
+        "profile_tool_policies.vegapunk.ignored_typo"
+    )
+    assert "private-value-must-not-print" not in output
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
@@ -208,4 +334,3 @@ class TestUnknownTopLevelKeys:
         ]
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
-

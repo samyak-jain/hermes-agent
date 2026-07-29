@@ -62,6 +62,22 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config check
     config_subparsers.add_parser("check", help="Check for missing/outdated config")
 
+    # config validate
+    config_validate = config_subparsers.add_parser(
+        "validate",
+        help="Validate non-secret configuration structure",
+    )
+    config_validate.add_argument(
+        "--managed",
+        metavar="PATH",
+        help="Validate an operator-managed config file strictly (for deployment CI)",
+    )
+    config_validate.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable result without configuration values",
+    )
+
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 

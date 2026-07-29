@@ -68,6 +68,14 @@ def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                     "require_approval": False,
                 },
                 "model": {"default": "managed-model"},
+                "agent": {
+                    "profile_models": {
+                        "vegapunk": {
+                            "provider": "anthropic",
+                            "model": "managed-profile-model",
+                        }
+                    }
+                },
             },
             sort_keys=False,
         ),
@@ -202,6 +210,293 @@ def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
             value=False,
             reason="operator asked",
         )
+
+
+def test_parent_mapping_rejection_enumerates_managed_shadowed_leaves(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={
+            "default": "agent-model",
+            "provider": "openrouter",
+        },
+        reason="operator requested a parent model update",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is False
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+    assert result["unshadowed_leaves"] == ["model.provider"]
+    assert "No parent mapping was written" in result["warning"]
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert "model" not in raw
+
+    # The same managed overlay also owns the active profile route. The broker
+    # reports only descendants touched by this parent write, never unrelated
+    # managed leaves.
+    effective = config_module.load_config()
+    assert (
+        effective["agent"]["profile_models"]["vegapunk"]["model"]
+        == "managed-profile-model"
+    )
+
+
+def test_wholly_shadowed_parent_mapping_is_explicitly_refused(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={"default": "agent-model"},
+        reason="replace the managed model through its parent",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is True
+    assert result["unshadowed_leaves"] == []
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+
+
+def test_inspect_mapping_recursively_redacts_sensitive_leaves_and_preserves_shape(
+    broker_home: Path,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "provider": "openrouter",
+        "runtime_options": {
+            "headers": {
+                "Authorization": "Bearer not-a-real-production-token",
+                "X-Label": "public",
+            },
+            "targets": [
+                {"name": "alpha", "client_secret": "also-not-real"},
+                {"name": "beta", "weight": 2},
+            ],
+            "modes": ["fast", "careful"],
+        },
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    options = result["value"]["runtime_options"]
+    assert options["headers"] == {
+        "Authorization": "[REDACTED]",
+        "X-Label": "public",
+    }
+    assert options["targets"] == [
+        {"name": "alpha", "client_secret": "[REDACTED]"},
+        {"name": "beta", "weight": 2},
+    ]
+    assert options["modes"] == ["fast", "careful"]
+    assert result["redacted_paths"] == [
+        "model.runtime_options.headers.Authorization",
+        "model.runtime_options.targets[0].client_secret",
+    ]
+
+
+def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api.key": "leak-api-dot",
+        "private.key": "leak-private-dot",
+        "access.token": "leak-access-dot",
+        "api-key": "leak-api-hyphen",
+        "access-token": "leak-access-hyphen",
+        "clientSecret": "leak-client-camel",
+        "AUTH TOKEN": "leak-auth-space",
+        "private_key": "leak-private-underscore",
+        "api_-._key": "leak-api-mixed",
+        "private.-_key": "leak-private-mixed",
+        "access_-.token": "leak-access-mixed",
+        "PassWord": "leak-password-case",
+    }
+    nested = {
+        "public.key": "publishable-material",
+        "monkey": "capuchin",
+        "keyboard": "split-layout",
+        "docs.public.key": "public-key-documentation",
+        "children": [
+            {
+                "label": "public",
+                "token_usage": 17,
+                "keyboard.layout": "dvorak",
+            },
+            {
+                "settings": secret_values,
+                "deeper": [
+                    {"api.key": "leak-list-api-dot"},
+                    {"private_key": "leak-list-private-underscore"},
+                    {"access-.token": "leak-list-access-mixed"},
+                ],
+            },
+        ],
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": nested}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    options = result["value"]["runtime_options"]
+    assert options["public.key"] == "publishable-material"
+    assert options["monkey"] == "capuchin"
+    assert options["keyboard"] == "split-layout"
+    assert options["docs.public.key"] == "public-key-documentation"
+    assert result["value"]["runtime_options"]["children"][0] == {
+        "label": "public",
+        "token_usage": 17,
+        "keyboard.layout": "dvorak",
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+    redacted = options["children"][1]["settings"]
+    assert set(redacted.values()) == {"[REDACTED]"}
+    assert options["children"][1]["deeper"] == [
+        {"api.key": "[REDACTED]"},
+        {"private_key": "[REDACTED]"},
+        {"access-.token": "[REDACTED]"},
+    ]
+
+
+def test_nested_benign_path_components_do_not_form_secret_phrases(
+    broker_home: Path,
+):
+    public_options = {
+        "auth": {"token_usage": 17},
+        "api": {"key_rotation_days": 30},
+        "private": {"key_count": 2},
+        "client": {"secret_format": "environment-reference"},
+        "controls": {
+            "monkey": "capuchin",
+            "keyboard": "split-layout",
+            "max_tokens": 4096,
+            "token_usage_limit": 100,
+        },
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": public_options}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    assert result["value"]["runtime_options"] == public_options
+    assert "redacted_paths" not in result
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api-key",
+        "api_-_key",
+        "clientSecret",
+        "AUTH TOKEN",
+        "access-token",
+        "private_key",
+        "PassWord",
+    ],
+)
+def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
+    broker_home: Path,
+    key: str,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {key: "short-secret"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(AgentConfigError, match="sensitive") as exc_info:
+        inspect_config(f"model.runtime_options.{key}")
+
+    assert "short-secret" not in str(exc_info.value)
+    assert "short-secret" not in repr(exc_info.value)
+
+
+def test_managed_shadow_report_redacts_canonical_secret_key_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api-key": "shadow-api-hyphen",
+        "client-secret": "shadow-client-hyphen",
+        "auth-token": "shadow-auth-hyphen",
+        "private-key": "shadow-private-hyphen",
+        "access.token": "shadow-access-dot",
+    }
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    managed_config = yaml.safe_load(
+        (managed / "config.yaml").read_text(encoding="utf-8")
+    )
+    managed_config["model"] = {
+        "runtime_options": {
+            "deep": [
+                {"public-key": "publishable-material"},
+                secret_values,
+            ]
+        }
+    }
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(managed_config, sort_keys=False),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    result = _result(
+        action="set",
+        path="model",
+        value={"runtime_options": {"deep": "new-value"}},
+        reason="exercise managed shadow refusal",
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["shadowed_leaves"][0]["effective_value"][0] == {
+        "public-key": "publishable-material"
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+
+
+def test_inspect_sensitive_scalar_returns_precise_refusal(broker_home: Path):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {"client_secret": "not-real"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(
+        AgentConfigError,
+        match=r"Requested scalar 'model\.runtime_options\.client_secret' is sensitive",
+    ):
+        inspect_config("model.runtime_options.client_secret")
 
 
 def test_mcp_env_reference_map_is_structured_and_approval_free(
