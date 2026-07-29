@@ -3033,7 +3033,11 @@ async def test_failed_stop_confirmation_keeps_original_and_command_retryable(
 
 
 @pytest.mark.asyncio
-async def test_successful_stop_makes_cancelled_parent_terminal(adapter):
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_successful_stop_makes_cancelled_parent_terminal(
+    adapter,
+    recovered,
+):
     original_id, command_id = [
         str(value) for value in _recent_snowflakes(2)
     ]
@@ -3098,7 +3102,7 @@ async def test_successful_stop_makes_cancelled_parent_terminal(adapter):
     try:
         await adapter._dispatch_discord_event(
             command_event,
-            recovered=False,
+            recovered=recovered,
         )
     finally:
         adapter._active_sessions.pop(session_key, None)

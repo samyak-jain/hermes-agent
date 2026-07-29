@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    DeferredCommandReply,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -341,6 +348,16 @@ class TestBasePlatformTopicSessions:
 
         adapter.set_message_handler(handler)
         adapter._keep_typing = hold_typing
+        original_send = adapter.send
+
+        async def send_before_terminal(*args, **kwargs):
+            assert not any(
+                hook[0] == "complete"
+                for hook in adapter.processing_hooks
+            )
+            return await original_send(*args, **kwargs)
+
+        adapter.send = send_before_terminal
 
         event = _make_event("-1001", "17585")
         event.metadata["_gateway_receipt_ids"] = ["1"]
@@ -359,6 +376,80 @@ class TestBasePlatformTopicSessions:
             "notify": False,
             "_gateway_recovery_component_index": "handler-error",
         }
+
+    @pytest.mark.asyncio
+    async def test_deferred_command_does_not_commit_before_failed_reply(self):
+        adapter = DummyTelegramAdapter()
+        event = _make_event("-1001", "17585")
+        event.text = "/stop"
+        event.message_type = MessageType.COMMAND
+        event.metadata["_gateway_receipt_ids"] = ["1"]
+        session_key = build_session_key(event.source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        committed = False
+
+        async def commit():
+            nonlocal committed
+            committed = True
+
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(
+                0,
+                result=DeferredCommandReply("Stopped", commit),
+            )
+        )
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="send failed",
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="send failed"):
+            await adapter._dispatch_active_session_command(
+                event,
+                session_key,
+                "stop",
+            )
+
+        assert committed is False
+
+    @pytest.mark.asyncio
+    async def test_deferred_command_commits_after_successful_reply(self):
+        adapter = DummyTelegramAdapter()
+        event = _make_event("-1001", "17585")
+        event.text = "/stop"
+        event.message_type = MessageType.COMMAND
+        event.metadata["_gateway_receipt_ids"] = ["1"]
+        session_key = build_session_key(event.source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        order = []
+
+        async def commit():
+            order.append("commit")
+
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(
+                0,
+                result=DeferredCommandReply("Stopped", commit),
+            )
+        )
+
+        async def successful_send(**_kwargs):
+            order.append("send")
+            return SendResult(success=True, message_id="reply-1")
+
+        adapter._send_with_retry = successful_send
+        adapter.cancel_session_processing = AsyncMock()
+        adapter._drain_pending_after_session_command = AsyncMock()
+
+        await adapter._dispatch_active_session_command(
+            event,
+            session_key,
+            "stop",
+        )
+
+        assert order == ["send", "commit"]
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):

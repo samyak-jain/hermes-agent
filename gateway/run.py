@@ -2695,6 +2695,7 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeferredCommandReply,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -6294,10 +6295,19 @@ class TurnRunner:
                     logger=logger,
                     log_message="Approval text-send scheduling error",
                 )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                if _approval_send_fut is None:
+                    raise RuntimeError(
+                        "approval text delivery could not be scheduled"
+                    )
+                _approval_send_result = _approval_send_fut.result(timeout=15)
+                if not getattr(_approval_send_result, "success", False):
+                    raise RuntimeError(
+                        getattr(_approval_send_result, "error", None)
+                        or "approval text delivery failed"
+                    )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
+                raise
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -16398,13 +16408,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is truly hung — the executor thread is blocked and never checks
         # _interrupt_requested.  Force-clean _running_agents so the session
         # is unlocked and subsequent messages are processed normally.
-        await self._interrupt_and_clear_session(
-            quick_key,
-            source,
-            interrupt_reason=_INTERRUPT_REASON_STOP,
-            invalidation_reason="stop_command",
-        )
-        logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+        async def _commit_stop() -> None:
+            await self._interrupt_and_clear_session(
+                quick_key,
+                source,
+                interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason="stop_command",
+            )
+            logger.info(
+                "STOP for session %s — agent interrupted, session lock released",
+                quick_key,
+            )
+
+        if event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY):
+            return DeferredCommandReply(
+                EphemeralReply(t("gateway.stop.stopped")),
+                _commit_stop,
+            )
+        await _commit_stop()
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
@@ -16415,15 +16436,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # clear the adapter's pending queue so the stale "/reset" text
         # doesn't get re-processed as a user message after the
         # interrupt completes.
-        # Clear any pending messages so the old text doesn't replay
+        async def _commit_new() -> None:
+            # Clear any pending messages so the old text doesn't replay.
+            await self._interrupt_and_clear_session(
+                quick_key,
+                source,
+                interrupt_reason=_INTERRUPT_REASON_RESET,
+                invalidation_reason="new_command",
+            )
+            # Clean up the running agent entry so the reset handler does not
+            # think an agent is still active.
+            await self._handle_reset_command(event)
+
+        if event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY):
+            return DeferredCommandReply(
+                EphemeralReply(t("gateway.reset.header_default")),
+                _commit_new,
+            )
         await self._interrupt_and_clear_session(
             quick_key,
             source,
             interrupt_reason=_INTERRUPT_REASON_RESET,
             invalidation_reason="new_command",
         )
-        # Clean up the running agent entry so the reset handler
-        # doesn't think an agent is still active.
         return await self._handle_reset_command(event)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):

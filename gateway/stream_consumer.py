@@ -344,6 +344,7 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
         self._recovery_text_chunk_index = 0
+        self._active_recovery_text_chunk_index: int | None = None
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
@@ -414,8 +415,11 @@ class GatewayStreamConsumer:
             or {}
         )
         if meta.get(_GATEWAY_RECEIPT_IDS_KEY):
-            meta[_GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY] = (
+            self._active_recovery_text_chunk_index = (
                 self._recovery_text_chunk_index
+            )
+            meta[_GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY] = (
+                self._active_recovery_text_chunk_index
             )
             self._recovery_text_chunk_index += 1
         return meta or None
@@ -479,7 +483,16 @@ class GatewayStreamConsumer:
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    edit_metadata = dict(self.metadata)
+                    if (
+                        edit_metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+                        and self._active_recovery_text_chunk_index
+                        is not None
+                    ):
+                        edit_metadata[
+                            _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                        ] = self._active_recovery_text_chunk_index
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)

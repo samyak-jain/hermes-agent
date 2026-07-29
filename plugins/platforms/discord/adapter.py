@@ -2383,7 +2383,14 @@ class DiscordAdapter(BasePlatformAdapter):
             and was_active
             and self._discord_event_bypasses_recovery_barrier(event)
         )
-        inline_command = event.get_command() if inline_control else None
+        inline_command = (
+            event.get_command()
+            if (
+                was_active
+                and self._discord_event_bypasses_recovery_barrier(event)
+            )
+            else None
+        )
         if inline_command in {"stop", "new", "reset"}:
             # The active request is intentionally terminated by its user, so
             # its CANCELLED lifecycle is terminal rather than retryable.  The
@@ -6172,6 +6179,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     nonce_base = (
                         reply_to_message_id,
                         "edit-overflow",
+                        (metadata or {}).get(
+                            _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY,
+                            0,
+                        ),
                     )
                     claim_guard = await asyncio.to_thread(
                         self._discord_recovery_store.acquire_claim_guard,
@@ -10586,7 +10597,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_role_ids=self._allowed_role_ids,
             )
 
-            msg = await channel.send(content=content, embed=embed, view=view)
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="slash-confirm",
+                send_kwargs={
+                    "content": content,
+                    "embed": embed,
+                    "view": view,
+                },
+            )
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
