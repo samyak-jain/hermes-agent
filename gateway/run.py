@@ -1930,6 +1930,8 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _GATEWAY_RECEIPT_IDS_KEY,
+    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -13490,9 +13492,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        media_succeeded = await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                        if not media_succeeded:
+                            event.metadata[
+                                _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                            ] = True
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -13501,12 +13507,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         _foot_adapter = self._adapter_for_source(source)
                         if _foot_adapter:
-                            await _foot_adapter.send(
+                            footer_result = await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=self._next_stream_delivery_metadata(
+                                    event,
+                                    self._thread_metadata_for_source(
+                                        source,
+                                        self._reply_anchor_for_event(event),
+                                    ),
+                                ),
                             )
+                            if not getattr(
+                                footer_result,
+                                "success",
+                                True,
+                            ):
+                                event.metadata[
+                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                                ] = True
                     except Exception as _e:
+                        event.metadata[
+                            _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                        ] = True
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
@@ -14554,21 +14577,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
+    def _next_stream_delivery_metadata(
+        self,
+        event: MessageEvent,
+        base_metadata: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Fence one post-stream component to the inbound receipt set."""
+        metadata = dict(base_metadata or {})
+        receipt_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in event.metadata.get(
+                    _GATEWAY_RECEIPT_IDS_KEY,
+                    [],
+                )
+                if str(value)
+            )
+        )
+        if not receipt_ids:
+            return metadata or None
+        metadata[_GATEWAY_RECEIPT_IDS_KEY] = receipt_ids
+        metadata["reply_to_message_id"] = str(
+            self._reply_anchor_for_event(event)
+            or receipt_ids[0]
+        )
+        metadata["notify"] = False
+        component_index = int(
+            event.metadata.get(
+                "_gateway_stream_delivery_component_index",
+                0,
+            )
+        )
+        metadata["_gateway_recovery_component_index"] = component_index
+        event.metadata[
+            "_gateway_stream_delivery_component_index"
+        ] = component_index + 1
+        return metadata
+
     async def _deliver_media_from_response(
         self,
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
+    ) -> bool:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
         that the normal _process_message_background path would have caught.
+
+        Returns whether every attempted component succeeded. Recovery uses
+        this to keep its cursor behind a failed attachment.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
 
+        all_succeeded = True
         try:
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
@@ -14622,58 +14686,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
-                        metadata=_thread_meta,
+                        metadata=self._next_stream_delivery_metadata(
+                            event,
+                            _thread_meta,
+                        ),
                     )
+                    if not getattr(result, "success", True):
+                        all_succeeded = False
                 except Exception as e:
+                    all_succeeded = False
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
-                            metadata=_thread_meta,
+                            metadata=self._next_stream_delivery_metadata(
+                                event,
+                                _thread_meta,
+                            ),
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
-                            metadata=_thread_meta,
+                            metadata=self._next_stream_delivery_metadata(
+                                event,
+                                _thread_meta,
+                            ),
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
-                            metadata=_thread_meta,
+                            metadata=self._next_stream_delivery_metadata(
+                                event,
+                                _thread_meta,
+                            ),
                         )
+                    if not getattr(result, "success", True):
+                        all_succeeded = False
                 except Exception as e:
+                    all_succeeded = False
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
-                            metadata=_thread_meta,
+                            metadata=self._next_stream_delivery_metadata(
+                                event,
+                                _thread_meta,
+                            ),
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
-                            metadata=_thread_meta,
+                            metadata=self._next_stream_delivery_metadata(
+                                event,
+                                _thread_meta,
+                            ),
                         )
+                    if not getattr(result, "success", True):
+                        all_succeeded = False
                 except Exception as e:
+                    all_succeeded = False
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 
         except Exception as e:
+            all_succeeded = False
             logger.warning("Post-stream media extraction failed: %s", e)
+        return all_succeeded
 
 
 
@@ -15741,6 +15834,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        receipt_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in (
+                    getattr(source, "_gateway_receipt_ids", None)
+                    or []
+                )
+                if str(value)
+            )
+        )
+        if receipt_ids:
+            metadata = dict(metadata or {})
+            metadata[_GATEWAY_RECEIPT_IDS_KEY] = receipt_ids
+            metadata["reply_to_message_id"] = str(
+                reply_to_message_id
+                or getattr(source, "message_id", None)
+                or receipt_ids[0]
+            )
         return metadata
 
     def _thread_metadata_for_target(

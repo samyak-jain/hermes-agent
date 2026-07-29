@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -2125,6 +2126,7 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
 
 _GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
 _GATEWAY_INLINE_OUTCOME_KEY = "_gateway_inline_processing_outcome"
+_GATEWAY_STREAM_DELIVERY_FAILED_KEY = "_gateway_stream_delivery_failed"
 
 
 def _merge_gateway_receipt_ids(existing: MessageEvent, event: MessageEvent) -> None:
@@ -5061,6 +5063,27 @@ class BasePlatformAdapter(ABC):
             else:
                 delivery_failed = True
 
+        receipt_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in event.metadata.get(
+                    _GATEWAY_RECEIPT_IDS_KEY,
+                    [],
+                )
+                if str(value)
+            )
+        )
+        if receipt_ids:
+            # The gateway's streaming consumer is created inside the message
+            # handler, before this adapter regains control for final delivery.
+            # Carry the complete (possibly batch-merged) receipt set on the
+            # per-event source so all in-handler sends can be fenced too.
+            setattr(
+                event.source,
+                "_gateway_receipt_ids",
+                receipt_ids,
+            )
+
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
         # Fall back to a new Event only if the entry was removed externally.
@@ -5098,8 +5121,16 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
 
-            # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            # Call the handler (this can take a while with tool calls).
+            # Receipt metadata only belongs to this inbound event; remove the
+            # temporary source binding before the source can be reused by a
+            # later synthetic/background turn.
+            try:
+                response = await self._message_handler(event)
+            finally:
+                if receipt_ids:
+                    with suppress(AttributeError):
+                        delattr(event.source, "_gateway_receipt_ids")
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5515,6 +5546,10 @@ class BasePlatformAdapter(ABC):
                 if delivery_attempted
                 else not bool(response)
             )
+            if event.metadata.get(
+                _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+            ):
+                processing_ok = False
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
