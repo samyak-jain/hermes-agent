@@ -93,6 +93,13 @@ def _fake_runner(thread_meta):
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
         _reply_anchor_for_event=lambda event: None,
     )
+    runner._next_stream_delivery_metadata = (
+        lambda event, metadata: GatewayRunner._next_stream_delivery_metadata(
+            runner,
+            event,
+            metadata,
+        )
+    )
     return runner
 
 
@@ -180,25 +187,75 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
 
 
-class _DiscordMediaFailureAdapter(BasePlatformAdapter):
-    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+@pytest.mark.asyncio
+async def test_streaming_recovery_media_is_fenced_and_failure_reported(
+    tmp_path,
+    monkeypatch,
+):
+    event = _event(thread_id="topic-1")
+    event.metadata["_gateway_receipt_ids"] = ["msg-1", "msg-2"]
+    media_file = _allowed_media_path(
+        tmp_path,
+        monkeypatch,
+        "report.pdf",
+    )
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(
+            return_value=SendResult(success=True, message_id="voice")
+        ),
+        send_document=AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="upload failed",
+            )
+        ),
+        send_image_file=AsyncMock(
+            return_value=SendResult(success=True, message_id="image")
+        ),
+        send_video=AsyncMock(
+            return_value=SendResult(success=True, message_id="video")
+        ),
+    )
 
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
-        self.notices: list[str] = []
+    succeeded = await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{media_file}",
+        event,
+        adapter,
+    )
 
-    async def connect(self, *, is_reconnect: bool = False):
-        return True
+    assert succeeded is False
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path=str(media_file),
+        metadata={
+            "thread_id": "topic-1",
+            "_gateway_receipt_ids": ["msg-1", "msg-2"],
+            "reply_to_message_id": "msg-1",
+            "notify": False,
+            "_gateway_recovery_component_index": 0,
+        },
+    )
 
-    async def disconnect(self):
-        pass
 
-    async def send(self, chat_id, content=None, **kwargs):
-        self.notices.append(content or "")
-        return SendResult(success=True, message_id="notice")
+def test_thread_metadata_carries_merged_recovery_receipts_for_streaming():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        message_id="msg-1",
+    )
+    source._gateway_receipt_ids = ["msg-1", "msg-2"]
 
-    async def get_chat_info(self, chat_id):
-        return {"id": chat_id, "type": "dm"}
+    assert runner._thread_metadata_for_source(source) == {
+        "_gateway_receipt_ids": ["msg-1", "msg-2"],
+        "reply_to_message_id": "msg-1",
+    }
 
 
 @pytest.mark.asyncio

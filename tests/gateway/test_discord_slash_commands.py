@@ -480,8 +480,12 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     assert result is thread
     message.channel.send.assert_awaited_once_with(
         "🧵 Thread created by Hermes: **Hello**",
-        nonce="hermes-auto-thread-123",
+        nonce=adapter._discord_recovery_nonce(
+            "123",
+            "auto-thread-seed",
+        ),
     )
+    assert len(message.channel.send.await_args.kwargs["nonce"]) <= 25
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
         auto_archive_duration=1440,
@@ -675,4 +679,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-

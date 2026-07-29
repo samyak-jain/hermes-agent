@@ -171,6 +171,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
+    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY,
     _GATEWAY_RECEIPT_IDS_KEY,
     _GATEWAY_INLINE_OUTCOME_KEY,
     _TEXT_INJECT_EXTENSIONS,
@@ -1177,6 +1178,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_recovery_waiters: Dict[str, asyncio.Future] = {}
         self._discord_recovery_started_events: Dict[str, asyncio.Event] = {}
         self._discord_recovery_session_keys: Dict[str, str] = {}
+        self._discord_recovery_active_receipt_lists: Dict[
+            str,
+            list[str],
+        ] = {}
+        self._discord_recovery_user_cancelled_sessions: set[str] = set()
         self._discord_recovery_receipts: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._discord_recovery_message_channels: Dict[str, str] = {}
         self._discord_recovery_claim_heartbeats: Dict[str, asyncio.Task] = {}
@@ -1754,6 +1760,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_id,
                 message_id,
             )
+            if not self._record_discord_message_seen(
+                message,
+                status="discovered",
+            ):
+                logger.error(
+                    "[%s] Refusing untracked Discord receipt %s in channel %s; "
+                    "durable pending registration unavailable",
+                    self.name,
+                    message_id,
+                    channel_id,
+                )
+                self._schedule_discord_recovery_retry(0.1)
+                return False
             durable_claim = self._claim_live_discord_message(message)
             if durable_claim is None:
                 logger.error(
@@ -1763,11 +1782,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     message_id,
                     channel_id,
                 )
+                self._schedule_discord_recovery_retry(0.1)
                 return False
             if durable_claim == "active":
                 # Discord may replay MESSAGE_CREATE after the in-memory dedupe
                 # TTL while the original turn is still waiting for user input.
                 # Its heartbeat-backed durable lease remains the owner.
+                if not self._discord_message_has_active_claim(message_id):
+                    self._schedule_discord_recovery_retry(0.1)
                 return False
             if durable_claim == "complete":
                 # A later successful receipt can remain above the contiguous
@@ -2382,6 +2404,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if waiter is not None and not waiter.done():
                 waiter.set_result(outcome)
 
+    def _attach_inline_discord_receipts_to_active_turn(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Defer a control receipt until its active parent turn commits."""
+        active_receipts = (
+            self._discord_recovery_active_receipt_lists.get(session_key)
+        )
+        if active_receipts is None:
+            return False
+        for message_id in self._discord_event_receipt_ids(event):
+            if message_id not in active_receipts:
+                active_receipts.append(message_id)
+        return True
+
     async def _dispatch_discord_event(
         self,
         event: MessageEvent,
@@ -2406,6 +2444,22 @@ class DiscordAdapter(BasePlatformAdapter):
             and was_active
             and self._discord_event_bypasses_recovery_barrier(event)
         )
+        inline_command = (
+            event.get_command()
+            if (
+                was_active
+                and self._discord_event_bypasses_recovery_barrier(event)
+            )
+            else None
+        )
+        if inline_command in {"stop", "new", "reset"}:
+            # The active request is intentionally terminated by its user, so
+            # its CANCELLED lifecycle is terminal rather than retryable.  The
+            # command receipt remains independent until its own confirmation
+            # delivery succeeds.
+            self._discord_recovery_user_cancelled_sessions.add(
+                session_key
+            )
         if not recovered and not inline_control:
             await self._discord_recovery_barrier.wait()
         active_at_dispatch = session_key in self._active_sessions
@@ -2429,6 +2483,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 inline_outcome = ProcessingOutcome(raw_outcome)
             except ValueError:
                 inline_outcome = ProcessingOutcome.FAILURE
+            if (
+                inline_command in {"stop", "new", "reset"}
+                and inline_outcome != ProcessingOutcome.SUCCESS
+            ):
+                self._discord_recovery_user_cancelled_sessions.discard(
+                    session_key
+                )
+            if (
+                inline_outcome == ProcessingOutcome.SUCCESS
+                and inline_command not in {"stop", "new", "reset"}
+                and self._attach_inline_discord_receipts_to_active_turn(
+                    event,
+                    session_key,
+                )
+            ):
+                # The parent lifecycle now owns this receipt.  Leaving the
+                # child claim nonterminal makes a crash replay both messages;
+                # successful parent completion commits both physical-channel
+                # cursors together.
+                return
             await self._complete_inline_discord_event(
                 event,
                 inline_outcome,
@@ -3353,6 +3427,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc,
             )
+        try:
+            incomplete_channels = await self._with_discord_recovery_db_async(
+                lambda conn: conn.execute(
+                    """
+                    SELECT channel_id, parent_channel_id, routing_thread_id
+                      FROM discord_messages
+                     WHERE status IN (
+                         'discovered', 'queued', 'processing',
+                         'failed', 'cancelled'
+                     )
+                    """
+                ).fetchall(),
+                [],
+            )
+            for row in incomplete_channels or []:
+                channels.update(str(value) for value in row if value)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Could not enumerate incomplete Discord receipts for recovery: %s",
+                self.name,
+                exc,
+            )
         return {channel for channel in channels if channel}
 
     async def _run_missed_message_backfill(self) -> None:
@@ -3414,6 +3510,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     by_channel[channel_id].append(message)
 
             max_dispatches = self._missed_message_backfill_max_dispatches()
+            dispatch_queue: list[tuple[str, Any]] = []
             for channel_id in sorted(by_channel):
                 candidates = sorted(
                     by_channel[channel_id],
@@ -3421,6 +3518,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 eligible: List[Any] = []
                 durably_completed: List[Any] = []
+                ignored: List[Any] = []
                 channel_has_active_claim = False
                 for message in candidates:
                     message_id = str(getattr(message, "id", ""))
@@ -3433,6 +3531,10 @@ class DiscordAdapter(BasePlatformAdapter):
                             continue
                     except (TypeError, ValueError):
                         pass
+                    self._register_discord_recovery_receipt(
+                        channel_id,
+                        message_id,
+                    )
                     if self._discord_message_is_persistently_complete(
                         message_id
                     ):
@@ -3451,14 +3553,26 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         channel_has_active_claim = True
                         break
-                    self._record_discord_message_seen(
+                    if not self._record_discord_message_seen(
                         message, status="discovered"
-                    )
+                    ):
+                        logger.warning(
+                            "[%s] Discord recovery stopped at message %s in "
+                            "channel %s because durable pending registration "
+                            "failed",
+                            self.name,
+                            message_id,
+                            channel_id,
+                        )
+                        retry_delays.append(0.1)
+                        channel_has_active_claim = True
+                        break
                     if not await self._should_backfill_discord_message(message):
                         if self._discord_message_has_active_claim(message_id):
-                            self._register_discord_recovery_receipt(
-                                channel_id,
-                                message_id,
+                            retry_delays.append(
+                                self._discord_active_claim_retry_delay(
+                                    message_id
+                                )
                             )
                             retry_delays.append(
                                 self._discord_active_claim_retry_delay(
@@ -3467,27 +3581,38 @@ class DiscordAdapter(BasePlatformAdapter):
                             )
                             channel_has_active_claim = True
                             break
+                        ignored.append(message)
                         continue
                     if not self._is_discord_recovery_trigger(message):
+                        ignored.append(message)
+                        continue
+                    if not self._is_discord_recovery_authorized_user(message):
+                        ignored.append(message)
                         continue
                     if not self._is_discord_recovery_authorized_user(message):
                         continue
                     eligible.append(message)
 
-                # Register the complete trigger set before committing a count
-                # boundary. A newer live receipt may complete concurrently;
-                # pre-registration prevents it from skipping retained replay.
-                for message in [*durably_completed, *eligible]:
-                    self._register_discord_recovery_receipt(
-                        channel_id,
-                        str(getattr(message, "id", "") or ""),
-                    )
                 if durably_completed:
                     await self._set_discord_recovery_receipts(
                         [
                             str(getattr(message, "id", "") or "")
                             for message in durably_completed
                         ],
+                        ProcessingOutcome.SUCCESS,
+                    )
+                if ignored:
+                    ignored_ids = [
+                        str(getattr(message, "id", "") or "")
+                        for message in ignored
+                    ]
+                    await asyncio.to_thread(
+                        self._record_discord_claim_outcome,
+                        ignored_ids,
+                        ProcessingOutcome.SUCCESS,
+                    )
+                    await self._set_discord_recovery_receipts(
+                        ignored_ids,
                         ProcessingOutcome.SUCCESS,
                     )
 
@@ -3504,11 +3629,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 if len(eligible) > max_dispatches:
                     skipped = eligible[:-max_dispatches]
                     boundary = str(getattr(skipped[-1], "id", "") or "")
+                    skipped_ids = [
+                        str(getattr(message, "id", "") or "")
+                        for message in skipped
+                    ]
+                    await asyncio.to_thread(
+                        self._record_discord_claim_outcome,
+                        skipped_ids,
+                        ProcessingOutcome.SUCCESS,
+                    )
                     await self._set_discord_recovery_receipts(
-                        [
-                            str(getattr(message, "id", "") or "")
-                            for message in skipped
-                        ],
+                        skipped_ids,
                         ProcessingOutcome.SUCCESS,
                         boundary_reason="dispatch_count_bound",
                     )
@@ -3544,152 +3675,210 @@ class DiscordAdapter(BasePlatformAdapter):
                             boundary,
                         )
                     eligible = eligible[-max_dispatches:]
+                dispatch_queue.extend(
+                    (channel_id, message) for message in eligible
+                )
 
-                recovery_tasks: list[
-                    tuple[str, asyncio.Task]
-                ] = []
-                blocking_task: Optional[asyncio.Task] = None
-                blocking_message_id: Optional[str] = None
-                for message in eligible:
-                    message_id = str(getattr(message, "id", ""))
-                    if blocking_task is not None:
-                        can_dispatch_control = (
-                            await self._wait_for_recovered_dispatch_window(
-                                blocking_task,
-                                blocking_message_id or "",
-                                message,
-                            )
+            # Pump every physical channel through one chronological recovery
+            # lane. Auto-threaded requests begin in a parent channel while a
+            # clarification/approval answer arrives in the child thread; a
+            # per-channel await would deadlock before reaching that answer.
+            dispatch_queue.sort(
+                key=lambda item: int(
+                    getattr(item[1], "id", 0) or 0
+                )
+            )
+            recovery_tasks: list[
+                tuple[str, str, Any, asyncio.Task]
+            ] = []
+            blocking_task: Optional[asyncio.Task] = None
+            blocking_message_id: Optional[str] = None
+            for channel_id, message in dispatch_queue:
+                message_id = str(getattr(message, "id", ""))
+                if blocking_task is not None:
+                    can_dispatch_control = (
+                        await self._wait_for_recovered_dispatch_window(
+                            blocking_task,
+                            blocking_message_id or "",
+                            message,
                         )
-                        if not can_dispatch_control:
-                            prior_outcome = await blocking_task
-                            if prior_outcome not in {
-                                None,
-                                ProcessingOutcome.SUCCESS,
-                            }:
-                                retry_delays.append(
-                                    self._discord_failure_retry_delay(
-                                        blocking_message_id or message_id
-                                    )
+                    )
+                    if not can_dispatch_control:
+                        prior_outcome = await blocking_task
+                        if prior_outcome not in {
+                            None,
+                            ProcessingOutcome.SUCCESS,
+                        }:
+                            retry_delays.append(
+                                self._discord_failure_retry_delay(
+                                    blocking_message_id or message_id
                                 )
-                                break
-                            blocking_task = None
-                            blocking_message_id = None
-                    missed += 1
-                    logger.info(
-                        "[%s] Backfilling missed Discord message %s in channel %s",
+                            )
+                            break
+                        blocking_task = None
+                        blocking_message_id = None
+                missed += 1
+                logger.info(
+                    "[%s] Backfilling missed Discord message %s in channel %s",
+                    self.name,
+                    message_id,
+                    channel_id,
+                )
+                durable_claim = self._claim_live_discord_message(message)
+                if durable_claim is None:
+                    logger.warning(
+                        "[%s] Discord recovery stopped at message %s in "
+                        "channel %s because its durable claim could not "
+                        "be acquired",
                         self.name,
                         message_id,
                         channel_id,
                     )
-                    durable_claim = self._claim_live_discord_message(message)
-                    if durable_claim is None:
-                        logger.warning(
-                            "[%s] Discord recovery stopped at message %s in "
-                            "channel %s because its durable claim could not "
-                            "be acquired",
-                            self.name,
-                            message_id,
-                            channel_id,
-                        )
-                        retry_delays.append(1.0)
-                        break
-                    if durable_claim == "active":
-                        retry_delays.append(
-                            self._discord_active_claim_retry_delay(message_id)
-                        )
-                        logger.info(
-                            "[%s] Discord recovery stopped at message %s in "
-                            "channel %s behind another durable owner",
-                            self.name,
-                            message_id,
-                            channel_id,
-                        )
-                        break
-                    if durable_claim == "complete":
-                        await self._set_discord_recovery_receipts(
-                            [message_id],
-                            ProcessingOutcome.SUCCESS,
-                        )
-                        continue
-                    self._record_recovery_attempt(message, status="queued")
-                    started = asyncio.Event()
-                    self._discord_recovery_started_events[message_id] = (
-                        started
+                    retry_delays.append(1.0)
+                    break
+                if durable_claim == "active":
+                    retry_delays.append(
+                        self._discord_active_claim_retry_delay(message_id)
                     )
-                    task = asyncio.create_task(
-                        self._dispatch_recovered_message(message)
+                    logger.info(
+                        "[%s] Discord recovery stopped at message %s in "
+                        "channel %s behind another durable owner",
+                        self.name,
+                        message_id,
+                        channel_id,
                     )
-                    recovery_tasks.append((message_id, task))
-                    started_wait = asyncio.create_task(started.wait())
-                    try:
-                        done, _ = await asyncio.wait(
-                            {task, started_wait},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                    except asyncio.CancelledError:
-                        task.cancel()
-                        started_wait.cancel()
-                        with suppress(
-                            asyncio.CancelledError,
-                            Exception,
-                        ):
-                            await task
-                        self._dedup.discard(message_id)
-                        self._discord_recovery_started_events.pop(
-                            message_id,
-                            None,
-                        )
-                        raise
-                    if started_wait not in done:
-                        started_wait.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await started_wait
-                    if task.done() and not started.is_set():
-                        started.set()
-                        self._discord_recovery_started_events.pop(
-                            message_id,
-                            None,
-                        )
-                    if blocking_task is None:
-                        blocking_task = task
-                        blocking_message_id = message_id
+                    break
+                if durable_claim == "complete":
+                    await self._set_discord_recovery_receipts(
+                        [message_id],
+                        ProcessingOutcome.SUCCESS,
+                    )
+                    continue
+                self._record_recovery_attempt(message, status="queued")
+                started = asyncio.Event()
+                self._discord_recovery_started_events[message_id] = started
+                task = asyncio.create_task(
+                    self._dispatch_recovered_message(message)
+                )
+                recovery_tasks.append(
+                    (channel_id, message_id, message, task)
+                )
+                started_wait = asyncio.create_task(started.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {task, started_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    task.cancel()
+                    started_wait.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
+                    self._dedup.discard(message_id)
+                    self._discord_recovery_started_events.pop(
+                        message_id,
+                        None,
+                    )
+                    raise
+                if started_wait not in done:
+                    started_wait.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await started_wait
+                if task.done() and not started.is_set():
+                    started.set()
+                    self._discord_recovery_started_events.pop(
+                        message_id,
+                        None,
+                    )
+                if blocking_task is None:
+                    blocking_task = task
+                    blocking_message_id = message_id
 
-                for message_id, task in recovery_tasks:
-                    try:
-                        outcome = await task
-                    except asyncio.CancelledError:
-                        self._dedup.discard(message_id)
-                        raise
-                    except Exception as exc:
-                        self._dedup.discard(message_id)
-                        logger.warning(
-                            "[%s] Discord recovery message %s in channel %s "
-                            "failed after dispatch: %s",
+            for channel_id, message_id, message, task in recovery_tasks:
+                if not task.done():
+                    interactive = (
+                        await self._wait_for_recovered_dispatch_window(
+                            task,
+                            message_id,
+                            message,
+                        )
+                    )
+                    if interactive and not task.done():
+                        logger.info(
+                            "[%s] Parking recovered Discord message %s in "
+                            "channel %s at an active clarification/approval; "
+                            "its durable claim remains incomplete until a "
+                            "normal live control reply finishes the turn",
                             self.name,
                             message_id,
                             channel_id,
-                            exc,
                         )
-                        retry_delays.append(
-                            self._discord_failure_retry_delay(message_id)
-                        )
+                        self._background_tasks.add(task)
+
+                        def _finish_parked(
+                            completed_task: asyncio.Task,
+                            *,
+                            parked_message_id: str = message_id,
+                        ) -> None:
+                            self._background_tasks.discard(completed_task)
+                            try:
+                                parked_outcome = completed_task.result()
+                            except asyncio.CancelledError:
+                                return
+                            except Exception:
+                                self._schedule_discord_recovery_retry(
+                                    self._discord_failure_retry_delay(
+                                        parked_message_id
+                                    )
+                                )
+                                return
+                            if parked_outcome in {
+                                ProcessingOutcome.FAILURE,
+                                ProcessingOutcome.CANCELLED,
+                            }:
+                                self._schedule_discord_recovery_retry(
+                                    self._discord_failure_retry_delay(
+                                        parked_message_id
+                                    )
+                                )
+
+                        task.add_done_callback(_finish_parked)
                         continue
-                    if outcome == ProcessingOutcome.SUCCESS:
-                        dispatched += 1
-                    elif outcome in {
-                        ProcessingOutcome.FAILURE,
-                        ProcessingOutcome.CANCELLED,
-                    }:
-                        retry_delays.append(
-                            self._discord_failure_retry_delay(message_id)
-                        )
-                        logger.warning(
-                            "[%s] Discord recovery retained incomplete "
-                            "message %s in channel %s for an in-process retry",
-                            self.name,
-                            message_id,
-                            channel_id,
-                        )
+                try:
+                    outcome = await task
+                except asyncio.CancelledError:
+                    self._dedup.discard(message_id)
+                    raise
+                except Exception as exc:
+                    self._dedup.discard(message_id)
+                    logger.warning(
+                        "[%s] Discord recovery message %s in channel %s "
+                        "failed after dispatch: %s",
+                        self.name,
+                        message_id,
+                        channel_id,
+                        exc,
+                    )
+                    retry_delays.append(
+                        self._discord_failure_retry_delay(message_id)
+                    )
+                    continue
+                if outcome == ProcessingOutcome.SUCCESS:
+                    dispatched += 1
+                elif outcome in {
+                    ProcessingOutcome.FAILURE,
+                    ProcessingOutcome.CANCELLED,
+                }:
+                    retry_delays.append(
+                        self._discord_failure_retry_delay(message_id)
+                    )
+                    logger.warning(
+                        "[%s] Discord recovery retained incomplete "
+                        "message %s in channel %s for an in-process retry",
+                        self.name,
+                        message_id,
+                        channel_id,
+                    )
             await asyncio.to_thread(
                 self._record_recovery_scan_complete,
                 scan_id,
@@ -4112,7 +4301,8 @@ class DiscordAdapter(BasePlatformAdapter):
                   FROM discord_messages
                  WHERE channel_id=?
                    AND status IN (
-                       'queued', 'processing', 'failed', 'cancelled'
+                       'discovered', 'queued', 'processing',
+                       'failed', 'cancelled'
                    )
                    AND CAST(message_id AS INTEGER) <= CAST(? AS INTEGER)
                 """
@@ -4309,6 +4499,39 @@ class DiscordAdapter(BasePlatformAdapter):
         import datetime as _dt
         return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
+    @staticmethod
+    def _discord_recovery_nonce(*parts: Any) -> str:
+        """Return a deterministic Discord nonce within the 25-character cap."""
+        material = "\x1f".join(str(part) for part in parts)
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return f"hr-{digest[:22]}"
+
+    def _discord_recovery_interaction_key(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        component: str,
+    ) -> Optional[str]:
+        """Return a replay-stable key for Discord component custom IDs."""
+        receipt_ids = (metadata or {}).get(
+            _GATEWAY_RECEIPT_IDS_KEY,
+            [],
+        )
+        if not receipt_ids:
+            return None
+        reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or receipt_ids[0]
+        )
+        component_index = (metadata or {}).get(
+            "_gateway_recovery_component_index",
+            component,
+        )
+        return self._discord_recovery_nonce(
+            reply_to,
+            "interaction",
+            component_index,
+        )
+
     def _message_channel_ids(self, message: Any) -> tuple[str, Optional[str], Optional[str]]:
         channel = getattr(message, "channel", None)
         channel_id = str(getattr(channel, "id", "") or "")
@@ -4327,6 +4550,11 @@ class DiscordAdapter(BasePlatformAdapter):
         created_at = getattr(message, "created_at", None)
         created_text = created_at.isoformat() if hasattr(created_at, "isoformat") else None
         now = self._utc_now_iso()
+        channel_guard = self._discord_recovery_store.acquire_channel_lock(
+            channel_id,
+        )
+        if channel_guard is None:
+            return False
 
         def _op(conn):
             existing = conn.execute("SELECT status FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
@@ -4337,6 +4565,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "queued",
                     "processing",
                     "responded",
+                    "processed",
                 }
                 else status
             )
@@ -4351,13 +4580,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     author_id=excluded.author_id,
                     created_at=COALESCE(discord_messages.created_at, excluded.created_at),
                     status=?,
-                    updated_at=excluded.updated_at
+                    updated_at=CASE
+                        WHEN discord_messages.status IN (
+                            'queued', 'processing'
+                        )
+                        THEN discord_messages.updated_at
+                        ELSE excluded.updated_at
+                    END
                 """,
                 (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, now, final_status),
             )
             return True
 
-        return bool(self._with_discord_recovery_db(_op, default=False))
+        try:
+            return bool(self._with_discord_recovery_db(_op, default=False))
+        finally:
+            self._discord_recovery_store.release_claim_guard(channel_guard)
 
     def _claim_live_discord_message(self, message: Any) -> Optional[str]:
         """Atomically claim live ingress or identify its durable owner.
@@ -4432,11 +4670,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 ) = existing
                 if (
                     status in {"queued", "processing"}
-                    and (
-                        updated_at >= active_cutoff
-                        or claim_owner
-                        == self._discord_recovery_claim_owner
-                    )
+                    and updated_at >= active_cutoff
                 ):
                     return "active"
                 if status == "processed" or (
@@ -5218,11 +5452,17 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _acquire_discord_side_effect_guard(
         self,
         message_id: str,
+        *,
+        require_claim: bool = False,
     ) -> tuple[bool, Any]:
         """Fence a tracked Discord side effect by claim owner and epoch."""
-        claim_epoch = self._discord_recovery_claim_epochs.get(message_id)
+        claim_epoch = getattr(
+            self,
+            "_discord_recovery_claim_epochs",
+            {},
+        ).get(message_id)
         if claim_epoch is None:
-            return True, None
+            return not require_claim, None
         guard = await asyncio.to_thread(
             self._discord_recovery_store.acquire_claim_guard,
             message_id,
@@ -5277,8 +5517,56 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message_id in self._discord_recovery_message_channels
             ]
         )
+        source_receipts = getattr(
+            event.source,
+            "_gateway_receipt_ids",
+            None,
+        )
+        if isinstance(source_receipts, list) and source_receipts:
+            self._discord_recovery_active_receipt_lists[
+                self._discord_event_session_key(event)
+            ] = source_receipts
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+    async def on_processing_complete(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        """Complete durable processing and always release active ownership."""
+        session_key = (
+            self._discord_event_session_key(event)
+            if event.source is not None
+            else None
+        )
+        effective_outcome = (
+            ProcessingOutcome.SUCCESS
+            if (
+                outcome == ProcessingOutcome.CANCELLED
+                and session_key
+                in self._discord_recovery_user_cancelled_sessions
+            )
+            else outcome
+        )
+        try:
+            await self._complete_discord_processing(
+                event,
+                effective_outcome,
+            )
+        finally:
+            if session_key is not None:
+                self._discord_recovery_active_receipt_lists.pop(
+                    session_key,
+                    None,
+                )
+                self._discord_recovery_user_cancelled_sessions.discard(
+                    session_key
+                )
+
+    async def _complete_discord_processing(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         message_ids = self._discord_event_receipt_ids(event)
         await self._stop_discord_processing_claim_heartbeats(message_ids)
@@ -5327,7 +5615,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     waiter = self._discord_recovery_waiters.get(message_id)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(outcome)
-
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
         """ids-built reply reference — no fetch_message round trip.
@@ -5459,14 +5746,49 @@ class DiscordAdapter(BasePlatformAdapter):
             claim_epoch = self._discord_recovery_claim_epochs.get(
                 recovery_reply_to
             )
+            if recovery_receipt_ids and claim_epoch is None:
+                logger.warning(
+                    "[%s] Refusing Discord recovery send for message %s "
+                    "because this adapter does not own its claim",
+                    self.name,
+                    recovery_reply_to,
+                )
+                return SendResult(
+                    success=False,
+                    error="Discord recovery claim no longer owned",
+                )
             nonce_base = None
             if claim_epoch is not None and (
                 final_delivery
                 or bool(metadata and metadata.get("expect_edits"))
+                or "_gateway_recovery_component_index" in (metadata or {})
+                or _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                in (metadata or {})
             ):
-                nonce_base = (
-                    f"{recovery_reply_to}-{int(final_delivery)}"
+                component_index = (metadata or {}).get(
+                    "_gateway_recovery_component_index"
                 )
+                text_chunk_index = (metadata or {}).get(
+                    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                )
+                if text_chunk_index is not None:
+                    nonce_base = (
+                        recovery_reply_to,
+                        "stream-text",
+                        text_chunk_index,
+                    )
+                elif component_index is not None:
+                    nonce_base = (
+                        recovery_reply_to,
+                        "component",
+                        component_index,
+                    )
+                else:
+                    nonce_base = (
+                        recovery_reply_to,
+                        "text",
+                        int(final_delivery),
+                    )
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -5559,7 +5881,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     "reference": chunk_reference,
                 }
                 if nonce_base is not None:
-                    send_kwargs["nonce"] = f"{nonce_base}-{i}"
+                    send_kwargs["nonce"] = self._discord_recovery_nonce(
+                        *nonce_base,
+                        i,
+                    )
                 try:
                     msg = await channel.send(**send_kwargs)
                 except Exception as e:
@@ -5634,7 +5959,7 @@ class DiscordAdapter(BasePlatformAdapter):
         forum_channel: Any,
         content: str,
         *,
-        nonce_base: Optional[str] = None,
+        nonce_base: Optional[tuple[Any, ...]] = None,
     ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
@@ -5662,7 +5987,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 name=thread_name,
                 content=starter_content,
                 nonce=(
-                    f"{nonce_base}-0"
+                    self._discord_recovery_nonce(*nonce_base, 0)
                     if nonce_base is not None
                     else None
                 ),
@@ -5684,7 +6009,10 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 send_kwargs = {"content": chunk}
                 if nonce_base is not None:
-                    send_kwargs["nonce"] = f"{nonce_base}-{index}"
+                    send_kwargs["nonce"] = self._discord_recovery_nonce(
+                        *nonce_base,
+                        index,
+                    )
                 msg = await thread_channel.send(**send_kwargs)
                 message_ids.append(str(msg.id))
             except Exception as e:
@@ -5717,15 +6045,19 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         content: str,
         nonce: Optional[str],
+        file: Any = None,
+        files: Optional[list[Any]] = None,
     ) -> Any:
         """Create a forum post with Discord's enforced nonce when available."""
         state = getattr(forum_channel, "_state", None)
         http = getattr(state, "http", None)
         if nonce is None or not hasattr(http, "start_thread_in_forum"):
-            return await forum_channel.create_thread(
-                name=name,
-                content=content,
-            )
+            kwargs: Dict[str, Any] = {"name": name, "content": content}
+            if file is not None:
+                kwargs["file"] = file
+            if files:
+                kwargs["files"] = files
+            return await forum_channel.create_thread(**kwargs)
 
         # discord.py 2.7 enforces nonces for ordinary Messageable.send(),
         # but does not expose the same argument on ForumChannel.create_thread.
@@ -5743,16 +6075,21 @@ class DiscordAdapter(BasePlatformAdapter):
             "rate_limit_per_user": None,
             "type": 11,
         }
-        with handle_message_parameters(
-            content=content,
-            nonce=nonce,
-            previous_allowed_mentions=getattr(
+        message_kwargs: Dict[str, Any] = {
+            "content": content,
+            "nonce": nonce,
+            "previous_allowed_mentions": getattr(
                 state,
                 "allowed_mentions",
                 None,
             ),
-            channel_payload=channel_payload,
-        ) as params:
+            "channel_payload": channel_payload,
+        }
+        if file is not None:
+            message_kwargs["file"] = file
+        if files:
+            message_kwargs["files"] = files
+        with handle_message_parameters(**message_kwargs) as params:
             data = await http.start_thread_in_forum(
                 forum_channel.id,
                 params=params,
@@ -5782,6 +6119,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str = "",
         file: Any = None,
         files: Optional[list] = None,
+        nonce: Optional[str] = None,
     ) -> SendResult:
         """Create a forum thread whose starter message carries file attachments.
 
@@ -5804,16 +6142,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     hint = getattr(files[0], "filename", "") or ""
             thread_name = _derive_forum_thread_name(hint) if hint.strip() else "New Post"
 
-        kwargs: Dict[str, Any] = {"name": thread_name}
-        if content:
-            kwargs["content"] = content
-        if file is not None:
-            kwargs["file"] = file
-        if files:
-            kwargs["files"] = files
-
         try:
-            thread = await forum_channel.create_thread(**kwargs)
+            thread = await self._create_forum_thread(
+                forum_channel,
+                name=thread_name,
+                content=content,
+                nonce=nonce,
+                file=file,
+                files=files,
+            )
         except Exception as e:
             logger.error(
                 "[%s] Failed to create forum thread with file in %s: %s",
@@ -5904,21 +6241,43 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         try:
+            reply_to_message_id = str(
+                (metadata or {}).get("reply_to_message_id") or ""
+            )
+            claim_epoch = (
+                self._discord_recovery_claim_epochs.get(
+                    reply_to_message_id
+                )
+                if reply_to_message_id
+                else None
+            )
+            if recovery_receipt_ids and claim_epoch is None:
+                logger.warning(
+                    "[%s] Refusing Discord recovery edit for message %s "
+                    "because this adapter does not own its claim",
+                    self.name,
+                    reply_to_message_id,
+                )
+                return SendResult(
+                    success=False,
+                    error="Discord recovery claim no longer owned",
+                )
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
-            reply_to_message_id = str(
-                (metadata or {}).get("reply_to_message_id") or ""
-            )
             nonce_base = None
             if reply_to_message_id:
-                claim_epoch = self._discord_recovery_claim_epochs.get(
-                    reply_to_message_id
-                )
                 if claim_epoch is not None:
-                    nonce_base = f"{reply_to_message_id}-1"
+                    nonce_base = (
+                        reply_to_message_id,
+                        "edit-overflow",
+                        (metadata or {}).get(
+                            _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY,
+                            0,
+                        ),
+                    )
                     claim_guard = await asyncio.to_thread(
                         self._discord_recovery_store.acquire_claim_guard,
                         reply_to_message_id,
@@ -5960,7 +6319,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         reply_to=reply_to_message_id,
                         result=result,
                         content=content,
-                        final=True,
+                        final=bool(
+                            (metadata or {}).get("notify")
+                        ),
                         claim_guard=claim_guard,
                         receipt_ids=recovery_receipt_ids,
                     )
@@ -6006,7 +6367,9 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to=reply_to_message_id,
                             result=result,
                             content=content,
-                            final=True,
+                            final=bool(
+                                (metadata or {}).get("notify")
+                            ),
                             claim_guard=claim_guard,
                             receipt_ids=recovery_receipt_ids,
                         )
@@ -6030,7 +6393,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     reply_to=reply_to_message_id,
                     result=result,
                     content=content,
-                    final=True,
+                    final=bool(
+                        (metadata or {}).get("notify")
+                    ),
                     claim_guard=claim_guard,
                     receipt_ids=recovery_receipt_ids,
                 )
@@ -6064,7 +6429,7 @@ class DiscordAdapter(BasePlatformAdapter):
         message_id: str,
         content: str,
         *,
-        nonce_base: Optional[str] = None,
+        nonce_base: Optional[tuple[Any, ...]] = None,
     ) -> SendResult:
         """Deliver an oversized final edit across message + continuations.
 
@@ -6126,7 +6491,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     "reference": reference,
                 }
                 if nonce_base is not None:
-                    send_kwargs["nonce"] = f"{nonce_base}-{index}"
+                    send_kwargs["nonce"] = self._discord_recovery_nonce(
+                        *nonce_base,
+                        index,
+                    )
                 sent = await channel.send(**send_kwargs)
             except Exception as send_err:
                 # Drop the reply anchor and retry once — a deleted/expired
@@ -6202,17 +6570,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
-
-        target_id = str((metadata or {}).get("thread_id") or chat_id)
-        channel = self._client.get_channel(int(target_id))
-        if not channel:
-            channel = await self._client.fetch_channel(int(target_id))
-        if not channel:
-            return SendResult(
-                success=False,
-                error=f"Channel {target_id} not found",
-            )
-
         receipt_ids = [
             str(value)
             for value in (metadata or {}).get(
@@ -6225,8 +6582,12 @@ class DiscordAdapter(BasePlatformAdapter):
             (metadata or {}).get("reply_to_message_id")
             or (receipt_ids[0] if receipt_ids else "")
         )
+        component_index = (metadata or {}).get(
+            "_gateway_recovery_component_index"
+        )
         allowed, guard = await self._acquire_discord_side_effect_guard(
-            reply_to
+            reply_to,
+            require_claim=bool(receipt_ids),
         )
         if not allowed:
             return SendResult(
@@ -6235,6 +6596,19 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         try:
+            target_id = str(
+                (metadata or {}).get("thread_id") or chat_id
+            )
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(
+                    int(target_id)
+                )
+            if not channel:
+                return SendResult(
+                    success=False,
+                    error=f"Channel {target_id} not found",
+                )
             filename = file_name or os.path.basename(file_path)
             logger.info(
                 "[%s] Sending file attachment %s (%s) to %s",
@@ -6248,19 +6622,38 @@ class DiscordAdapter(BasePlatformAdapter):
             # API, which avoids the silent zero-attachment failure seen with
             # the older open-handle/singular-file path.
             discord_file = discord.File(file_path, filename=filename)
-            if self._is_forum_parent(channel):
+            is_forum_parent = self._is_forum_parent(channel)
+            nonce = (
+                self._discord_recovery_nonce(
+                    reply_to,
+                    "component",
+                    (
+                        component_index
+                        if component_index is not None
+                        else (
+                            f"forum-attachment:{file_path}"
+                            if is_forum_parent
+                            else f"attachment:{file_path}"
+                        )
+                    ),
+                )
+                if reply_to
+                else None
+            )
+            if is_forum_parent:
                 result = await self._forum_post_file(
                     channel,
                     content=(caption or "").strip(),
                     files=[discord_file],
+                    nonce=nonce,
                 )
             else:
                 send_kwargs: Dict[str, Any] = {
                     "content": caption if caption else None,
                     "files": [discord_file],
                 }
-                if reply_to:
-                    send_kwargs["nonce"] = f"{reply_to}-attachment-{filename}"
+                if nonce:
+                    send_kwargs["nonce"] = nonce
                 msg = await channel.send(**send_kwargs)
                 attachments = getattr(msg, "attachments", None) or []
                 if not attachments:
@@ -6329,6 +6722,20 @@ class DiscordAdapter(BasePlatformAdapter):
             (metadata or {}).get("reply_to_message_id")
             or (recovery_receipt_ids[0] if recovery_receipt_ids else "")
         )
+        component_index = (metadata or {}).get(
+            "_gateway_recovery_component_index"
+        )
+        if (
+            recovery_receipt_ids
+            and self._discord_recovery_claim_epochs.get(
+                recovery_reply_to
+            )
+            is None
+        ):
+            return SendResult(
+                success=False,
+                error="Discord recovery claim no longer owned",
+            )
 
         try:
             import discord as _discord_mod
@@ -6391,11 +6798,19 @@ class DiscordAdapter(BasePlatformAdapter):
                         local_path = _unquote(image_url[7:])
                         if not os.path.exists(local_path):
                             logger.warning("[%s] Skipping missing image: %s", self.name, local_path)
+                            if recovery_receipt_ids:
+                                failures.append(
+                                    f"Missing recovery image: {local_path}"
+                                )
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
                     else:
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
+                            if recovery_receipt_ids:
+                                failures.append(
+                                    "Blocked unsafe recovery image URL"
+                                )
                             continue
                         # Download to BytesIO so it renders inline
                         try:
@@ -6416,6 +6831,11 @@ class DiscordAdapter(BasePlatformAdapter):
                                     "[%s] Failed to download image (HTTP %d) in batch: %s",
                                     self.name, status, image_url[:80],
                                 )
+                                if recovery_receipt_ids:
+                                    failures.append(
+                                        "Recovery image download failed "
+                                        f"(HTTP {status})"
+                                    )
                                 continue
                             ct = headers.get("content-type", "image/png")
                             ext = "png"
@@ -6428,6 +6848,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            if recovery_receipt_ids:
+                                failures.append(str(dl_err))
                             continue
 
                 if not files:
@@ -6441,7 +6863,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 side_effect_allowed, chunk_guard = (
                     await self._acquire_discord_side_effect_guard(
-                        recovery_reply_to
+                        recovery_reply_to,
+                        require_claim=bool(recovery_receipt_ids),
                     )
                 )
                 if not side_effect_allowed:
@@ -6455,6 +6878,20 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(content or "").strip(),
                         files=files,
+                        nonce=(
+                            self._discord_recovery_nonce(
+                                recovery_reply_to,
+                                "component",
+                                (
+                                    component_index
+                                    if component_index is not None
+                                    else "forum-images"
+                                ),
+                                chunk_idx,
+                            )
+                            if recovery_reply_to
+                            else None
+                        ),
                     )
                     if forum_result.success:
                         if forum_result.message_id:
@@ -6471,8 +6908,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         "files": files,
                     }
                     if recovery_reply_to:
-                        send_kwargs["nonce"] = (
-                            f"{recovery_reply_to}-attachments-{chunk_idx}"
+                        send_kwargs["nonce"] = self._discord_recovery_nonce(
+                            recovery_reply_to,
+                            "component",
+                            (
+                                component_index
+                                if component_index is not None
+                                else "images"
+                            ),
+                            chunk_idx,
                         )
                     sent = await channel.send(**send_kwargs)
                     sent_message_ids.append(str(sent.id))
@@ -6530,6 +6974,16 @@ class DiscordAdapter(BasePlatformAdapter):
         When the bot is in a voice channel for this chat's guild, play
         directly in the VC instead of sending as a file attachment.
         """
+        metadata = kwargs.get("metadata") or {}
+        if metadata.get(_GATEWAY_RECEIPT_IDS_KEY):
+            # Voice-channel playback has no Discord nonce/idempotency key. A
+            # recovered turn therefore uses the ordinary attachment path,
+            # which is claim-fenced and safe to retry after a crash.
+            return await self.send_voice(
+                chat_id=chat_id,
+                audio_path=audio_path,
+                **kwargs,
+            )
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
                 logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
@@ -6547,17 +7001,70 @@ class DiscordAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
+        receipt_ids = [
+            str(value)
+            for value in (metadata or {}).get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            if str(value)
+        ]
+        recovery_reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or reply_to
+            or (receipt_ids[0] if receipt_ids else "")
+        )
+        component_index = (metadata or {}).get(
+            "_gateway_recovery_component_index"
+        )
+        target_id = str((metadata or {}).get("thread_id") or chat_id)
+        allowed, guard = await self._acquire_discord_side_effect_guard(
+            recovery_reply_to,
+            require_claim=bool(receipt_ids),
+        )
+        if not allowed:
+            return SendResult(
+                success=False,
+                error="Discord recovery claim no longer owned",
+            )
+
         try:
             import io
 
-            channel = self._client.get_channel(int(chat_id))
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                result = SendResult(
+                    success=False,
+                    error=f"Channel {target_id} not found",
+                )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=recovery_reply_to,
+                    result=result,
+                    content=caption or "",
+                    final=bool((metadata or {}).get("notify")),
+                    claim_guard=guard,
+                    receipt_ids=receipt_ids,
+                )
+                return result
 
             if not os.path.exists(audio_path):
-                return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+                result = SendResult(
+                    success=False,
+                    error=f"Audio file not found: {audio_path}",
+                )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=recovery_reply_to,
+                    result=result,
+                    content=caption or "",
+                    final=bool((metadata or {}).get("notify")),
+                    claim_guard=guard,
+                    receipt_ids=receipt_ids,
+                )
+                return result
 
             filename = os.path.basename(audio_path)
 
@@ -6573,11 +7080,34 @@ class DiscordAdapter(BasePlatformAdapter):
             # attachment instead.
             if self._is_forum_parent(channel):
                 forum_file = discord.File(io.BytesIO(file_data), filename=filename)
-                return await self._forum_post_file(
+                result = await self._forum_post_file(
                     channel,
                     content=(caption or "").strip(),
                     file=forum_file,
+                    nonce=(
+                        self._discord_recovery_nonce(
+                            recovery_reply_to,
+                            "component",
+                            (
+                                component_index
+                                if component_index is not None
+                                else f"forum-voice:{audio_path}"
+                            ),
+                        )
+                        if recovery_reply_to
+                        else None
+                    ),
                 )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=recovery_reply_to,
+                    result=result,
+                    content=caption or "",
+                    final=bool((metadata or {}).get("notify")),
+                    claim_guard=guard,
+                    receipt_ids=receipt_ids,
+                )
+                return result
 
             # Try sending as a native voice message via raw API (flags=8192).
             try:
@@ -6595,7 +7125,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 waveform_b64 = base64.b64encode(waveform_bytes).decode()
 
                 import json as _json
-                payload_data = {
+                payload_data: Dict[str, Any] = {
                     "flags": 8192,
                     "attachments": [{
                         "id": "0",
@@ -6609,6 +7139,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         "message_id": str(reply_to),
                         "fail_if_not_exists": False,
                     }
+                if recovery_reply_to:
+                    payload_data["nonce"] = self._discord_recovery_nonce(
+                        recovery_reply_to,
+                        "component",
+                        (
+                            component_index
+                            if component_index is not None
+                            else f"voice:{audio_path}"
+                        ),
+                    )
+                    payload_data["enforce_nonce"] = True
                 payload = _json.dumps(payload_data)
                 form = [
                     {"name": "payload_json", "value": payload},
@@ -6623,12 +7164,28 @@ class DiscordAdapter(BasePlatformAdapter):
                     discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
                     form=form,
                 )
-                return SendResult(success=True, message_id=str(msg_data["id"]))
+                result = SendResult(
+                    success=True,
+                    message_id=str(msg_data["id"]),
+                )
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
+                send_kwargs: Dict[str, Any] = {"file": file}
+                if reference is not None:
+                    send_kwargs["reference"] = reference
+                if recovery_reply_to:
+                    send_kwargs["nonce"] = self._discord_recovery_nonce(
+                        recovery_reply_to,
+                        "component",
+                        (
+                            component_index
+                            if component_index is not None
+                            else f"voice:{audio_path}"
+                        ),
+                    )
                 try:
-                    msg = await channel.send(file=file, reference=reference)
+                    msg = await channel.send(**send_kwargs)
                 except Exception as send_err:
                     err_text = str(send_err)
                     if (
@@ -6641,13 +7198,45 @@ class DiscordAdapter(BasePlatformAdapter):
                             or "error code: 10008" in err_text
                         )
                     ):
-                        msg = await channel.send(file=file, reference=None)
+                        send_kwargs.pop("reference", None)
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
-                return SendResult(success=True, message_id=str(msg.id))
+                result = SendResult(success=True, message_id=str(msg.id))
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=recovery_reply_to,
+                result=result,
+                content=caption or "",
+                final=bool((metadata or {}).get("notify")),
+                claim_guard=guard,
+                receipt_ids=receipt_ids,
+            )
+            return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+            if recovery_reply_to:
+                result = SendResult(success=False, error=str(e))
+            else:
+                result = await super().send_voice(
+                    chat_id,
+                    audio_path,
+                    caption,
+                    reply_to,
+                    metadata=metadata,
+                )
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=recovery_reply_to,
+                result=result,
+                content=caption or "",
+                final=bool((metadata or {}).get("notify")),
+                claim_guard=guard,
+                receipt_ids=receipt_ids,
+            )
+            return result
+        finally:
+            await self._release_discord_side_effect_guard(guard)
 
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)
@@ -9669,7 +10258,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         return existing
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**",
-                        nonce=f"hermes-auto-thread-{message_id}",
+                        nonce=self._discord_recovery_nonce(
+                            message_id,
+                            "auto-thread-seed",
+                        ),
                     )
                     existing = await self._resolve_existing_auto_thread(
                         str(getattr(seed_msg, "id", "") or "")
@@ -9879,6 +10471,92 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
 
+    async def _send_discord_interactive_prompt(
+        self,
+        channel: Any,
+        *,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        component: str,
+        send_kwargs: Dict[str, Any],
+    ) -> Any:
+        """Send one claim-fenced, nonce-addressed interactive prompt."""
+        receipt_ids = [
+            str(value)
+            for value in (metadata or {}).get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            if str(value)
+        ]
+        reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or (receipt_ids[0] if receipt_ids else "")
+        )
+        allowed, guard = await self._acquire_discord_side_effect_guard(
+            reply_to,
+            require_claim=bool(receipt_ids),
+        )
+        if not allowed:
+            raise RuntimeError(
+                "Discord recovery claim no longer owned"
+            )
+
+        kwargs = dict(send_kwargs)
+        if receipt_ids:
+            component_index = (metadata or {}).get(
+                "_gateway_recovery_component_index",
+                component,
+            )
+            kwargs["nonce"] = self._discord_recovery_nonce(
+                reply_to,
+                "interactive",
+                component_index,
+                0,
+            )
+            if self._reply_to_mode != "off":
+                try:
+                    ref_msg = await channel.fetch_message(int(reply_to))
+                    kwargs["reference"] = (
+                        ref_msg.to_reference(fail_if_not_exists=False)
+                        if hasattr(ref_msg, "to_reference")
+                        else ref_msg
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Could not fetch interactive prompt reply "
+                        "target %s: %s",
+                        self.name,
+                        reply_to,
+                        exc,
+                    )
+
+        result = SendResult(success=False, error="prompt send failed")
+        try:
+            msg = await channel.send(**kwargs)
+            result = SendResult(
+                success=True,
+                message_id=str(msg.id),
+            )
+            return msg
+        except Exception as exc:
+            result = SendResult(success=False, error=str(exc))
+            raise
+        finally:
+            try:
+                if receipt_ids:
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=False,
+                        claim_guard=guard,
+                        receipt_ids=receipt_ids,
+                    )
+            finally:
+                await self._release_discord_side_effect_guard(guard)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -9962,6 +10640,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                interaction_key=(
+                    self._discord_recovery_interaction_key(
+                        metadata,
+                        "exec-approval",
+                    )
+                ),
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -9974,7 +10658,13 @@ class DiscordAdapter(BasePlatformAdapter):
                         everyone=False,
                         replied_user=False,
                     )
-            msg = await channel.send(**send_kwargs)
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="exec-approval",
+                send_kwargs=send_kwargs,
+            )
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
 
@@ -10017,9 +10707,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 confirm_id=confirm_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                interaction_key=(
+                    self._discord_recovery_interaction_key(
+                        metadata,
+                        "slash-confirm",
+                    )
+                ),
             )
 
-            msg = await channel.send(content=content, embed=embed, view=view)
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="slash-confirm",
+                send_kwargs={
+                    "content": content,
+                    "embed": embed,
+                    "view": view,
+                },
+            )
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
@@ -10125,10 +10831,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = (
-                await channel.send(content=content, view=view)
-                if view
-                else await channel.send(content=content)
+            send_kwargs = {"content": content}
+            if view is not None:
+                send_kwargs["view"] = view
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="clarify",
+                send_kwargs=send_kwargs,
             )
             if view:
                 view._message = msg  # store for on_timeout expiration editing
@@ -10645,7 +11356,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         await message.channel.send(
                             "⚠️ Hermes could not create a Discord thread for "
                             "this message, so the request was not processed. Please retry.",
-                            nonce=f"{message_id}-routing-failure",
+                            nonce=self._discord_recovery_nonce(
+                                message_id,
+                                "routing-failure",
+                            ),
                         )
                     except Exception as notify_error:
                         logger.warning(
@@ -11392,6 +12106,7 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            interaction_key: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -11410,6 +12125,11 @@ def _define_discord_view_classes() -> None:
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
                 self.remove_item(self.allow_always)
+            if interaction_key:
+                for index, child in enumerate(self.children):
+                    child.custom_id = (
+                        f"exec:{interaction_key}:{index}"
+                    )
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized.
@@ -11559,6 +12279,7 @@ def _define_discord_view_classes() -> None:
             confirm_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            interaction_key: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -11566,6 +12287,11 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
+            if interaction_key:
+                for index, child in enumerate(self.children):
+                    child.custom_id = (
+                        f"confirm:{interaction_key}:{index}"
+                    )
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
