@@ -154,8 +154,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Only ``success`` and intentional
+  # lane ``skipped`` results are accepted; cancelled/unknown states fail closed.
   #
   # Branch protection should require ONLY this check.
   # ─────────────────────────────────────────────────────────────────────

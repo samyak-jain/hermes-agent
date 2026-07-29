@@ -16,7 +16,6 @@ def _workflow(name: str) -> dict:
 
 
 def test_required_aggregate_waits_for_docker_and_fails_closed():
-    workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = _workflow("ci.yml")
     gate = workflow["jobs"]["all-checks-pass"]
 
