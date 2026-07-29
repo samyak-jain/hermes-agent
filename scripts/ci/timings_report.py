@@ -286,6 +286,7 @@ def collect_timings(token: str, repo: str, run_id: str, head_sha: str) -> dict:
         "run_id": run_id,
         "head_sha": head_sha,
         "created_at": created_at,
+        "run_started_at": run_info.get("run_started_at") or created_at,
         "jobs": all_jobs,
     }
 
@@ -352,6 +353,29 @@ def fmt_tick(seconds: int) -> str:
 # Stats computation
 # ---------------------------------------------------------------------------
 
+def required_critical_path_s(timings: dict) -> float | None:
+    """Return feedback latency through the required aggregate job.
+
+    This is the merge-blocking wall clock, including initial runner queueing:
+    workflow ``run_started_at`` (or ``created_at`` for older JSON) through
+    completion of ``All required checks pass``. It deliberately does not sum
+    parallel job durations or include advisory jobs that finish later.
+    """
+    gate = next(
+        (
+            job
+            for job in timings.get("jobs", [])
+            if job.get("name") == "All required checks pass" and not is_skipped(job)
+        ),
+        None,
+    )
+    start = parse_ts(timings.get("run_started_at") or timings.get("created_at"))
+    end = parse_ts(gate.get("completed_at")) if gate else None
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds()
+
+
 def compute_stats(timings: dict, baseline: dict | None = None) -> dict:
     jobs_all = timings.get("jobs", [])
     jobs = [j for j in jobs_all if not is_skipped(j)]
@@ -398,8 +422,12 @@ def compute_stats(timings: dict, baseline: dict | None = None) -> dict:
     bl_skipped = sum(1 for j in bl_jobs_all if is_skipped(j))
     total_wait = sum(j.get("wait_s") or 0 for j in jobs)
     bl_total_wait = sum(j.get("wait_s") or 0 for j in bl_jobs)
+    critical_path = required_critical_path_s(timings)
+    bl_critical_path = required_critical_path_s(baseline) if baseline else None
 
     return {
+        "critical_path": critical_path,
+        "bl_critical_path": bl_critical_path,
         "wall": wall,
         "compute": compute,
         "bl_wall": bl_wall,
@@ -619,6 +647,12 @@ def _gantt_bars(timings: dict, baseline: dict | None) -> str:
 
 
 def _stats_cards(stats: dict) -> str:
+    critical_text = fmt_dur(stats["critical_path"])
+    critical_delta = ""
+    if stats["bl_critical_path"] is not None:
+        d, cls = fmt_delta(stats["critical_path"], stats["bl_critical_path"])
+        critical_delta = f'<span class="stat-delta {cls}">{d}</span>'
+
     wall_text = fmt_dur(stats["wall"])
     wall_delta = ""
     if stats["bl_wall"] is not None:
@@ -632,6 +666,8 @@ def _stats_cards(stats: dict) -> str:
         compute_delta = f'<span class="stat-delta {cls}">{d}</span>'
 
     cards = [
+        f'<div class="stat-card"><span class="stat-label">Required critical path</span>'
+        f'<div class="stat-value">{critical_text}</div>{critical_delta}</div>',
         f'<div class="stat-card"><span class="stat-label">Wall Time</span>'
         f'<div class="stat-value">{wall_text}</div>{wall_delta}</div>',
         f'<div class="stat-card"><span class="stat-label">Total Compute</span>'
@@ -866,6 +902,16 @@ def generate_summary(timings: dict, baseline: dict | None = None) -> str:
     # Global stats table
     lines.append("| Metric | Current | Baseline | Delta |")
     lines.append("|--------|---------|----------|-------|")
+
+    critical_d = ""
+    if stats["bl_critical_path"] is not None:
+        critical_d, _ = fmt_delta(
+            stats["critical_path"], stats["bl_critical_path"]
+        )
+    lines.append(
+        f"| Required critical path | {fmt_dur(stats['critical_path'])} | "
+        f"{fmt_dur(stats['bl_critical_path'])} | {critical_d} |"
+    )
 
     wall_d = ""
     if stats["bl_wall"] is not None:

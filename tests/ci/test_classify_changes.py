@@ -66,6 +66,19 @@ CASES = {
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
     "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),
     "mixed docs+frontend → frontend": (["README.md", "apps/x.tsx"], _lanes(frontend=True)),
+    # Profile-scoped cron/model/tool-policy regressions are never path-skipped.
+    "profile cron regression → python": (
+        ["cron/scheduler.py"],
+        _lanes(python=True, scan=True),
+    ),
+    "profile model regression → python": (
+        ["gateway/profile_routing.py"],
+        _lanes(python=True, scan=True),
+    ),
+    "profile tool-policy regression → python": (
+        ["gateway/run.py"],
+        _lanes(python=True, scan=True),
+    ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
     "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True)),

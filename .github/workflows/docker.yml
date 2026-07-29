@@ -22,7 +22,10 @@ env:
 jobs:
   # Build, test, and optionally push the image for each architecture.
   build:
-    if: github.repository == 'NousResearch/hermes-agent'
+    # PR verification is safe in forks: registry login/push and cache writes
+    # remain gated below to trusted push/release events. Keeping the repository
+    # guard only for publication made fork-local PRs silently skip this lane.
+    if: github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent'
     strategy:
       fail-fast: false
       matrix:
