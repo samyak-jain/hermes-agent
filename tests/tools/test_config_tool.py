@@ -317,18 +317,38 @@ def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
     broker_home: Path,
 ):
     secret_values = {
+        "api.key": "leak-api-dot",
+        "private.key": "leak-private-dot",
+        "access.token": "leak-access-dot",
         "api-key": "leak-api-hyphen",
+        "access-token": "leak-access-hyphen",
         "clientSecret": "leak-client-camel",
         "AUTH TOKEN": "leak-auth-space",
         "private_key": "leak-private-underscore",
-        "access.token": "leak-access-dot",
+        "api_-._key": "leak-api-mixed",
+        "private.-_key": "leak-private-mixed",
+        "access_-.token": "leak-access-mixed",
         "PassWord": "leak-password-case",
     }
     nested = {
-        "public-key": "publishable-material",
+        "public.key": "publishable-material",
+        "monkey": "capuchin",
+        "keyboard": "split-layout",
+        "docs.public.key": "public-key-documentation",
         "children": [
-            {"label": "public", "token_usage": 17},
-            {"settings": secret_values},
+            {
+                "label": "public",
+                "token_usage": 17,
+                "keyboard.layout": "dvorak",
+            },
+            {
+                "settings": secret_values,
+                "deeper": [
+                    {"api.key": "leak-list-api-dot"},
+                    {"private_key": "leak-list-private-underscore"},
+                    {"access-.token": "leak-list-access-mixed"},
+                ],
+            },
         ],
     }
     config_path = broker_home / "config.yaml"
@@ -340,16 +360,26 @@ def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
     result = inspect_config("model")
     rendered = json.dumps(result, ensure_ascii=False)
 
-    assert result["value"]["runtime_options"]["public-key"] == "publishable-material"
+    options = result["value"]["runtime_options"]
+    assert options["public.key"] == "publishable-material"
+    assert options["monkey"] == "capuchin"
+    assert options["keyboard"] == "split-layout"
+    assert options["docs.public.key"] == "public-key-documentation"
     assert result["value"]["runtime_options"]["children"][0] == {
         "label": "public",
         "token_usage": 17,
+        "keyboard.layout": "dvorak",
     }
     for secret in secret_values.values():
         assert secret not in rendered
         assert secret not in repr(result)
-    redacted = result["value"]["runtime_options"]["children"][1]["settings"]
+    redacted = options["children"][1]["settings"]
     assert set(redacted.values()) == {"[REDACTED]"}
+    assert options["children"][1]["deeper"] == [
+        {"api.key": "[REDACTED]"},
+        {"private_key": "[REDACTED]"},
+        {"access-.token": "[REDACTED]"},
+    ]
 
 
 @pytest.mark.parametrize(
