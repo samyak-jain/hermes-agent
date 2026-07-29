@@ -38,7 +38,8 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
 
     A local date always maps to one instant: ambiguous fall-back hours use
     ``fold=0`` (the first occurrence), while nonexistent spring-forward hours
-    use ZoneInfo's ``fold=0`` offset and normalize forward by the DST gap.
+    normalize forward by the DST gap. Explicit zones use ``ZoneInfo``; the
+    unconfigured fallback uses the runtime's transition-aware local rules.
     """
     was_naive = now.tzinfo is None
     instant = now.astimezone() if was_naive else now
@@ -49,7 +50,7 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
     configured_now = (
         instant.astimezone(configured_tz)
         if configured_tz is not None
-        else instant
+        else datetime.fromtimestamp(instant.timestamp())
     )
 
     def boundary_for(local_date) -> datetime:
@@ -58,12 +59,12 @@ def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
             local_date.month,
             local_date.day,
             at_hour,
-            tzinfo=configured_now.tzinfo,
+            tzinfo=configured_tz,
             fold=0,
         )
         return datetime.fromtimestamp(
             wall_time.timestamp(),
-            configured_now.tzinfo,
+            configured_tz,
         )
 
     boundary = boundary_for(configured_now.date())
