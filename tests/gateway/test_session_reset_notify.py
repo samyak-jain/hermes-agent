@@ -8,8 +8,10 @@ Verifies that:
 - resume_pending_expired auto-reset sets the correct reason and DB end_reason
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import hermes_time
 
 from gateway.config import (
     GatewayConfig,
@@ -90,6 +92,38 @@ class TestShouldResetReason:
         )
         source = _make_source()
         assert store._should_reset(entry, source) == "daily"
+
+    def test_daily_boundary_uses_configured_timezone(self, tmp_path, monkeypatch):
+        """04:00 Asia/Kolkata must not be interpreted as 04:00 UTC."""
+        monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Kolkata")
+        hermes_time.reset_cache()
+        try:
+            # 22:45 UTC is 04:15 the following day in Asia/Kolkata. Activity
+            # at 22:25 UTC (03:55 IST) is therefore across the 04:00 boundary.
+            now = datetime(2026, 7, 28, 22, 45, tzinfo=timezone.utc)
+            store = _make_store(
+                SessionResetPolicy(mode="daily", at_hour=4),
+                tmp_path,
+            )
+            entry = SessionEntry(
+                session_key="test",
+                session_id="s1",
+                created_at=datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 7, 28, 22, 25, tzinfo=timezone.utc),
+                platform=Platform.TELEGRAM,
+            )
+            source = _make_source()
+
+            with patch("gateway.session._now", return_value=now):
+                assert store._should_reset(entry, source) == "daily"
+                assert store._is_session_expired(entry) is True
+
+                monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+                hermes_time.reset_cache()
+                assert store._should_reset(entry, source) is None
+                assert store._is_session_expired(entry) is False
+        finally:
+            hermes_time.reset_cache()
 
     def test_returns_none_when_mode_is_none(self, tmp_path):
         store = _make_store(

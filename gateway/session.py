@@ -28,6 +28,39 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
+    """Return the latest configured-local reset boundary in ``now``'s basis.
+
+    Session routing timestamps are historically stored as naive server-local
+    datetimes.  Compute the wall-clock boundary in the configured Hermes
+    timezone, then convert it back before comparing so timezone support does
+    not require a persisted timestamp migration.
+    """
+    was_naive = now.tzinfo is None
+    instant = now.astimezone() if was_naive else now
+
+    from hermes_time import get_timezone
+
+    configured_tz = get_timezone()
+    configured_now = (
+        instant.astimezone(configured_tz)
+        if configured_tz is not None
+        else instant
+    )
+    boundary = configured_now.replace(
+        hour=at_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if configured_now.hour < at_hour:
+        boundary -= timedelta(days=1)
+
+    if was_naive:
+        return datetime.fromtimestamp(boundary.timestamp())
+    return boundary.astimezone(now.tzinfo)
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -1668,12 +1701,7 @@ class SessionStore:
                 return True
 
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour,
-                minute=0, second=0, microsecond=0,
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
             if entry.updated_at < today_reset:
                 return True
 
@@ -1769,14 +1797,7 @@ class SessionStore:
                 return "idle"
         
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour, 
-                minute=0, 
-                second=0, 
-                microsecond=0
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
             
             if entry.updated_at < today_reset:
                 return "daily"
