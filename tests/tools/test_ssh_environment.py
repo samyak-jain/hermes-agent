@@ -160,23 +160,26 @@ class TestControlSocketPath:
         cleaned.control_socket.touch()
         active.control_socket.touch()
 
-        cleaned.cleanup()
+        try:
+            cleaned.cleanup()
 
-        exit_commands = [
-            command for command in commands if "-O" in command and "exit" in command
-        ]
-        assert exit_commands == [
-            [
-                "ssh",
-                "-o",
-                f"ControlPath={cleaned.control_socket}",
-                "-O",
-                "exit",
-                "root@operator",
+            exit_commands = [
+                command for command in commands if "-O" in command and "exit" in command
             ]
-        ]
-        assert not cleaned.control_socket.exists()
-        assert active.control_socket.exists()
+            assert exit_commands == [
+                [
+                    "ssh",
+                    "-o",
+                    f"ControlPath={cleaned.control_socket}",
+                    "-O",
+                    "exit",
+                    "root@operator",
+                ]
+            ]
+            assert not cleaned.control_socket.exists()
+            assert active.control_socket.exists()
+        finally:
+            active.cleanup()
 
     def test_path_differs_for_different_targets(self):
         """Different (user, host, port) triples must produce different paths."""
