@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -999,6 +1000,29 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
         # Timeout or session-boundary cancellation
         return f"[user did not respond within {int(timeout / 60)}m]"
     return response
+
+
+def _stable_recovery_interaction_id(
+    metadata: Optional[Dict[str, Any]],
+    purpose: str,
+) -> Optional[str]:
+    """Derive a replay-stable waiter/component id from a durable receipt."""
+    receipt_ids = (metadata or {}).get(_GATEWAY_RECEIPT_IDS_KEY) or []
+    if not receipt_ids:
+        return None
+    material = "\x1f".join(
+        (
+            str(receipt_ids[0]),
+            str(
+                (metadata or {}).get(
+                    "_gateway_recovery_component_index",
+                    purpose,
+                )
+            ),
+            purpose,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
 def _resolve_progress_thread_id(
@@ -6045,7 +6069,14 @@ class TurnRunner:
             if not ctx._status_adapter:
                 return ""
 
-            clarify_id = _uuid.uuid4().hex[:10]
+            clarify_metadata = self._next_interactive_prompt_metadata()
+            clarify_id = (
+                _stable_recovery_interaction_id(
+                    clarify_metadata,
+                    "clarify",
+                )
+                or _uuid.uuid4().hex[:10]
+            )
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
@@ -6082,7 +6113,6 @@ class TurnRunner:
                     exc_info=True,
                 )
 
-            clarify_metadata = self._next_interactive_prompt_metadata()
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
@@ -23858,6 +23888,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         source = event.source
         session_key = self._session_key_for_source(source)
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
         # Bare-runner test harnesses (object.__new__(GatewayRunner)) skip
         # __init__ and don't have the counter attribute — fall back to a
         # local counter so tests don't AttributeError.  Real runs always
@@ -23867,14 +23901,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             import itertools as _itertools
             counter = _itertools.count(1)
             self._slash_confirm_counter = counter
-        confirm_id = f"{next(counter)}"
+        confirm_id = (
+            _stable_recovery_interaction_id(
+                metadata,
+                f"slash-confirm:{command}",
+            )
+            or f"{next(counter)}"
+        )
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
         _slash_confirm_mod.register(session_key, confirm_id, command, handler)
 
         adapter = self._adapter_for_source(source)
-        metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
         used_buttons = False
         if adapter is not None:

@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord.adapter import (
+    DiscordAdapter,
+    ExecApprovalView,
+    SlashConfirmView,
+)
 
 
 def _capture_channel(adapter):
@@ -92,6 +96,35 @@ async def test_slash_confirm_routes_recovery_prompt_through_side_effect_guard():
     guarded_send.assert_awaited_once()
     assert guarded_send.await_args.kwargs["metadata"] is metadata
     assert guarded_send.await_args.kwargs["component"] == "slash-confirm"
+
+
+def test_replayed_interactive_views_keep_remote_component_ids():
+    approval_kwargs = {
+        "session_key": "discord:555",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_approval = ExecApprovalView(**approval_kwargs)
+    replayed_approval = ExecApprovalView(**approval_kwargs)
+    assert [
+        child.custom_id for child in first_approval.children
+    ] == [
+        child.custom_id for child in replayed_approval.children
+    ]
+
+    confirm_kwargs = {
+        "session_key": "discord:555",
+        "confirm_id": "stable-confirm",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_confirm = SlashConfirmView(**confirm_kwargs)
+    replayed_confirm = SlashConfirmView(**confirm_kwargs)
+    assert [
+        child.custom_id for child in first_confirm.children
+    ] == [
+        child.custom_id for child in replayed_confirm.children
+    ]
 
 
 @pytest.mark.asyncio
