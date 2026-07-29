@@ -1026,6 +1026,62 @@ def test_stale_processing_claim_is_recoverable(adapter):
     assert adapter._discord_message_has_active_claim("100") is False
 
 
+def test_stale_live_claim_is_reclaimed_by_same_adapter(adapter):
+    message_id = _recent_snowflakes(1)[0]
+    message = make_message(message_id=message_id)
+
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    first_epoch = adapter._discord_recovery_claim_epochs[str(message_id)]
+    stale = (
+        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
+    ).isoformat()
+    adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
+            (stale, str(message_id)),
+        )
+    )
+
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    assert (
+        adapter._discord_recovery_claim_epochs[str(message_id)]
+        == first_epoch + 1
+    )
+
+
+def test_record_seen_does_not_refresh_foreign_stale_claim(adapter):
+    message_id = _recent_snowflakes(1)[0]
+    message = make_message(message_id=message_id)
+
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    stale = (
+        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
+    ).isoformat()
+    adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
+            (stale, str(message_id)),
+        )
+    )
+
+    replacement = DiscordAdapter(
+        PlatformConfig(enabled=True, token="fake-token")
+    )
+    assert replacement._record_discord_message_seen(
+        message,
+        status="discovered",
+    )
+    row = replacement._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT status, updated_at FROM discord_messages "
+            "WHERE message_id=?",
+            (str(message_id),),
+        ).fetchone()
+    )
+    assert row == ("queued", stale)
+    assert replacement._claim_live_discord_message(message) == "claimed"
+
+
 @pytest.mark.asyncio
 async def test_processing_claim_heartbeat_renews_long_running_turn(
     adapter,
