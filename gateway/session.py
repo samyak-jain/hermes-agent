@@ -28,6 +28,59 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
+    """Return the latest configured-local reset boundary in ``now``'s basis.
+
+    Session routing timestamps are historically stored as naive server-local
+    datetimes.  Compute the wall-clock boundary in the configured Hermes
+    timezone, then convert it back before comparing so timezone support does
+    not require a persisted timestamp migration.
+
+    A local date always maps to one instant: ambiguous fall-back hours use
+    ``fold=0`` (the first occurrence), while nonexistent spring-forward hours
+    normalize forward by the DST gap. Explicit zones use ``ZoneInfo``; the
+    unconfigured fallback uses the runtime's transition-aware local rules.
+    """
+    was_naive = now.tzinfo is None
+    instant = now.astimezone() if was_naive else now
+
+    from hermes_time import get_timezone
+
+    configured_tz = get_timezone()
+    configured_now = (
+        instant.astimezone(configured_tz)
+        if configured_tz is not None
+        else datetime.fromtimestamp(instant.timestamp())
+    )
+
+    def boundary_for(local_date) -> datetime:
+        wall_time = datetime(
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            at_hour,
+            tzinfo=configured_tz,
+            fold=0,
+        )
+        return datetime.fromtimestamp(
+            wall_time.timestamp(),
+            configured_tz,
+        )
+
+    boundary = boundary_for(configured_now.date())
+    if boundary.timestamp() > instant.timestamp():
+        boundary = boundary_for(configured_now.date() - timedelta(days=1))
+
+    if was_naive:
+        return datetime.fromtimestamp(boundary.timestamp())
+    return boundary.astimezone(now.tzinfo)
+
+
+def _is_before_daily_reset(updated_at: datetime, boundary: datetime) -> bool:
+    """Compare reset instants without losing naive server-local ``fold``."""
+    return updated_at.timestamp() < boundary.timestamp()
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -922,6 +975,8 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        if self.updated_at.fold:
+            result["updated_at_fold"] = self.updated_at.fold
         return result
     
     @classmethod
@@ -978,11 +1033,16 @@ class SessionEntry:
                 "Invalid session_key: potential directory traversal detected"
             )
 
+        updated_at = datetime.fromisoformat(data["updated_at"])
+        updated_at_fold = data.get("updated_at_fold")
+        if type(updated_at_fold) is int and updated_at_fold in (0, 1):
+            updated_at = updated_at.replace(fold=updated_at_fold)
+
         return cls(
             session_key=session_key,
             session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            updated_at=updated_at,
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -2359,13 +2419,8 @@ class SessionStore:
                 return True
 
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour,
-                minute=0, second=0, microsecond=0,
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
-            if entry.updated_at < today_reset:
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return True
 
         return False
@@ -2460,16 +2515,9 @@ class SessionStore:
                 return "idle"
         
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour, 
-                minute=0, 
-                second=0, 
-                microsecond=0
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
             
-            if entry.updated_at < today_reset:
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return "daily"
         
         return None
