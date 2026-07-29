@@ -22423,8 +22423,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
+    ) -> bool:
         """Deliver a queued response using the normal text+attachment split."""
+        all_succeeded = True
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -22462,30 +22463,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    text_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
                     )
+                    if not getattr(text_result, "success", False):
+                        all_succeeded = False
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return all_succeeded
 
         synthetic_event = MessageEvent(
             text="",
             source=source,
             message_id=event_message_id,
         )
-        await self._deliver_media_from_response(
+        media_succeeded = await self._deliver_media_from_response(
             response,
             synthetic_event,
             adapter,
             thread_metadata=metadata,
         )
+        return all_succeeded and media_succeeded
 
     async def _run_background_task(
         self,
@@ -29601,7 +29605,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
+                            delivery_succeeded = await self._deliver_queued_first_response(
                                 first_response,
                                 source=source,
                                 adapter=adapter,
@@ -29611,8 +29615,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
                             )
+                            if (
+                                getattr(
+                                    source,
+                                    "_gateway_receipt_ids",
+                                    None,
+                                )
+                                and not delivery_succeeded
+                            ):
+                                setattr(
+                                    source,
+                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                                    True,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                            if getattr(
+                                source,
+                                "_gateway_receipt_ids",
+                                None,
+                            ):
+                                setattr(
+                                    source,
+                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                                    True,
+                                )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in

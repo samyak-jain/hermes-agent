@@ -199,6 +199,30 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
         return await super().edit_message(chat_id, message_id, content)
 
 
+class FailedQueuedRecoverySendAdapter(ProgressCaptureAdapter):
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content == "final response 1":
+            return SendResult(
+                success=False,
+                error="recovery claim no longer owned",
+            )
+        return SendResult(success=True, message_id="progress-1")
+
+
 class FailingFinalEditProgressCaptureAdapter(
     MetadataEditProgressCaptureAdapter
 ):
@@ -1479,6 +1503,38 @@ async def test_run_agent_queued_message_joins_recovery_receipt_lifecycle(
     assert result["final_response"] == "follow-up processed"
     assert QueuedSilenceAgent.calls == 2
     assert source._gateway_receipt_ids == ["456", "457"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_recovery_send_failure_marks_outer_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    QueuedCommentaryAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-recovery-send-failure",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+        adapter_cls=FailedQueuedRecoverySendAdapter,
+    )
+
+    assert result["final_response"] == "final response 2"
+    assert QueuedCommentaryAgent.calls == 2
+    assert source._gateway_receipt_ids == ["456", "457"]
+    assert source._gateway_stream_delivery_failed is True
+    assert any(
+        call["content"] == "final response 1"
+        for call in adapter.sent
+    )
 
 
 @pytest.mark.asyncio

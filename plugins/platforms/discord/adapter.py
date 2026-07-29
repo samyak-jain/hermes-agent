@@ -171,6 +171,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
+    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY,
     _GATEWAY_RECEIPT_IDS_KEY,
     _GATEWAY_INLINE_OUTCOME_KEY,
     _TEXT_INJECT_EXTENSIONS,
@@ -5563,23 +5564,33 @@ class DiscordAdapter(BasePlatformAdapter):
                 final_delivery
                 or bool(metadata and metadata.get("expect_edits"))
                 or "_gateway_recovery_component_index" in (metadata or {})
+                or _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                in (metadata or {})
             ):
                 component_index = (metadata or {}).get(
                     "_gateway_recovery_component_index"
                 )
-                nonce_base = (
-                    (
+                text_chunk_index = (metadata or {}).get(
+                    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                )
+                if text_chunk_index is not None:
+                    nonce_base = (
+                        recovery_reply_to,
+                        "stream-text",
+                        text_chunk_index,
+                    )
+                elif component_index is not None:
+                    nonce_base = (
                         recovery_reply_to,
                         "component",
                         component_index,
                     )
-                    if component_index is not None
-                    else (
+                else:
+                    nonce_base = (
                         recovery_reply_to,
                         "text",
                         int(final_delivery),
                     )
-                )
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.

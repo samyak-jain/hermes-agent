@@ -2700,6 +2700,9 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
 _GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
 _GATEWAY_INLINE_OUTCOME_KEY = "_gateway_inline_processing_outcome"
 _GATEWAY_STREAM_DELIVERY_FAILED_KEY = "_gateway_stream_delivery_failed"
+_GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY = (
+    "_gateway_recovery_text_chunk_index"
+)
 
 
 def _merge_gateway_receipt_ids(existing: MessageEvent, event: MessageEvent) -> None:
@@ -6432,6 +6435,23 @@ class BasePlatformAdapter(ABC):
             try:
                 response = await self._message_handler(event)
             finally:
+                if getattr(
+                    event.source,
+                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                    False,
+                ):
+                    # The runner can deliver the first response of an in-band
+                    # queued turn before this lifecycle frame resumes.  Keep a
+                    # failed fenced send attached to the outer event so the
+                    # complete hook leaves every merged receipt retryable.
+                    event.metadata[
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                    ] = True
+                with suppress(AttributeError):
+                    delattr(
+                        event.source,
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                    )
                 if receipt_ids:
                     # A busy runner can consume queued follow-ups in-band
                     # before this adapter frame regains control.  The runner

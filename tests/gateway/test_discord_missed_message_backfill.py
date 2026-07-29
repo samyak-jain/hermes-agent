@@ -809,6 +809,60 @@ async def test_image_only_delivery_records_success_and_response_evidence(
 
 
 @pytest.mark.asyncio
+async def test_recovery_stream_chunks_use_distinct_deterministic_nonces(
+    adapter,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    channel = SimpleNamespace(
+        id=123,
+        type=0,
+        send=AsyncMock(
+            side_effect=[
+                SimpleNamespace(id=700),
+                SimpleNamespace(id=701),
+            ]
+        ),
+    )
+    adapter._client.get_channel = lambda _id: channel
+
+    for chunk_index in (0, 1):
+        result = await adapter.send(
+            "123",
+            f"chunk {chunk_index}",
+            metadata={
+                "notify": False,
+                "expect_edits": True,
+                "reply_to_message_id": message_id,
+                "_gateway_receipt_ids": [message_id],
+                "_gateway_recovery_text_chunk_index": chunk_index,
+            },
+        )
+        assert result.success is True
+
+    nonces = [
+        call.kwargs["nonce"]
+        for call in channel.send.await_args_list
+    ]
+    assert nonces == [
+        adapter._discord_recovery_nonce(
+            message_id,
+            "stream-text",
+            0,
+            0,
+        ),
+        adapter._discord_recovery_nonce(
+            message_id,
+            "stream-text",
+            1,
+            0,
+        ),
+    ]
+    assert nonces[0] != nonces[1]
+
+
+@pytest.mark.asyncio
 async def test_recovery_image_batch_fails_if_any_image_is_missing(
     adapter,
     tmp_path,

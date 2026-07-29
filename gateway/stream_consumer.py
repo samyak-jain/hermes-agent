@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
 from gateway.platforms.base import _GATEWAY_RECEIPT_IDS_KEY
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -342,6 +343,7 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
         self._before_finalize_notified = False
+        self._recovery_text_chunk_index = 0
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
@@ -390,6 +392,32 @@ class GatewayStreamConsumer:
             # The adapter completion hook owns the terminal cursor update
             # after post-stream media/footer delivery also succeeds.
             meta["notify"] = False
+        return meta or None
+
+    def _metadata_for_new_send(
+        self,
+        *,
+        final: bool = False,
+        expect_edits: bool = False,
+    ) -> dict | None:
+        """Return stable metadata for one newly-created stream message.
+
+        Discord recovery uses the text-chunk index as part of its nonce.  The
+        index advances once per logical new message, while transport retries
+        reuse the same metadata (and therefore the same nonce).
+        """
+        meta = dict(
+            self._metadata_for_send(
+                final=final,
+                expect_edits=expect_edits,
+            )
+            or {}
+        )
+        if meta.get(_GATEWAY_RECEIPT_IDS_KEY):
+            meta[_GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY] = (
+                self._recovery_text_chunk_index
+            )
+            self._recovery_text_chunk_index += 1
         return meta or None
 
     @property
@@ -1466,7 +1494,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=self._metadata_for_send(
+                metadata=self._metadata_for_new_send(
                     final=final,
                     expect_edits=not final,
                 ),
@@ -1677,11 +1705,12 @@ class GatewayStreamConsumer:
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
             result = None
+            chunk_metadata = self._metadata_for_new_send(final=True)
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=chunk_metadata,
                 )
                 if result.success:
                     break
@@ -1778,12 +1807,13 @@ class GatewayStreamConsumer:
             stale_ids.add(str(self._message_id))
 
         result = None
+        fallback_metadata = self._metadata_for_new_send(final=True)
         for attempt in range(2):
             try:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=final_text,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=fallback_metadata,
                 )
             except Exception as exc:
                 logger.debug("Empty fallback final send failed: %s", exc)
@@ -2036,7 +2066,7 @@ class GatewayStreamConsumer:
             # Interim declaration: this tail is pre-boundary text, not the
             # turn-final — never let it seal a native stream (see
             # _send_commentary).
-            _md = dict(self.metadata) if self.metadata else {}
+            _md = dict(self._metadata_for_new_send() or {})
             _md["_interim_send"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -2081,7 +2111,7 @@ class GatewayStreamConsumer:
             # draft(final=true) — that would seal the live stream with
             # interim text and orphan the true final into a plain-send
             # duplicate (live finding, 2026-08-16 canary).
-            _md = dict(self.metadata) if self.metadata else {}
+            _md = dict(self._metadata_for_new_send() or {})
             _md["_interim_send"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -2241,7 +2271,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_new_send(final=True),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2673,7 +2703,7 @@ class GatewayStreamConsumer:
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_send(
+                    metadata=self._metadata_for_new_send(
                         final=finalize,
                         expect_edits=not finalize,
                     ),
