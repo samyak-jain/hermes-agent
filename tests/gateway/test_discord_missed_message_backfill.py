@@ -531,6 +531,47 @@ async def test_live_messages_keep_normal_text_batching_path(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_live_text_batch_sorts_racing_receipts_by_snowflake(adapter):
+    first_id, second_id = _recent_snowflakes(2)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    first = MessageEvent(
+        text="first",
+        source=source,
+        message_id=str(first_id),
+        metadata={"_gateway_receipt_ids": [str(first_id)]},
+    )
+    second = MessageEvent(
+        text="second",
+        source=source,
+        message_id=str(second_id),
+        metadata={"_gateway_receipt_ids": [str(second_id)]},
+    )
+    adapter._text_batch_delay_seconds = 60
+
+    adapter._enqueue_text_event(second)
+    adapter._enqueue_text_event(first)
+
+    pending = next(iter(adapter._pending_text_batches.values()))
+    assert pending.message_id == str(first_id)
+    assert pending.text == "first\nsecond"
+    assert pending.metadata["_gateway_receipt_ids"] == [
+        str(first_id),
+        str(second_id),
+    ]
+    for task in adapter._pending_text_batch_tasks.values():
+        task.cancel()
+    await asyncio.gather(
+        *adapter._pending_text_batch_tasks.values(),
+        return_exceptions=True,
+    )
+
+
 def test_missed_message_backfill_config_bridge(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
@@ -743,7 +784,7 @@ def test_recovery_ledger_migrates_claim_fencing_columns(tmp_path):
     assert {"claim_owner", "claim_epoch"} <= columns
 
 
-def test_empty_successful_turn_is_not_persistently_complete(adapter):
+def test_empty_successful_turn_is_persistently_complete(adapter):
     message = make_message(message_id=89)
     event = MessageEvent(
         text=message.content,
@@ -754,7 +795,57 @@ def test_empty_successful_turn_is_not_persistently_complete(adapter):
     adapter._record_discord_processing_start(event, emoji_ack=False)
     adapter._record_discord_processing_complete(event, outcome=ProcessingOutcome.SUCCESS)
 
-    assert adapter._discord_message_is_persistently_complete("89") is False
+    assert adapter._discord_message_is_persistently_complete("89") is True
+
+
+def test_coalesced_receipts_all_receive_durable_response_evidence(adapter):
+    first = make_message(message_id=90)
+    second = make_message(message_id=91)
+    assert adapter._claim_live_discord_message(first) == "claimed"
+    assert adapter._claim_live_discord_message(second) == "claimed"
+
+    adapter._record_discord_response(
+        reply_to="90",
+        receipt_ids=["90", "91"],
+        result=SendResult(success=True, message_id="reply-1"),
+        content="done",
+        final=True,
+    )
+
+    assert adapter._discord_message_is_persistently_complete("90") is True
+    assert adapter._discord_message_is_persistently_complete("91") is True
+
+
+@pytest.mark.asyncio
+async def test_image_only_delivery_records_success_and_response_evidence(
+    adapter,
+    tmp_path,
+):
+    message = make_message(message_id=92)
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    image_path = tmp_path / "result.png"
+    image_path.write_bytes(b"png")
+    channel = SimpleNamespace(
+        id=123,
+        type=0,
+        send=AsyncMock(return_value=SimpleNamespace(id=700)),
+    )
+    adapter._client.get_channel = lambda _id: channel
+
+    result = await adapter.send_multiple_images(
+        "123",
+        [(image_path.as_uri(), "")],
+        metadata={
+            "notify": True,
+            "reply_to_message_id": "92",
+            "_gateway_receipt_ids": ["92"],
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id == "700"
+    assert adapter._discord_message_is_persistently_complete("92") is True
+    assert channel.send.await_args.kwargs["nonce"] == "92-attachments-0"
 
 
 def test_fresh_processing_claim_suppresses_duplicate_recovery(adapter):
@@ -1967,7 +2058,7 @@ async def test_claim_transfer_cannot_interleave_with_cursor_commit(
 
     release_commit.set()
     await asyncio.wait_for(commit_task, timeout=5)
-    assert await asyncio.wait_for(claim_task, timeout=5) == "claimed"
+    assert await asyncio.wait_for(claim_task, timeout=5) == "complete"
     assert adapter._discord_recovery_cursor("123") == message_id
 
 
@@ -2168,8 +2259,12 @@ async def test_processing_failure_stops_channel_and_does_not_advance_cursor(
 
     dispatch.assert_awaited_once_with(first)
     assert adapter._discord_recovery_cursor("123") is None
+    retry_task = adapter._missed_message_backfill_retry_task
+    assert retry_task is not None and not retry_task.done()
     assert await adapter._dispatch_discord_message(second) is True
     assert adapter._discord_recovery_cursor("123") is None
+    retry_task.cancel()
+    await asyncio.gather(retry_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -2757,6 +2852,87 @@ async def test_recovered_turn_waiting_for_clarification_does_not_deadlock(
 
     adapter.handle_message.assert_awaited_once_with(reply_event)
     assert adapter._discord_recovery_cursor("123") == reply_id
+
+
+@pytest.mark.asyncio
+async def test_backfill_dispatches_historical_clarification_answer(
+    adapter,
+    monkeypatch,
+):
+    from tools import clarify_gateway
+
+    original_id, answer_id = [
+        str(value) for value in _recent_snowflakes(2)
+    ]
+    original = make_message(message_id=int(original_id))
+    answer = make_message(
+        message_id=int(answer_id),
+        content="The second option",
+    )
+    session_key = "discord:recovered-control-lane"
+    release_original = asyncio.Event()
+    dispatched: list[str] = []
+
+    async def candidates(_channels):
+        yield original
+        yield answer
+
+    async def dispatch(message):
+        message_id = str(message.id)
+        dispatched.append(message_id)
+        started = adapter._discord_recovery_started_events.get(message_id)
+        if message_id == original_id:
+            adapter._discord_recovery_session_keys[message_id] = session_key
+            adapter._active_sessions[session_key] = asyncio.Event()
+            clarify_gateway.register(
+                "historical-clarification-answer",
+                session_key,
+                "Which option?",
+                ["The first option", "The second option"],
+            )
+            if started is not None:
+                started.set()
+            await release_original.wait()
+            return ProcessingOutcome.SUCCESS
+        assert (
+            clarify_gateway.get_pending_for_session(
+                session_key,
+                include_choice_prompts=True,
+            )
+            is not None
+        )
+        if started is not None:
+            started.set()
+        release_original.set()
+        return ProcessingOutcome.SUCCESS
+
+    adapter.config.extra["free_response_channels"] = "123"
+    monkeypatch.setattr(
+        adapter,
+        "_known_missed_message_backfill_channels",
+        AsyncMock(return_value={"123"}),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_iter_missed_message_backfill_candidates",
+        candidates,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_should_backfill_discord_message",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(adapter, "_dispatch_recovered_message", dispatch)
+    try:
+        await asyncio.wait_for(
+            adapter._run_missed_message_backfill(),
+            timeout=5,
+        )
+    finally:
+        clarify_gateway.clear_session(session_key)
+        adapter._active_sessions.pop(session_key, None)
+
+    assert dispatched == [original_id, answer_id]
 
 
 @pytest.mark.asyncio

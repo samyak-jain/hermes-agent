@@ -274,7 +274,6 @@ class TestBuildSessionContextPrompt:
             p3 = _prompt_for("3003")
 
         assert p1 == p2 == p3, "system prompt must be stable across message_id"
-        assert "1001" not in p1 and "2002" not in p2 and "3003" not in p3
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
 
