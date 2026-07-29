@@ -9,6 +9,7 @@ Verifies that:
 """
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -59,6 +60,24 @@ def configure_timezone(monkeypatch):
         hermes_time.reset_cache()
 
     yield configure
+    hermes_time.reset_cache()
+
+
+@pytest.fixture
+def server_local_new_york(monkeypatch):
+    if not hasattr(time, "tzset"):
+        pytest.skip("server-local DST tests require time.tzset()")
+
+    with monkeypatch.context() as local:
+        local.setenv("TZ", "America/New_York")
+        local.delenv("HERMES_TIMEZONE", raising=False)
+        local.setattr(hermes_time, "_resolve_timezone_name", lambda: "")
+        time.tzset()
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone() is None
+        yield
+
+    time.tzset()
     hermes_time.reset_cache()
 
 
@@ -296,6 +315,145 @@ class TestShouldResetReason:
             datetime(2026, 7, 28, 22, 30, tzinfo=timezone.utc),
             datetime(2026, 7, 28, 22, 30, tzinfo=timezone.utc),
         ]
+
+    def test_server_local_fall_back_boundary_is_monotonic(
+        self,
+        server_local_new_york,
+    ):
+        moments = [
+            datetime(2026, 11, 1, 0, 30),
+            datetime(2026, 11, 1, 1, 0, fold=0),
+            datetime(2026, 11, 1, 1, 30, fold=0),
+            datetime(2026, 11, 1, 1, 30, fold=1),
+            datetime(2026, 11, 1, 2, 30),
+        ]
+        boundaries = [_daily_reset_boundary(now, 1) for now in moments]
+
+        assert boundaries == [
+            datetime(2026, 10, 31, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+            datetime(2026, 11, 1, 1, 0),
+        ]
+        assert boundaries == sorted(boundaries)
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    @pytest.mark.parametrize(
+        ("now", "updated_at", "expected"),
+        [
+            (
+                datetime(2026, 11, 1, 1, 30, fold=0),
+                datetime(2026, 11, 1, 0, 59),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=1),
+                datetime(2026, 11, 1, 0, 59),
+                True,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=0),
+                datetime(2026, 11, 1, 1, 0),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 1, 30, fold=1),
+                datetime(2026, 11, 1, 1, 15, fold=1),
+                False,
+            ),
+            (
+                datetime(2026, 11, 1, 2, 30),
+                datetime(2026, 11, 1, 1, 15, fold=1),
+                False,
+            ),
+        ],
+        ids=[
+            "fold-0-before-boundary",
+            "fold-1-before-boundary",
+            "exact-boundary",
+            "fold-1-activity-after-boundary",
+            "after-fold-activity-after-boundary",
+        ],
+    )
+    def test_server_local_fall_back_resets_once_in_both_paths(
+        self,
+        tmp_path,
+        server_local_new_york,
+        path,
+        now,
+        updated_at,
+        expected,
+    ):
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=1),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 10, 31),
+            updated_at=updated_at,
+            platform=Platform.TELEGRAM,
+        )
+
+        decision = _daily_reset_decision(
+            store,
+            entry,
+            _make_source(),
+            now,
+            path,
+        )
+        expected_decision = (
+            expected if path == "proactive" else "daily" if expected else None
+        )
+        assert decision == expected_decision
+
+    @pytest.mark.parametrize("path", ["proactive", "routing"])
+    def test_server_local_spring_forward_nonexistent_hour_resets_once(
+        self,
+        tmp_path,
+        server_local_new_york,
+        path,
+    ):
+        before = datetime(2026, 3, 8, 1, 59)
+        boundary = datetime(2026, 3, 8, 3, 0)
+        after = datetime(2026, 3, 8, 3, 30)
+        boundaries = [
+            _daily_reset_boundary(moment, 2)
+            for moment in (before, boundary, after)
+        ]
+
+        assert boundaries == [
+            datetime(2026, 3, 7, 2, 0),
+            boundary,
+            boundary,
+        ]
+        assert boundaries == sorted(boundaries)
+
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=2),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime(2026, 3, 7),
+            updated_at=datetime(2026, 3, 8, 1, 30),
+            platform=Platform.TELEGRAM,
+        )
+        assert _daily_reset_decision(
+            store, entry, _make_source(), boundary, path,
+        ) == (True if path == "proactive" else "daily")
+
+        for updated_at in (
+            boundary,
+            datetime(2026, 3, 8, 3, 15),
+        ):
+            entry.updated_at = updated_at
+            assert _daily_reset_decision(
+                store, entry, _make_source(), after, path,
+            ) == (False if path == "proactive" else None)
 
     def test_returns_none_when_mode_is_none(self, tmp_path):
         store = _make_store(
