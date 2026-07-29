@@ -123,7 +123,6 @@ _SECRET_KEY_WORDS = frozenset(
         "credentials",
         "passwd",
         "password",
-        "secret",
     }
 )
 _OBVIOUS_SECRET_VALUE_RE = re.compile(
@@ -264,6 +263,8 @@ def _is_secret_config_key(key: Any) -> bool:
     words = tuple(part for part in canonical.split("_") if part)
     if any(word in _SECRET_KEY_WORDS for word in words):
         return True
+    if canonical == "secret" or (words and words[-1] == "secret"):
+        return True
     if canonical == "token" or (words and words[-1] == "token"):
         return True
     return any(
@@ -274,12 +275,12 @@ def _is_secret_config_key(key: Any) -> bool:
 
 
 def _secret_shaped_path(path: str) -> bool:
-    # Classify the complete path in one pass. Dots are both config-path
-    # separators and valid punctuation inside literal mapping keys; splitting
-    # first loses adjacency for credential phrases such as ``api.key`` and
-    # ``private.key``. The token classifier uses whole components, so benign
-    # substrings such as ``monkey`` and ``keyboard`` remain public.
-    return _is_secret_config_key(path)
+    # A dotted config path is composed from distinct mapping keys. Classify
+    # those segments independently so benign parent/child combinations cannot
+    # form a credential phrase across the hierarchy boundary. Literal dotted
+    # mapping keys are classified before path composition in
+    # ``_redact_non_secret_view`` below.
+    return any(_is_secret_config_key(segment) for segment in path.split("."))
 
 
 def _value_looks_secret(value: Any) -> bool:
@@ -331,7 +332,7 @@ def _redact_non_secret_view(
             child_value, child_redacted = _redact_non_secret_view(
                 child,
                 child_path,
-                inherited_sensitive=sensitive,
+                inherited_sensitive=sensitive or _is_secret_config_key(key),
             )
             out[key] = child_value
             redacted.extend(child_redacted)

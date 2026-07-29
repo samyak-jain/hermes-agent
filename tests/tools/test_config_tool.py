@@ -382,9 +382,44 @@ def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
     ]
 
 
+def test_nested_benign_path_components_do_not_form_secret_phrases(
+    broker_home: Path,
+):
+    public_options = {
+        "auth": {"token_usage": 17},
+        "api": {"key_rotation_days": 30},
+        "private": {"key_count": 2},
+        "client": {"secret_format": "environment-reference"},
+        "controls": {
+            "monkey": "capuchin",
+            "keyboard": "split-layout",
+            "max_tokens": 4096,
+            "token_usage_limit": 100,
+        },
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": public_options}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    assert result["value"]["runtime_options"] == public_options
+    assert "redacted_paths" not in result
+
+
 @pytest.mark.parametrize(
     "key",
-    ["api-key", "clientSecret", "AUTH TOKEN", "private_key", "PassWord"],
+    [
+        "api-key",
+        "api_-_key",
+        "clientSecret",
+        "AUTH TOKEN",
+        "access-token",
+        "private_key",
+        "PassWord",
+    ],
 )
 def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
     broker_home: Path,
