@@ -313,6 +313,113 @@ def test_inspect_mapping_recursively_redacts_sensitive_leaves_and_preserves_shap
     ]
 
 
+def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api-key": "leak-api-hyphen",
+        "clientSecret": "leak-client-camel",
+        "AUTH TOKEN": "leak-auth-space",
+        "private_key": "leak-private-underscore",
+        "access.token": "leak-access-dot",
+        "PassWord": "leak-password-case",
+    }
+    nested = {
+        "public-key": "publishable-material",
+        "children": [
+            {"label": "public", "token_usage": 17},
+            {"settings": secret_values},
+        ],
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": nested}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert result["value"]["runtime_options"]["public-key"] == "publishable-material"
+    assert result["value"]["runtime_options"]["children"][0] == {
+        "label": "public",
+        "token_usage": 17,
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+    redacted = result["value"]["runtime_options"]["children"][1]["settings"]
+    assert set(redacted.values()) == {"[REDACTED]"}
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["api-key", "clientSecret", "AUTH TOKEN", "private_key", "PassWord"],
+)
+def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
+    broker_home: Path,
+    key: str,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {key: "short-secret"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(AgentConfigError, match="sensitive") as exc_info:
+        inspect_config(f"model.runtime_options.{key}")
+
+    assert "short-secret" not in str(exc_info.value)
+    assert "short-secret" not in repr(exc_info.value)
+
+
+def test_managed_shadow_report_redacts_canonical_secret_key_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api-key": "shadow-api-hyphen",
+        "client-secret": "shadow-client-hyphen",
+        "auth-token": "shadow-auth-hyphen",
+        "private-key": "shadow-private-hyphen",
+        "access.token": "shadow-access-dot",
+    }
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    managed_config = yaml.safe_load(
+        (managed / "config.yaml").read_text(encoding="utf-8")
+    )
+    managed_config["model"] = {
+        "runtime_options": {
+            "deep": [
+                {"public-key": "publishable-material"},
+                secret_values,
+            ]
+        }
+    }
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(managed_config, sort_keys=False),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    result = _result(
+        action="set",
+        path="model",
+        value={"runtime_options": {"deep": "new-value"}},
+        reason="exercise managed shadow refusal",
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["shadowed_leaves"][0]["effective_value"][0] == {
+        "public-key": "publishable-material"
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+
+
 def test_inspect_sensitive_scalar_returns_precise_refusal(broker_home: Path):
     config_path = broker_home / "config.yaml"
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))

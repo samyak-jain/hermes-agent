@@ -7866,7 +7866,17 @@ def tick(
                 # t_3bc20d0e: next_run_at moved while last_run_at/last_status
                 # remained null.
                 try:
-                    mark_job_dispatch_error(job_id, dispatch_error)
+                    run_claim = job.get("run_claim")
+                    expected_run_claim_owner = (
+                        str(run_claim.get("by") or "")
+                        if isinstance(run_claim, dict)
+                        else None
+                    )
+                    mark_job_dispatch_error(
+                        job_id,
+                        dispatch_error,
+                        expected_run_claim_owner=expected_run_claim_owner,
+                    )
                 except Exception:
                     logger.exception(
                         "Job '%s': failed to persist executor dispatch error",
