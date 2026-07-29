@@ -59,6 +59,42 @@ def test_recovery_stream_new_messages_get_ordered_chunk_indices():
     assert second["_gateway_receipt_ids"] == ["456"]
 
 
+@pytest.mark.asyncio
+async def test_recovery_stream_edits_keep_current_segment_chunk_index():
+    adapter = MagicMock()
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="m1")
+    )
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send()
+    await consumer._edit_message(
+        message_id="m1",
+        content="first segment",
+        finalize=True,
+    )
+    second = consumer._metadata_for_new_send()
+    await consumer._edit_message(
+        message_id="m2",
+        content="second segment",
+        finalize=True,
+    )
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert [
+        call.kwargs["metadata"][
+            "_gateway_recovery_text_chunk_index"
+        ]
+        for call in adapter.edit_message.await_args_list
+    ] == [0, 1]
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 

@@ -66,6 +66,35 @@ async def test_slash_confirm_truncates_long_message_in_content():
 
 
 @pytest.mark.asyncio
+async def test_slash_confirm_routes_recovery_prompt_through_side_effect_guard():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    _capture_channel(adapter)
+    guarded_send = AsyncMock(
+        return_value=SimpleNamespace(id=444)
+    )
+    adapter._send_discord_interactive_prompt = guarded_send
+    metadata = {
+        "_gateway_receipt_ids": ["333"],
+        "reply_to_message_id": "333",
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+
+    result = await adapter.send_slash_confirm(
+        chat_id="555",
+        title="Reset session?",
+        message="This will clear the current conversation history.",
+        session_key="discord:555",
+        confirm_id="c3",
+        metadata=metadata,
+    )
+
+    assert result.success is True
+    guarded_send.assert_awaited_once()
+    assert guarded_send.await_args.kwargs["metadata"] is metadata
+    assert guarded_send.await_args.kwargs["component"] == "slash-confirm"
+
+
+@pytest.mark.asyncio
 async def test_clarify_with_choices_mirrors_question_into_content():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent = _capture_channel(adapter)

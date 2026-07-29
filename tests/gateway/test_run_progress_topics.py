@@ -163,6 +163,44 @@ class FailedSecondQueuedRecoverySendAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id="progress-1")
 
 
+class FailedApprovalPromptAdapter(ProgressCaptureAdapter):
+    async def send_exec_approval(self, **kwargs) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": kwargs["chat_id"],
+                "content": "button approval",
+                "reply_to": (
+                    kwargs.get("metadata") or {}
+                ).get("reply_to_message_id"),
+                "metadata": kwargs.get("metadata"),
+            }
+        )
+        return SendResult(
+            success=False,
+            error="button delivery failed",
+        )
+
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(
+            success=False,
+            error="fallback delivery failed",
+        )
+
+
 class FailingFinalEditProgressCaptureAdapter(
     MetadataEditProgressCaptureAdapter
 ):
@@ -272,6 +310,44 @@ async def test_discord_recovery_tool_progress_send_is_nonce_component_scoped(
     assert len(components) == len(set(components))
 
 
+@pytest.mark.asyncio
+async def test_failed_approval_button_and_fallback_notify_without_waiting(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            ApprovalNotifyAgent,
+            session_id="sess-discord-recovery-approval-failure",
+            config_data={
+                "display": {
+                    "tool_progress": "off",
+                    "interim_assistant_messages": False,
+                },
+                "streaming": {"enabled": False},
+            },
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="dm",
+            thread_id=None,
+            adapter_cls=FailedApprovalPromptAdapter,
+            event_message_id="456",
+            receipt_ids=["456"],
+        ),
+        timeout=5,
+    )
+
+    assert result["final_response"] == "notify failed"
+    assert len(adapter.sent) == 2
+    assert all(
+        (call["metadata"] or {}).get("_gateway_receipt_ids")
+        == ["456"]
+        for call in adapter.sent
+    )
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -290,6 +366,39 @@ class FakeAgent:
             time.sleep(0.35)
         return {
             "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ApprovalNotifyAgent:
+    def __init__(self, **_kwargs):
+        self.tools = []
+
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+    ):
+        from tools import approval
+
+        notify = approval._gateway_notify_cbs[
+            "agent:main:discord:dm:123"
+        ]
+        try:
+            notify(
+                {
+                    "command": "rm guarded-file",
+                    "description": "dangerous command",
+                }
+            )
+        except RuntimeError:
+            final_response = "notify failed"
+        else:
+            final_response = "notify callback returned"
+        return {
+            "final_response": final_response,
             "messages": [],
             "api_calls": 1,
         }

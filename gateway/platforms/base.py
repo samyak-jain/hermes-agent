@@ -2105,6 +2105,14 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class DeferredCommandReply:
+    """Commit an irreversible receipt-backed command after its reply lands."""
+
+    def __init__(self, response, commit):
+        self.response = response
+        self.commit = commit
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -4764,7 +4772,14 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
-            _text, _eph_ttl = self._unwrap_ephemeral(response)
+            deferred = (
+                response
+                if isinstance(response, DeferredCommandReply)
+                else None
+            )
+            _text, _eph_ttl = self._unwrap_ephemeral(
+                deferred.response if deferred is not None else response
+            )
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
             # condition fix — issue #18912).  Previously the send happened
@@ -4802,6 +4817,8 @@ class BasePlatformAdapter(ABC):
                         message_id=_r.message_id,
                         ttl_seconds=_eph_ttl,
                     )
+            if deferred is not None:
+                await deferred.commit()
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -5738,7 +5755,6 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
@@ -5779,6 +5795,15 @@ class BasePlatformAdapter(ABC):
                     "[%s] Failed to send error notification to user: %s",
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
+            finally:
+                # A Discord recovery failure becomes side-effect-ineligible
+                # once its claim is terminal. Attempt the nonce-addressed
+                # error notice while the claim is still processing.
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    event,
+                    ProcessingOutcome.FAILURE,
+                )
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
