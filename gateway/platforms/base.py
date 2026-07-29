@@ -2697,6 +2697,7 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
 
 
 _GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
+_GATEWAY_INLINE_OUTCOME_KEY = "_gateway_inline_processing_outcome"
 
 
 def _merge_gateway_receipt_ids(existing: MessageEvent, event: MessageEvent) -> None:
@@ -6240,8 +6241,14 @@ class BasePlatformAdapter(ABC):
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
                     self._discard_text_debounce(session_key)
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.FAILURE.value
+                    )
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
+                        event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                            ProcessingOutcome.SUCCESS.value
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
@@ -6255,6 +6262,9 @@ class BasePlatformAdapter(ABC):
                 logger.debug(
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,
+                )
+                event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                    ProcessingOutcome.FAILURE.value
                 )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
@@ -6273,6 +6283,9 @@ class BasePlatformAdapter(ABC):
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.SUCCESS.value
+                    )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -6307,6 +6320,9 @@ class BasePlatformAdapter(ABC):
                         "[%s] Routing message to clarify text-intercept for %s",
                         self.name, session_key,
                     )
+                    event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                        ProcessingOutcome.FAILURE.value
+                    )
                     try:
                         _thread_meta = _thread_metadata_for_source(
                             event.source, _reply_anchor_for_event(event)
@@ -6326,6 +6342,9 @@ class BasePlatformAdapter(ABC):
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        event.metadata[_GATEWAY_INLINE_OUTCOME_KEY] = (
+                            ProcessingOutcome.SUCCESS.value
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",

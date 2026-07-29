@@ -172,6 +172,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
     _GATEWAY_RECEIPT_IDS_KEY,
+    _GATEWAY_INLINE_OUTCOME_KEY,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
     utf16_len,
@@ -215,6 +216,10 @@ async def _read_url_image_with_redirect_guard(
             return status, await resp.read(), headers
 
     raise ValueError("Too many image URL redirects")
+
+
+class DiscordRoutingError(RuntimeError):
+    """A recoverable Discord message could not reach its configured route."""
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -1159,6 +1164,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # shutdown from a runtime websocket crash.
         self._disconnecting = False
         self._missed_message_backfill_task: Optional[asyncio.Task] = None
+        self._missed_message_backfill_retry_task: Optional[asyncio.Task] = None
         # Live receipts wait behind the startup scan, while commands and
         # clarification replies may bypass that barrier to unblock a recovered
         # turn. Per-channel receipt states hold later successes behind any
@@ -1182,6 +1188,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # Thread starters emitted by Discord after message.create_thread()
+        # have their own snowflake and must be rejected before a durable claim
+        # is created. Keeping this separate from normal ingress dedup avoids a
+        # synthetic starter stranding a claimed receipt and heartbeat.
+        self._auto_thread_starters = MessageDeduplicator()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1730,6 +1741,8 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         message_id = str(getattr(message, "id", "") or "")
         channel_id = self._discord_message_channel_id(message)
+        if message_id and self._auto_thread_starters.contains(message_id):
+            return False
         if recovery_receipt:
             # Discord invokes callbacks in Gateway arrival order, but the first
             # await below allows later callbacks to overtake this one. Register
@@ -2349,22 +2362,23 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _complete_inline_discord_event(
         self,
         event: MessageEvent,
+        outcome: ProcessingOutcome = ProcessingOutcome.SUCCESS,
     ) -> None:
         message_ids = self._discord_event_receipt_ids(event)
         await self._stop_discord_processing_claim_heartbeats(message_ids)
         await asyncio.to_thread(
             self._record_discord_claim_outcome,
             message_ids,
-            ProcessingOutcome.SUCCESS,
+            outcome,
         )
         await self._set_discord_recovery_receipts(
             message_ids,
-            ProcessingOutcome.SUCCESS,
+            outcome,
         )
         for message_id in message_ids:
             waiter = self._discord_recovery_waiters.get(message_id)
             if waiter is not None and not waiter.done():
-                waiter.set_result(ProcessingOutcome.SUCCESS)
+                waiter.set_result(outcome)
 
     async def _dispatch_discord_event(
         self,
@@ -2402,7 +2416,18 @@ class DiscordAdapter(BasePlatformAdapter):
             # steer inputs are consumed inline and do not run a separate
             # lifecycle hook. Queue/interrupt follow-ups retain their receipt
             # metadata and complete when their actual later turn finishes.
-            await self._complete_inline_discord_event(event)
+            raw_outcome = event.metadata.get(
+                _GATEWAY_INLINE_OUTCOME_KEY,
+                ProcessingOutcome.SUCCESS.value,
+            )
+            try:
+                inline_outcome = ProcessingOutcome(raw_outcome)
+            except ValueError:
+                inline_outcome = ProcessingOutcome.FAILURE
+            await self._complete_inline_discord_event(
+                event,
+                inline_outcome,
+            )
 
     async def _dispatch_serialized_discord_message(
         self,
@@ -2807,6 +2832,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._missed_message_backfill_task
             except asyncio.CancelledError:
                 pass
+        if (
+            self._missed_message_backfill_retry_task
+            and not self._missed_message_backfill_retry_task.done()
+        ):
+            self._missed_message_backfill_retry_task.cancel()
+            try:
+                await self._missed_message_backfill_retry_task
+            except asyncio.CancelledError:
+                pass
 
         self._running = False
         self._client = None
@@ -2814,6 +2848,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._post_connect_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
+        self._missed_message_backfill_retry_task = None
         self._discord_recovery_barrier.set()
         for waiter in self._discord_recovery_waiters.values():
             if not waiter.done():
@@ -3181,6 +3216,56 @@ class DiscordAdapter(BasePlatformAdapter):
         self._missed_message_backfill_task = task
         return task
 
+    def _discord_active_claim_retry_delay(self, message_id: str) -> float:
+        """Return when a foreign claim becomes eligible for takeover."""
+        lease_seconds = 10 * 60
+
+        def _op(conn):
+            row = conn.execute(
+                """
+                SELECT updated_at
+                  FROM discord_messages
+                 WHERE message_id=?
+                   AND status IN ('queued', 'processing')
+                """,
+                (message_id,),
+            ).fetchone()
+            return row[0] if row else None
+
+        updated_at = self._with_discord_recovery_db(_op)
+        if not updated_at:
+            return 0.1
+        try:
+            updated = dt.datetime.fromisoformat(str(updated_at))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=dt.timezone.utc)
+            expires = updated + dt.timedelta(seconds=lease_seconds)
+            return max(
+                0.1,
+                (expires - dt.datetime.now(dt.timezone.utc)).total_seconds()
+                + 0.1,
+            )
+        except (TypeError, ValueError):
+            return 0.1
+
+    def _schedule_discord_recovery_retry(self, delay: float) -> None:
+        """Rescan after an observed foreign lease expires."""
+        existing = self._missed_message_backfill_retry_task
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            try:
+                await asyncio.sleep(max(0.1, delay))
+                if not self._disconnecting and self._client is not None:
+                    self._ensure_missed_message_backfill_task()
+            except asyncio.CancelledError:
+                raise
+
+        self._missed_message_backfill_retry_task = asyncio.create_task(
+            retry()
+        )
+
     async def _wait_for_gateway_startup_restore(self) -> None:
         """Do not let startup queuing masquerade as completed backfill work."""
         runner = getattr(self, "gateway_runner", None)
@@ -3261,6 +3346,7 @@ class DiscordAdapter(BasePlatformAdapter):
         dispatched = 0
         scanned = 0
         missed = 0
+        retry_delays: list[float] = []
         try:
             if not self._client:
                 return
@@ -3344,6 +3430,9 @@ class DiscordAdapter(BasePlatformAdapter):
                             channel_id,
                             message_id,
                         )
+                        retry_delays.append(
+                            self._discord_active_claim_retry_delay(message_id)
+                        )
                         channel_has_active_claim = True
                         break
                     self._record_discord_message_seen(
@@ -3355,10 +3444,17 @@ class DiscordAdapter(BasePlatformAdapter):
                                 channel_id,
                                 message_id,
                             )
+                            retry_delays.append(
+                                self._discord_active_claim_retry_delay(
+                                    message_id
+                                )
+                            )
                             channel_has_active_claim = True
                             break
                         continue
                     if not self._is_discord_recovery_trigger(message):
+                        continue
+                    if not self._is_discord_recovery_authorized_user(message):
                         continue
                     eligible.append(message)
 
@@ -3382,11 +3478,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 if channel_has_active_claim:
                     logger.info(
                         "[%s] Deferring Discord recovery for channel %s "
-                        "behind an active durable receipt",
+                        "at an active durable receipt; older discovered work "
+                        "will run now and the channel will be rescanned after "
+                        "the lease expires",
                         self.name,
                         channel_id,
                     )
-                    continue
 
                 if len(eligible) > max_dispatches:
                     skipped = eligible[:-max_dispatches]
@@ -3453,6 +3550,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         break
                     if durable_claim == "active":
+                        retry_delays.append(
+                            self._discord_active_claim_retry_delay(message_id)
+                        )
                         logger.info(
                             "[%s] Discord recovery stopped at message %s in "
                             "channel %s behind another durable owner",
@@ -3551,6 +3651,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # Failed channels retain their old cursor, and failed message IDs
             # are released, so the next reconnect retries them.
             self._discord_recovery_barrier.set()
+            if retry_delays and not self._disconnecting:
+                self._schedule_discord_recovery_retry(min(retry_delays))
 
     async def _dispatch_recovered_message(
         self, message: Any
@@ -3986,6 +4088,29 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
+    def _is_discord_recovery_authorized_user(self, message: Any) -> bool:
+        """Apply the live human authorization gate before replay counting."""
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False):
+            return False
+        guild = getattr(message, "guild", None)
+        channel = getattr(message, "channel", None)
+        is_dm = isinstance(channel, discord.DMChannel) or guild is None
+        channel_ids = None
+        if not is_dm:
+            channel_ids = {str(getattr(channel, "id", "") or "")}
+            parent_id = self._get_parent_channel_id(channel)
+            if parent_id:
+                channel_ids.add(parent_id)
+            channel_ids.discard("")
+        return self._is_allowed_user(
+            str(getattr(author, "id", "") or ""),
+            author,
+            guild=guild,
+            is_dm=is_dm,
+            channel_ids=channel_ids,
+        )
+
     def _discord_recovery_db_path(self) -> _Path:
         return self._discord_recovery_store.path()
 
@@ -4080,6 +4205,15 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         now = self._utc_now_iso()
         active_cutoff = self._discord_active_claim_cutoff()
+        message_guard = self._discord_recovery_store.acquire_message_lock(
+            message_id,
+            timeout=0.1,
+        )
+        if message_guard is None:
+            # Another process is claiming or delivering this exact receipt.
+            # Treat it as active; unlike a ledger failure this is safe to
+            # revisit after its lease/side-effect fence is released.
+            return "active"
 
         def _op(conn):
             # Upgrade to a writer before inspecting the row.  A deferred
@@ -4160,7 +4294,10 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return ("claimed", next_epoch)
 
-        result = self._with_discord_recovery_db(_op, default=None)
+        try:
+            result = self._with_discord_recovery_db(_op, default=None)
+        finally:
+            self._discord_recovery_store.release_claim_guard(message_guard)
         if isinstance(result, tuple) and result[0] == "claimed":
             self._discord_recovery_claim_epochs[message_id] = int(result[1])
             return "claimed"
@@ -4437,10 +4574,59 @@ class DiscordAdapter(BasePlatformAdapter):
                 ),
             )
 
-        if claim_guard is not None:
-            _op(claim_guard)
-        else:
-            self._with_discord_recovery_db(_op)
+        # ``claim_guard`` is a per-message advisory lock, not a database
+        # transaction. Persist through the normal short SQLite transaction
+        # while the caller still owns that lock.
+        self._with_discord_recovery_db(_op)
+
+    def _record_discord_routing_thread(
+        self,
+        message_id: str,
+        thread_id: str,
+    ) -> None:
+        """Persist the thread chosen for a recoverable parent-channel input."""
+        claim_epoch = self._discord_recovery_claim_epochs.get(message_id)
+        if not message_id or not thread_id or claim_epoch is None:
+            return
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                """
+                UPDATE discord_messages
+                   SET routing_thread_id=?, updated_at=?
+                 WHERE message_id=?
+                   AND claim_owner=?
+                   AND claim_epoch=?
+                   AND status IN ('queued', 'processing')
+                """,
+                (
+                    thread_id,
+                    now,
+                    message_id,
+                    self._discord_recovery_claim_owner,
+                    claim_epoch,
+                ),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    def _discord_routing_thread_id(self, message_id: str) -> Optional[str]:
+        if not message_id:
+            return None
+
+        def _op(conn):
+            row = conn.execute(
+                """
+                SELECT routing_thread_id
+                  FROM discord_messages
+                 WHERE message_id=?
+                """,
+                (message_id,),
+            ).fetchone()
+            return str(row[0]) if row and row[0] else None
+
+        return self._with_discord_recovery_db(_op)
 
     def _discord_message_is_persistently_complete(self, message_id: str) -> bool:
         if not message_id:
@@ -9045,6 +9231,28 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
+    async def _resolve_existing_auto_thread(
+        self,
+        thread_id: str,
+    ) -> Optional[Any]:
+        """Resolve a previously-created thread without creating a new one."""
+        if not thread_id or not self._client:
+            return None
+        candidate = None
+        try:
+            candidate = self._client.get_channel(int(thread_id))
+        except Exception:
+            candidate = None
+        if str(getattr(candidate, "id", "") or "") == str(thread_id):
+            return candidate
+        try:
+            candidate = await self._client.fetch_channel(int(thread_id))
+        except Exception:
+            return None
+        if str(getattr(candidate, "id", "") or "") == str(thread_id):
+            return candidate
+        return None
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
@@ -9060,6 +9268,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         last_direct_error: Exception | None = None
         last_fallback_error: Exception | None = None
+        message_id = str(getattr(message, "id", "") or "")
 
         for attempt in range(2):
             try:
@@ -9072,9 +9281,26 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as direct_error:
                 last_direct_error = direct_error
                 try:
-                    seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+                    # A thread created from a message uses the starter
+                    # snowflake as its channel ID. A crash can occur after
+                    # Discord creates it but before the routing choice is
+                    # persisted, so recover that side effect before falling
+                    # back to a second seed/thread.
+                    existing = await self._resolve_existing_auto_thread(
+                        message_id
                     )
+                    if existing is not None:
+                        return existing
+                    seed_msg = await message.channel.send(
+                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**",
+                        nonce=f"hermes-auto-thread-{message_id}",
+                        enforce_nonce=True,
+                    )
+                    existing = await self._resolve_existing_auto_thread(
+                        str(getattr(seed_msg, "id", "") or "")
+                    )
+                    if existing is not None:
+                        return existing
                     thread = await seed_msg.create_thread(
                         name=thread_name,
                         auto_archive_duration=1440,
@@ -9990,12 +10216,37 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = await self._auto_create_thread(message)
+                message_id = str(getattr(message, "id", "") or "")
+                thread = None
+                if recovered:
+                    routing_thread_id = await asyncio.to_thread(
+                        self._discord_routing_thread_id,
+                        message_id,
+                    )
+                    if routing_thread_id:
+                        thread = await self._resolve_existing_auto_thread(
+                            routing_thread_id
+                        )
+                    if thread is None:
+                        # Direct message-created threads use the triggering
+                        # message snowflake as their channel ID. This also
+                        # closes the crash window before routing_thread_id is
+                        # durably recorded.
+                        thread = await self._resolve_existing_auto_thread(
+                            message_id
+                        )
+                if thread is None:
+                    thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
+                    await asyncio.to_thread(
+                        self._record_discord_routing_thread,
+                        message_id,
+                        thread_id,
+                    )
                     self._threads.mark(thread_id)
                     # Pre-seed dedup: when _auto_create_thread creates a thread
                     # via message.create_thread(), Discord fires a second
@@ -10006,7 +10257,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # thread id in the dedup cache now ensures that duplicate
                     # event is dropped before it can trigger a second agent run.
                     # Fixes #51057.
-                    self._dedup.is_duplicate(str(thread.id))
+                    self._auto_thread_starters.is_duplicate(str(thread.id))
                 else:
                     # Auto-threading is the configured routing target for this
                     # message; if it fails we must NOT silently fall back to an
@@ -10018,7 +10269,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     try:
                         await message.channel.send(
                             "⚠️ Hermes could not create a Discord thread for "
-                            "this message, so the request was not processed. Please retry."
+                            "this message, so the request was not processed. Please retry.",
+                            nonce=f"{message_id}-routing-failure",
+                            enforce_nonce=True,
                         )
                     except Exception as notify_error:
                         logger.warning(
@@ -10026,7 +10279,9 @@ class DiscordAdapter(BasePlatformAdapter):
                             self.name,
                             notify_error,
                         )
-                    return False
+                    raise DiscordRoutingError(
+                        "Discord auto-thread routing failed"
+                    )
 
         referenced_attachments = []
         reference = getattr(message, "reference", None)
