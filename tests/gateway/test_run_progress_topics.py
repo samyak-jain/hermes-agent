@@ -199,11 +199,265 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
         return await super().edit_message(chat_id, message_id, content)
 
 
+class FailedQueuedRecoverySendAdapter(ProgressCaptureAdapter):
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content == "final response 1":
+            return SendResult(
+                success=False,
+                error="recovery claim no longer owned",
+            )
+        return SendResult(success=True, message_id="progress-1")
+
+
+class FailedSecondQueuedRecoverySendAdapter(ProgressCaptureAdapter):
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content == "final response 2":
+            return SendResult(
+                success=False,
+                error="ambiguous timeout",
+            )
+        return SendResult(success=True, message_id="progress-1")
+
+
+class FailedApprovalPromptAdapter(ProgressCaptureAdapter):
+    async def send_exec_approval(self, **kwargs) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": kwargs["chat_id"],
+                "content": "button approval",
+                "reply_to": (
+                    kwargs.get("metadata") or {}
+                ).get("reply_to_message_id"),
+                "metadata": kwargs.get("metadata"),
+            }
+        )
+        return SendResult(
+            success=False,
+            error="button delivery failed",
+        )
+
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(
+            success=False,
+            error="fallback delivery failed",
+        )
+
+
+class FailingFinalEditProgressCaptureAdapter(
+    MetadataEditProgressCaptureAdapter
+):
+    async def edit_message(
+        self,
+        chat_id,
+        message_id,
+        content,
+        *,
+        finalize: bool = False,
+        metadata=None,
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        if finalize and "[plugin appended this]" in content:
+            return SendResult(success=False, error="edit rejected")
+        return SendResult(success=True, message_id=message_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         raise AssertionError("non-editable adapters should not receive edit_message calls")
+
+
+@pytest.mark.asyncio
+async def test_recovery_status_fallback_is_reply_anchored_and_component_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+
+    result = await gateway_run._send_or_update_status_coro(
+        adapter,
+        "123",
+        "inactivity-warning",
+        "Still working",
+        {
+            "_gateway_receipt_ids": ["456"],
+            "reply_to_message_id": "456",
+        },
+    )
+
+    assert result.success is True
+    assert adapter.sent == [
+        {
+            "chat_id": "123",
+            "content": "Still working",
+            "reply_to": "456",
+            "metadata": {
+                "_gateway_receipt_ids": ["456"],
+                "reply_to_message_id": "456",
+                "notify": False,
+                "_gateway_recovery_component_index": (
+                    "status:inactivity-warning:Still working"
+                ),
+            },
+        }
+    ]
+
+
+def test_recovery_interaction_id_is_replay_stable_and_component_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    first = {
+        "_gateway_receipt_ids": ["456"],
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+    replay = dict(first)
+    later = {
+        "_gateway_receipt_ids": ["456"],
+        "_gateway_recovery_component_index": "interactive:1",
+    }
+
+    assert gateway_run._stable_recovery_interaction_id(
+        first,
+        "clarify",
+    ) == gateway_run._stable_recovery_interaction_id(
+        replay,
+        "clarify",
+    )
+    assert gateway_run._stable_recovery_interaction_id(
+        first,
+        "clarify",
+    ) != gateway_run._stable_recovery_interaction_id(
+        later,
+        "clarify",
+    )
+
+
+@pytest.mark.asyncio
+async def test_discord_recovery_tool_progress_send_is_nonce_component_scoped(
+    monkeypatch,
+    tmp_path,
+):
+    import tools.terminal_tool  # noqa: F401 - register progress display data
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-discord-recovery-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        event_message_id="456",
+        receipt_ids=["456"],
+    )
+
+    assert result["final_response"] == "done"
+    recovery_sends = [
+        call
+        for call in adapter.sent
+        if (call.get("metadata") or {}).get("_gateway_receipt_ids")
+    ]
+    assert recovery_sends
+    assert all(call["reply_to"] == "456" for call in recovery_sends)
+    components = [
+        call["metadata"]["_gateway_recovery_component_index"]
+        for call in recovery_sends
+    ]
+    assert all(component.startswith("progress:") for component in components)
+    assert len(components) == len(set(components))
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_button_and_fallback_notify_without_waiting(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await asyncio.wait_for(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            ApprovalNotifyAgent,
+            session_id="sess-discord-recovery-approval-failure",
+            config_data={
+                "display": {
+                    "tool_progress": "off",
+                    "interim_assistant_messages": False,
+                },
+                "streaming": {"enabled": False},
+            },
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="dm",
+            thread_id=None,
+            adapter_cls=FailedApprovalPromptAdapter,
+            event_message_id="456",
+            receipt_ids=["456"],
+        ),
+        timeout=5,
+    )
+
+    assert result["final_response"] == "notify failed"
+    assert len(adapter.sent) == 2
+    assert all(
+        (call["metadata"] or {}).get("_gateway_receipt_ids")
+        == ["456"]
+        for call in adapter.sent
+    )
 
 
 class FakeAgent:
@@ -306,6 +560,39 @@ class DuplicateNativeToolsAgent:
         )
         time.sleep(0.15)
         return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class ApprovalNotifyAgent:
+    def __init__(self, **_kwargs):
+        self.tools = []
+
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+    ):
+        from tools import approval
+
+        notify = approval._gateway_notify_cbs[
+            "agent:main:discord:dm:123"
+        ]
+        try:
+            notify(
+                {
+                    "command": "rm guarded-file",
+                    "description": "dangerous command",
+                }
+            )
+        except RuntimeError:
+            final_response = "notify failed"
+        else:
+            final_response = "notify callback returned"
+        return {
+            "final_response": final_response,
+            "messages": [],
+            "api_calls": 1,
+        }
 
 
 class ThinkingAgent:
@@ -930,6 +1217,51 @@ class QueuedSilenceAgent:
         }
 
 
+class ThreeQueuedResponseAgent:
+    """Inject a third distinct queued source during the second turn."""
+
+    calls = 0
+    adapter = None
+    session_key = None
+
+    @classmethod
+    def configure_gateway_test(cls, adapter, session_key):
+        cls.adapter = adapter
+        cls.session_key = session_key
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+    ):
+        type(self).calls += 1
+        if type(self).calls == 2:
+            third_source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                chat_type="dm",
+                message_id="458",
+            )
+            type(self).adapter._pending_messages[
+                type(self).session_key
+            ] = MessageEvent(
+                text="third queued follow-up",
+                message_type=MessageType.TEXT,
+                source=third_source,
+                message_id="458",
+                metadata={"_gateway_receipt_ids": ["458"]},
+            )
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1006,6 +1338,10 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    event_message_id=None,
+    receipt_ids=None,
+    pending_receipt_ids=None,
+    return_source=False,
 ):
     if config_data:
         import yaml
@@ -1034,17 +1370,48 @@ async def _run_with_agent(
         thread_id=thread_id,
         user_id=user_id,
         scope_id=scope_id,
+        message_id=event_message_id,
     )
+    if receipt_ids:
+        source._gateway_receipt_ids = list(receipt_ids)
+        source._gateway_delivery_state = {"failed": False}
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
+        pending_source = SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            message_id=(
+                str(pending_receipt_ids[0])
+                if pending_receipt_ids
+                else "queued-1"
+            ),
+        )
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
-            source=source,
-            message_id="queued-1",
+            source=pending_source,
+            message_id=(
+                str(pending_receipt_ids[0])
+                if pending_receipt_ids
+                else "queued-1"
+            ),
+            metadata=(
+                {"_gateway_receipt_ids": list(pending_receipt_ids)}
+                if pending_receipt_ids
+                else {}
+            ),
         )
+    configure_gateway_test = getattr(
+        agent_cls,
+        "configure_gateway_test",
+        None,
+    )
+    if callable(configure_gateway_test):
+        configure_gateway_test(adapter, session_key)
 
     result = await runner._run_agent(
         message="hello",
@@ -1053,7 +1420,10 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
+    if return_source:
+        return adapter, result, source
     return adapter, result
 
 
@@ -1240,6 +1610,85 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_unthreaded_discord_stream_carries_merged_receipts(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-discord-recovery-stream",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+        event_message_id="456",
+        receipt_ids=["456", "457"],
+    )
+
+    assert result.get("already_sent") is True
+    delivery_metadata = [
+        call.get("metadata")
+        for call in adapter.sent + adapter.edits
+        if (call.get("metadata") or {}).get("_gateway_receipt_ids")
+    ]
+    assert delivery_metadata
+    assert all(
+        metadata["_gateway_receipt_ids"] == ["456", "457"]
+        and metadata["reply_to_message_id"] == "456"
+        and metadata["notify"] is False
+        for metadata in delivery_metadata
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_transformed_stream_edit_keeps_normal_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-edit-failure",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=FailingFinalEditProgressCaptureAdapter,
+        event_message_id="456",
+        receipt_ids=["456"],
+    )
+
+    assert result.get("already_sent") is not True
+    assert result["final_response"].endswith("[plugin appended this]")
+
+
+@pytest.mark.asyncio
 async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
     QueuedCommentaryAgent.calls = 0
     adapter, result = await _run_with_agent(
@@ -1333,6 +1782,108 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
             "metadata": {"thread_id": "discord-thread"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_message_joins_recovery_receipt_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    QueuedSilenceAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSilenceAgent,
+        session_id="sess-queued-recovery-receipts",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+    )
+
+    assert result["final_response"] == "follow-up processed"
+    assert QueuedSilenceAgent.calls == 2
+    assert source._gateway_receipt_ids == ["456", "457"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_recovery_send_failure_marks_outer_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    QueuedCommentaryAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-recovery-send-failure",
+        pending_text="queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+        adapter_cls=FailedQueuedRecoverySendAdapter,
+    )
+
+    assert result["final_response"] == "final response 2"
+    assert QueuedCommentaryAgent.calls == 2
+    assert source._gateway_receipt_ids == ["456", "457"]
+    assert source._gateway_stream_delivery_failed is True
+    failed_send = next(
+        call
+        for call in adapter.sent
+        if call["content"] == "final response 1"
+    )
+    assert failed_send["reply_to"] == "456"
+    assert failed_send["metadata"][
+        "_gateway_recovery_text_chunk_index"
+    ] == "queued-first-response"
+    assert failed_send["metadata"]["reply_to_message_id"] == "456"
+
+
+@pytest.mark.asyncio
+async def test_middle_queued_delivery_failure_taints_shared_outer_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    ThreeQueuedResponseAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ThreeQueuedResponseAgent,
+        session_id="sess-three-queued-recovery",
+        pending_text="second queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+        adapter_cls=FailedSecondQueuedRecoverySendAdapter,
+    )
+
+    assert result["final_response"] == "final response 3"
+    assert ThreeQueuedResponseAgent.calls == 3
+    assert source._gateway_receipt_ids == ["456", "457", "458"]
+    assert source._gateway_delivery_state["failed"] is True
+    failed_send = next(
+        call
+        for call in adapter.sent
+        if call["content"] == "final response 2"
+    )
+    assert failed_send["reply_to"] == "457"
+    assert failed_send["metadata"][
+        "_gateway_recovery_text_chunk_index"
+    ] == "queued-first-response"
 
 
 @pytest.mark.asyncio
