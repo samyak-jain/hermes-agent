@@ -20751,7 +20751,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
-                await self._send_voice_reply(event, response)
+                voice_succeeded = await self._send_voice_reply(
+                    event,
+                    response,
+                )
+                if (
+                    event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+                    and not voice_succeeded
+                ):
+                    event.metadata[
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY
+                    ] = True
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -22108,7 +22118,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(
+        self,
+        event: MessageEvent,
+        text: str,
+    ) -> bool:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
         actual_paths: List[str] = []
@@ -22117,7 +22131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
 
             # Platform-aware output path: platforms whose native voice
             # bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS — Telegram,
@@ -22133,7 +22147,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
+                return False
 
             # Final delivery may be one combined file or multiple separately
             # valid files when combination is unavailable or would exceed a
@@ -22147,9 +22161,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ]
             if not result.get("success") or not actual_paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
 
             adapter = self._adapter_for_source(event.source)
+            receipt_ids = event.metadata.get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+            )
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
@@ -22158,6 +22175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             send_voice = getattr(adapter, "send_voice", None)
             in_voice_channel = bool(
                 guild_id
+                and not receipt_ids
                 and callable(play_in_voice_channel)
                 and callable(is_in_voice_channel)
                 and is_in_voice_channel(guild_id)
@@ -22172,26 +22190,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # final voice reply as a normal notification instead of a
                 # silent message.  Clone first so we don't mutate metadata
                 # shared with concurrent typing-indicator state.
-                if thread_meta is not None:
+                if not receipt_ids and thread_meta is not None:
                     thread_meta = dict(thread_meta)
                     thread_meta["notify"] = True
-                else:
+                elif not receipt_ids:
                     thread_meta = {"notify": True}
+
+            delivered = False
+            all_succeeded = True
             for actual_path in actual_paths:
                 if in_voice_channel:
                     play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
+                    play_result = await play_voice(guild_id, actual_path)
+                    delivered = True
+                    if not bool(play_result):
+                        all_succeeded = False
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
+                    delivery_metadata = (
+                        self._next_stream_delivery_metadata(event, thread_meta)
+                        if receipt_ids
+                        else thread_meta
+                    )
                     send_kwargs: Dict[str, Any] = {
                         "chat_id": event.source.chat_id,
                         "audio_path": actual_path,
                         "reply_to": reply_anchor,
-                        "metadata": thread_meta,
+                        "metadata": delivery_metadata,
                     }
-                    await send_voice_call(**send_kwargs)
+                    send_result = await send_voice_call(**send_kwargs)
+                    delivered = True
+                    if not bool(getattr(send_result, "success", False)):
+                        all_succeeded = False
+                else:
+                    all_succeeded = False
+            return delivered and all_succeeded
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 try:
@@ -28692,7 +28728,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=event_message_id,
                 )
-            ) if _progress_thread_id else None
+            ) if _progress_thread_id else self._thread_metadata_for_source(
+                source,
+                event_message_id,
+            )
             if _status_thread_metadata is None and _relay_prospective_thread_id:
                 # Relay Discord auto-thread lane (see _progress_metadata above):
                 # carry the reply anchor so status/interim bubbles route into
@@ -29909,17 +29948,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
+                            metadata=_sc._metadata_for_send(
+                                final=True,
+                            ),
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(edit_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit streamed message for session %s: %s",
+                                session_key or "?",
+                                getattr(
+                                    edit_result,
+                                    "error",
+                                    "unknown edit failure",
+                                ),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
