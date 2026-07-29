@@ -2909,6 +2909,263 @@ async def test_failed_inline_clarification_does_not_advance_cursor(adapter):
 
 
 @pytest.mark.asyncio
+async def test_failed_inline_clarification_delivery_does_not_advance_cursor(
+    adapter,
+):
+    from tools import clarify_gateway
+
+    message_id = str(_recent_snowflakes(1)[0])
+    raw_message = make_message(message_id=int(message_id))
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    event = MessageEvent(
+        text="The second option",
+        source=source,
+        raw_message=raw_message,
+        message_id=message_id,
+        metadata={"_gateway_receipt_ids": [message_id]},
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    adapter._register_discord_recovery_receipt("123", message_id)
+    assert adapter._claim_live_discord_message(raw_message) == "claimed"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = asyncio.current_task()
+    adapter._message_handler = AsyncMock(return_value="Recorded")
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(
+            success=False,
+            error="Discord send rejected",
+        )
+    )
+    clarify_gateway.register(
+        "clarify-delivery-failure-recovery-test",
+        session_key,
+        "Which option?",
+        ["The first option", "The second option"],
+    )
+    try:
+        await adapter._dispatch_discord_event(
+            event,
+            recovered=False,
+        )
+    finally:
+        clarify_gateway.clear_session(session_key)
+        adapter._session_tasks.pop(session_key, None)
+        adapter._active_sessions.pop(session_key, None)
+
+    assert (
+        event.metadata["_gateway_inline_processing_outcome"]
+        == "failure"
+    )
+    assert adapter._discord_recovery_cursor("123") is None
+    assert adapter._discord_message_has_active_claim(message_id) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_confirmation_keeps_original_and_command_retryable(
+    adapter,
+):
+    original_id, command_id = [
+        str(value) for value in _recent_snowflakes(2)
+    ]
+    original_message = make_message(message_id=int(original_id))
+    command_message = make_message(
+        message_id=int(command_id),
+        content="/stop",
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    command_event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.COMMAND,
+        source=source,
+        raw_message=command_message,
+        message_id=command_id,
+        metadata={"_gateway_receipt_ids": [command_id]},
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    for message in (original_message, command_message):
+        message_id = str(message.id)
+        adapter._register_discord_recovery_receipt("123", message_id)
+        assert adapter._claim_live_discord_message(message) == "claimed"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = asyncio.current_task()
+    adapter._message_handler = AsyncMock(return_value="Stopped")
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(
+            success=False,
+            error="Discord send rejected",
+        )
+    )
+    try:
+        await adapter._dispatch_discord_event(
+            command_event,
+            recovered=False,
+        )
+    finally:
+        adapter._session_tasks.pop(session_key, None)
+        adapter._active_sessions.pop(session_key, None)
+
+    assert (
+        command_event.metadata["_gateway_inline_processing_outcome"]
+        == "failure"
+    )
+    assert session_key not in adapter._discord_recovery_user_cancelled_sessions
+    assert adapter._discord_recovery_cursor("123") is None
+    assert adapter._discord_message_has_active_claim(original_id) is True
+    assert adapter._discord_message_has_active_claim(command_id) is False
+
+
+@pytest.mark.asyncio
+async def test_successful_stop_makes_cancelled_parent_terminal(adapter):
+    original_id, command_id = [
+        str(value) for value in _recent_snowflakes(2)
+    ]
+    original_message = make_message(message_id=int(original_id))
+    command_message = make_message(
+        message_id=int(command_id),
+        content="/stop",
+    )
+    original_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    original_source._gateway_receipt_ids = [original_id]
+    command_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        user_id="42",
+    )
+    original_event = MessageEvent(
+        text="long running task",
+        source=original_source,
+        raw_message=original_message,
+        message_id=original_id,
+        metadata={"_gateway_receipt_ids": [original_id]},
+    )
+    command_event = MessageEvent(
+        text="/stop",
+        message_type=MessageType.COMMAND,
+        source=command_source,
+        raw_message=command_message,
+        message_id=command_id,
+        metadata={"_gateway_receipt_ids": [command_id]},
+    )
+    session_key = build_session_key(
+        original_source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    for message in (original_message, command_message):
+        message_id = str(message.id)
+        adapter._register_discord_recovery_receipt("123", message_id)
+        assert adapter._claim_live_discord_message(message) == "claimed"
+    await adapter.on_processing_start(original_event)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    async def finish_cancelled_parent(_event):
+        assert (
+            session_key
+            in adapter._discord_recovery_user_cancelled_sessions
+        )
+        await adapter.on_processing_complete(
+            original_event,
+            ProcessingOutcome.CANCELLED,
+        )
+
+    adapter.handle_message = AsyncMock(
+        side_effect=finish_cancelled_parent
+    )
+    try:
+        await adapter._dispatch_discord_event(
+            command_event,
+            recovered=False,
+        )
+    finally:
+        adapter._active_sessions.pop(session_key, None)
+
+    assert adapter._discord_recovery_cursor("123") == command_id
+    assert session_key not in adapter._discord_recovery_user_cancelled_sessions
+
+
+@pytest.mark.asyncio
+async def test_recovery_interactive_prompt_is_claim_fenced_and_nonce_addressed(
+    adapter,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    raw_message = make_message(message_id=int(message_id))
+    adapter._register_discord_recovery_receipt("123", message_id)
+    assert adapter._claim_live_discord_message(raw_message) == "claimed"
+
+    reference = SimpleNamespace(id=int(message_id))
+    fetched_message = SimpleNamespace(
+        to_reference=lambda **_kwargs: reference,
+    )
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=fetched_message),
+        send=AsyncMock(return_value=SimpleNamespace(id=9876)),
+    )
+    metadata = {
+        "_gateway_receipt_ids": [message_id],
+        "reply_to_message_id": message_id,
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+
+    sent = await adapter._send_discord_interactive_prompt(
+        channel,
+        content="Approve?",
+        metadata=metadata,
+        component="exec-approval",
+        send_kwargs={"content": "Approve?"},
+    )
+
+    assert sent.id == 9876
+    channel.send.assert_awaited_once_with(
+        content="Approve?",
+        nonce=adapter._discord_recovery_nonce(
+            message_id,
+            "interactive",
+            "interactive:0",
+            0,
+        ),
+        reference=reference,
+    )
+
+    adapter._discord_recovery_claim_epochs.pop(message_id)
+    with pytest.raises(
+        RuntimeError,
+        match="claim no longer owned",
+    ):
+        await adapter._send_discord_interactive_prompt(
+            channel,
+            content="Approve?",
+            metadata=metadata,
+            component="exec-approval",
+            send_kwargs={"content": "Approve?"},
+        )
+    assert channel.send.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_live_silent_decision_cannot_skip_unregistered_backfill(
     adapter,
     monkeypatch,

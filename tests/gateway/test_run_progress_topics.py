@@ -279,6 +279,83 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+@pytest.mark.asyncio
+async def test_recovery_status_fallback_is_reply_anchored_and_component_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+
+    result = await gateway_run._send_or_update_status_coro(
+        adapter,
+        "123",
+        "inactivity-warning",
+        "Still working",
+        {
+            "_gateway_receipt_ids": ["456"],
+            "reply_to_message_id": "456",
+        },
+    )
+
+    assert result.success is True
+    assert adapter.sent == [
+        {
+            "chat_id": "123",
+            "content": "Still working",
+            "reply_to": "456",
+            "metadata": {
+                "_gateway_receipt_ids": ["456"],
+                "reply_to_message_id": "456",
+                "notify": False,
+                "_gateway_recovery_component_index": (
+                    "status:inactivity-warning:Still working"
+                ),
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discord_recovery_tool_progress_send_is_nonce_component_scoped(
+    monkeypatch,
+    tmp_path,
+):
+    import tools.terminal_tool  # noqa: F401 - register progress display data
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FakeAgent,
+        session_id="sess-discord-recovery-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        thread_id=None,
+        event_message_id="456",
+        receipt_ids=["456"],
+    )
+
+    assert result["final_response"] == "done"
+    recovery_sends = [
+        call
+        for call in adapter.sent
+        if (call.get("metadata") or {}).get("_gateway_receipt_ids")
+    ]
+    assert recovery_sends
+    assert all(call["reply_to"] == "456" for call in recovery_sends)
+    components = [
+        call["metadata"]["_gateway_recovery_component_index"]
+        for call in recovery_sends
+    ]
+    assert all(component.startswith("progress:") for component in components)
+    assert len(components) == len(set(components))
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't

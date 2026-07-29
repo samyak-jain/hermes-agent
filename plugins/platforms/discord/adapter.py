@@ -1182,6 +1182,7 @@ class DiscordAdapter(BasePlatformAdapter):
             str,
             list[str],
         ] = {}
+        self._discord_recovery_user_cancelled_sessions: set[str] = set()
         self._discord_recovery_receipts: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._discord_recovery_message_channels: Dict[str, str] = {}
         self._discord_recovery_claim_heartbeats: Dict[str, asyncio.Task] = {}
@@ -2382,6 +2383,15 @@ class DiscordAdapter(BasePlatformAdapter):
             and was_active
             and self._discord_event_bypasses_recovery_barrier(event)
         )
+        inline_command = event.get_command() if inline_control else None
+        if inline_command in {"stop", "new", "reset"}:
+            # The active request is intentionally terminated by its user, so
+            # its CANCELLED lifecycle is terminal rather than retryable.  The
+            # command receipt remains independent until its own confirmation
+            # delivery succeeds.
+            self._discord_recovery_user_cancelled_sessions.add(
+                session_key
+            )
         if not recovered and not inline_control:
             await self._discord_recovery_barrier.wait()
         active_at_dispatch = session_key in self._active_sessions
@@ -2406,7 +2416,15 @@ class DiscordAdapter(BasePlatformAdapter):
             except ValueError:
                 inline_outcome = ProcessingOutcome.FAILURE
             if (
+                inline_command in {"stop", "new", "reset"}
+                and inline_outcome != ProcessingOutcome.SUCCESS
+            ):
+                self._discord_recovery_user_cancelled_sessions.discard(
+                    session_key
+                )
+            if (
                 inline_outcome == ProcessingOutcome.SUCCESS
+                and inline_command not in {"stop", "new", "reset"}
                 and self._attach_inline_discord_receipts_to_active_turn(
                     event,
                     session_key,
@@ -5419,13 +5437,28 @@ class DiscordAdapter(BasePlatformAdapter):
             if event.source is not None
             else None
         )
+        effective_outcome = (
+            ProcessingOutcome.SUCCESS
+            if (
+                outcome == ProcessingOutcome.CANCELLED
+                and session_key
+                in self._discord_recovery_user_cancelled_sessions
+            )
+            else outcome
+        )
         try:
-            await self._complete_discord_processing(event, outcome)
+            await self._complete_discord_processing(
+                event,
+                effective_outcome,
+            )
         finally:
             if session_key is not None:
                 self._discord_recovery_active_receipt_lists.pop(
                     session_key,
                     None,
+                )
+                self._discord_recovery_user_cancelled_sessions.discard(
+                    session_key
                 )
 
     async def _complete_discord_processing(
@@ -10321,6 +10354,92 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
 
+    async def _send_discord_interactive_prompt(
+        self,
+        channel: Any,
+        *,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        component: str,
+        send_kwargs: Dict[str, Any],
+    ) -> Any:
+        """Send one claim-fenced, nonce-addressed interactive prompt."""
+        receipt_ids = [
+            str(value)
+            for value in (metadata or {}).get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            if str(value)
+        ]
+        reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or (receipt_ids[0] if receipt_ids else "")
+        )
+        allowed, guard = await self._acquire_discord_side_effect_guard(
+            reply_to,
+            require_claim=bool(receipt_ids),
+        )
+        if not allowed:
+            raise RuntimeError(
+                "Discord recovery claim no longer owned"
+            )
+
+        kwargs = dict(send_kwargs)
+        if receipt_ids:
+            component_index = (metadata or {}).get(
+                "_gateway_recovery_component_index",
+                component,
+            )
+            kwargs["nonce"] = self._discord_recovery_nonce(
+                reply_to,
+                "interactive",
+                component_index,
+                0,
+            )
+            if self._reply_to_mode != "off":
+                try:
+                    ref_msg = await channel.fetch_message(int(reply_to))
+                    kwargs["reference"] = (
+                        ref_msg.to_reference(fail_if_not_exists=False)
+                        if hasattr(ref_msg, "to_reference")
+                        else ref_msg
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Could not fetch interactive prompt reply "
+                        "target %s: %s",
+                        self.name,
+                        reply_to,
+                        exc,
+                    )
+
+        result = SendResult(success=False, error="prompt send failed")
+        try:
+            msg = await channel.send(**kwargs)
+            result = SendResult(
+                success=True,
+                message_id=str(msg.id),
+            )
+            return msg
+        except Exception as exc:
+            result = SendResult(success=False, error=str(exc))
+            raise
+        finally:
+            try:
+                if receipt_ids:
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=False,
+                        claim_guard=guard,
+                        receipt_ids=receipt_ids,
+                    )
+            finally:
+                await self._release_discord_side_effect_guard(guard)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -10416,7 +10535,13 @@ class DiscordAdapter(BasePlatformAdapter):
                         everyone=False,
                         replied_user=False,
                     )
-            msg = await channel.send(**send_kwargs)
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="exec-approval",
+                send_kwargs=send_kwargs,
+            )
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
 
@@ -10586,7 +10711,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            send_kwargs = {"content": content, "embed": embed}
+            if view is not None:
+                send_kwargs["view"] = view
+            msg = await self._send_discord_interactive_prompt(
+                channel,
+                content=content,
+                metadata=metadata,
+                component="clarify",
+                send_kwargs=send_kwargs,
+            )
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))

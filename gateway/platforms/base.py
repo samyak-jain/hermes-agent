@@ -6067,7 +6067,19 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
+                if (
+                    event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+                    and not getattr(_r, "success", False)
+                ):
+                    raise RuntimeError(
+                        getattr(_r, "error", None)
+                        or f"Failed to deliver '/{cmd}' response"
+                    )
+                if (
+                    _eph_ttl > 0
+                    and getattr(_r, "success", False)
+                    and _r.message_id
+                ):
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
                         message_id=_r.message_id,
@@ -6204,7 +6216,21 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
+                        if (
+                            event.metadata.get(
+                                _GATEWAY_RECEIPT_IDS_KEY
+                            )
+                            and not getattr(_r, "success", False)
+                        ):
+                            raise RuntimeError(
+                                getattr(_r, "error", None)
+                                or f"Failed to deliver '/{cmd}' response"
+                            )
+                        if (
+                            _eph_ttl > 0
+                            and getattr(_r, "success", False)
+                            and _r.message_id
+                        ):
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
                                 message_id=_r.message_id,
@@ -6263,7 +6289,21 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
+                            if (
+                                event.metadata.get(
+                                    _GATEWAY_RECEIPT_IDS_KEY
+                                )
+                                and not getattr(_r, "success", False)
+                            ):
+                                raise RuntimeError(
+                                    getattr(_r, "error", None)
+                                    or "Failed to deliver clarification response"
+                                )
+                            if (
+                                _eph_ttl > 0
+                                and getattr(_r, "success", False)
+                                and _r.message_id
+                            ):
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
                                     message_id=_r.message_id,
@@ -7122,6 +7162,25 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                if receipt_ids:
+                    _thread_metadata = dict(_thread_metadata or {})
+                    _thread_metadata[_GATEWAY_RECEIPT_IDS_KEY] = list(
+                        receipt_ids
+                    )
+                    _thread_metadata["reply_to_message_id"] = str(
+                        _reply_anchor_for_event(event)
+                        or receipt_ids[0]
+                    )
+                    _thread_metadata["notify"] = False
+                    _thread_metadata[
+                        "_gateway_recovery_component_index"
+                    ] = "handler-error"
+                error_reply_to = (
+                    (_thread_metadata or {}).get(
+                        "reply_to_message_id"
+                    )
+                    or _reply_anchor_for_event(event)
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -7129,6 +7188,7 @@ class BasePlatformAdapter(ABC):
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
                     ),
+                    reply_to=error_reply_to,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:

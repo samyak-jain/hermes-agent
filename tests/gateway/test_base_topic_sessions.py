@@ -343,12 +343,22 @@ class TestBasePlatformTopicSessions:
         adapter._keep_typing = hold_typing
 
         event = _make_event("-1001", "17585")
+        event.metadata["_gateway_receipt_ids"] = ["1"]
         await adapter._process_message_background(event, build_session_key(event.source))
 
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
         ]
+        assert len(adapter.sent) == 1
+        assert adapter.sent[0]["reply_to"] == "1"
+        assert adapter.sent[0]["metadata"] == {
+            "thread_id": "17585",
+            "_gateway_receipt_ids": ["1"],
+            "reply_to_message_id": "1",
+            "notify": False,
+            "_gateway_recovery_component_index": "handler-error",
+        }
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):
