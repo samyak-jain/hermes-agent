@@ -2696,6 +2696,44 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+_GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
+
+
+def _merge_gateway_receipt_ids(existing: MessageEvent, event: MessageEvent) -> None:
+    """Preserve platform receipt IDs when inbound events are coalesced.
+
+    Adapters may attach durable receipt identifiers to ``MessageEvent.metadata``.
+    Any gateway debounce/merge must carry all of them into the eventual
+    processing-complete hook so the adapter can acknowledge the whole merged
+    input only after that turn actually finishes.
+    """
+    incoming = event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
+    if not incoming:
+        return
+    receipt_ids = existing.metadata.setdefault(_GATEWAY_RECEIPT_IDS_KEY, [])
+    for receipt_id in incoming:
+        value = str(receipt_id)
+        if value and value not in receipt_ids:
+            receipt_ids.append(value)
+
+
+def _transfer_gateway_receipt_ids(
+    existing: MessageEvent,
+    replacement: MessageEvent,
+) -> None:
+    """Carry replaced pending receipts into the event that will actually run."""
+    ordered: list[str] = []
+    for candidate in (existing, replacement):
+        for receipt_id in (
+            candidate.metadata.get(_GATEWAY_RECEIPT_IDS_KEY) or []
+        ):
+            value = str(receipt_id)
+            if value and value not in ordered:
+                ordered.append(value)
+    if ordered:
+        replacement.metadata[_GATEWAY_RECEIPT_IDS_KEY] = ordered
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2722,6 +2760,7 @@ def merge_pending_message_event(
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            _merge_gateway_receipt_ids(existing, event)
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -2730,6 +2769,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
+            _merge_gateway_receipt_ids(existing, event)
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2753,10 +2793,12 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            _merge_gateway_receipt_ids(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
+        _transfer_gateway_receipt_ids(existing, event)
     pending_messages[session_key] = event
 
 
@@ -5790,6 +5832,7 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
+            _merge_gateway_receipt_ids(state.event, event)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"
