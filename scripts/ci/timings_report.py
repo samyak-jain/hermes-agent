@@ -14,6 +14,13 @@ Usage:
 
     # Regenerate HTML from saved JSON (testing):
     python scripts/ci/timings_report.py --from-json ci-timings.json
+
+    # Measured A/B from two comparable PR runs:
+    python scripts/ci/timings_report.py \
+        --from-json after/ci-timings.json \
+        --baseline before/ci-timings.json \
+        --output ci-timings-ab.html \
+        --summary-out ci-timings-ab.md
 """
 
 from __future__ import annotations

@@ -52,3 +52,11 @@ def test_docker_prs_use_native_runners_without_publication_permissions():
         and "github.repository == 'NousResearch/hermes-agent'" not in step["if"]
         for step in push_steps
     )
+
+    docker_test = next(
+        step
+        for step in build["steps"]
+        if step.get("name") == "Run docker integration tests"
+    )
+    assert docker_test["env"]["HERMES_TEST_IMAGE"] == "${{ env.IMAGE_NAME }}:test"
+    assert "scripts/run_tests.sh tests/docker/" in docker_test["run"]

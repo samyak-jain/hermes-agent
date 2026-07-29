@@ -248,6 +248,18 @@ jobs:
           retention-days: 14
           archive: false
 
+      - name: Upload raw timing data
+        # Keep the machine-readable side of the measured A/B method. Download
+        # JSON from before/after runs, then pass after as --from-json and before
+        # as --baseline to compare the required critical path and step deltas.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-timings-data
+          path: ci-timings.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Output summary
         env:
           REPORT_URL: ${{ steps.ci-timings-artifact.outputs.artifact-url}}

@@ -91,6 +91,9 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# Safe, non-secret Docker test control: the CI Docker matrix has already
+# built and loaded this tag. Preserve it through env -i so each isolated
+# pytest file reuses that image instead of launching another docker build.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
@@ -98,6 +101,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  ${HERMES_TEST_IMAGE:+HERMES_TEST_IMAGE="$HERMES_TEST_IMAGE"} \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
