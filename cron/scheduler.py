@@ -4617,15 +4617,13 @@ def tick(
                 # remained null.
                 try:
                     run_claim = job.get("run_claim")
-                    expected_run_claim_owner = (
-                        str(run_claim.get("by") or "")
-                        if isinstance(run_claim, dict)
-                        else None
+                    expected_run_claim = (
+                        dict(run_claim) if isinstance(run_claim, dict) else None
                     )
                     mark_job_dispatch_error(
                         job_id,
                         dispatch_error,
-                        expected_run_claim_owner=expected_run_claim_owner,
+                        expected_run_claim=expected_run_claim,
                     )
                 except Exception:
                     logger.exception(

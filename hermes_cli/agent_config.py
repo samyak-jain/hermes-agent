@@ -274,7 +274,12 @@ def _is_secret_config_key(key: Any) -> bool:
 
 
 def _secret_shaped_path(path: str) -> bool:
-    return any(_is_secret_config_key(segment) for segment in path.split("."))
+    # Classify the complete path in one pass. Dots are both config-path
+    # separators and valid punctuation inside literal mapping keys; splitting
+    # first loses adjacency for credential phrases such as ``api.key`` and
+    # ``private.key``. The token classifier uses whole components, so benign
+    # substrings such as ``monkey`` and ``keyboard`` remain public.
+    return _is_secret_config_key(path)
 
 
 def _value_looks_secret(value: Any) -> bool:

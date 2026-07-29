@@ -1670,7 +1670,7 @@ def mark_job_dispatch_error(
     job_id: str,
     error: str,
     *,
-    expected_run_claim_owner: Optional[str] = None,
+    expected_run_claim: Optional[dict] = None,
 ) -> bool:
     """Record a terminal executor-dispatch failure without completing the job.
 
@@ -1681,26 +1681,28 @@ def mark_job_dispatch_error(
     reached ``claim_dispatch()``.
 
     A one-shot is durably claimed by ``get_due_jobs()`` before executor
-    submission. Release only the exact claim returned to the rejecting tick;
-    if another executor has since replaced it, preserve that live owner's
-    claim. Recurring jobs do not carry ``run_claim`` and retain their already
-    advanced next-run timestamp unchanged.
+    submission. When ``expected_run_claim`` is provided, record the failure and
+    release the claim only if the complete claim generation still matches; if
+    another tick has since replaced it, leave the newer job state untouched and
+    return ``False``. Recurring jobs do not carry ``run_claim`` and retain their
+    already advanced next-run timestamp unchanged.
+
+    Calls that omit ``expected_run_claim`` retain the historical behavior:
+    record the dispatch error without touching any claim.
     """
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
                 continue
+            claim = job.get("run_claim")
+            if expected_run_claim is not None and claim != expected_run_claim:
+                return False
             job["last_run_at"] = _hermes_now().isoformat()
             job["last_status"] = "error"
             job["last_error"] = error
             job["last_delivery_error"] = None
-            claim = job.get("run_claim")
-            if (
-                expected_run_claim_owner
-                and isinstance(claim, dict)
-                and claim.get("by") == expected_run_claim_owner
-            ):
+            if expected_run_claim is not None:
                 job["run_claim"] = None
             save_jobs(jobs)
             return True

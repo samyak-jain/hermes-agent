@@ -259,7 +259,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         scheduler,
         "mark_job_dispatch_error",
         lambda job_id, error, **kwargs: marked.append(
-            (job_id, error, kwargs.get("expected_run_claim_owner"))
+            (job_id, error, kwargs.get("expected_run_claim"))
         ),
     )
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
@@ -360,31 +360,66 @@ def test_dispatch_failure_records_error_without_consuming_schedule(
     assert recorded["enabled"] is True
 
 
-def test_dispatch_failure_does_not_clear_another_executor_run_claim(
+def test_dispatch_failure_clears_exact_claim_and_preserves_oneshot_retry_state(
     monkeypatch,
     tmp_path,
 ):
     jobs = _point_jobs(monkeypatch, tmp_path)
     now = datetime.now(timezone.utc)
     job = _due_oneshot(now)
-    job["run_claim"] = {
+    expected_claim = {
         "at": now.isoformat(),
-        "by": "replacement-live-owner",
+        "by": "stable-owner",
+    }
+    job["run_claim"] = expected_claim
+    jobs.save_jobs([job])
+
+    assert jobs.mark_job_dispatch_error(
+        job["id"],
+        "executor rejected",
+        expected_run_claim=expected_claim,
+    ) is True
+
+    recorded = jobs.get_job(job["id"])
+    assert recorded["run_claim"] is None
+    assert recorded["state"] == "scheduled"
+    assert recorded["repeat"] == {"times": 1, "completed": 0}
+    assert recorded["next_run_at"] == job["next_run_at"]
+    assert recorded["last_status"] == "error"
+    assert recorded["last_error"] == "executor rejected"
+    assert recorded["enabled"] is True
+
+
+def test_dispatch_failure_does_not_clear_new_generation_from_same_owner(
+    monkeypatch,
+    tmp_path,
+):
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    now = datetime.now(timezone.utc)
+    original_claim = {
+        "at": now.isoformat(),
+        "by": "stable-owner",
+    }
+    replacement_at = (now + timedelta(seconds=1)).isoformat()
+    job = _due_oneshot(now)
+    job["run_claim"] = {
+        "at": replacement_at,
+        "by": "stable-owner",
     }
     jobs.save_jobs([job])
 
     assert jobs.mark_job_dispatch_error(
         job["id"],
         "old executor rejected",
-        expected_run_claim_owner="original-owner",
-    )
+        expected_run_claim=original_claim,
+    ) is False
 
     recorded = jobs.get_job(job["id"])
-    assert recorded["last_status"] == "error"
-    assert recorded["last_error"] == "old executor rejected"
+    assert recorded["last_status"] is None
+    assert recorded["last_error"] is None
     assert recorded["run_claim"] == {
-        "at": now.isoformat(),
-        "by": "replacement-live-owner",
+        "at": replacement_at,
+        "by": "stable-owner",
     }
 
 
