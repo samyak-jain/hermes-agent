@@ -6076,11 +6076,36 @@ class BasePlatformAdapter(ABC):
                     len(_text),
                     event.source.chat_id,
                 )
+                _send_metadata = _mark_notify_metadata(thread_meta)
+                _receipt_ids = list(
+                    dict.fromkeys(
+                        str(value)
+                        for value in event.metadata.get(
+                            _GATEWAY_RECEIPT_IDS_KEY,
+                            [],
+                        )
+                        if str(value)
+                    )
+                )
+                if deferred is not None and _receipt_ids:
+                    # A receipt-backed /stop or /new reply is confirmation
+                    # that the control action is ABOUT to commit, not evidence
+                    # that it already committed.  Keep this send nonce-fenced
+                    # but nonterminal; normal processing completion advances
+                    # the durable receipt only after deferred.commit() returns.
+                    _send_metadata[_GATEWAY_RECEIPT_IDS_KEY] = _receipt_ids
+                    _send_metadata["reply_to_message_id"] = str(
+                        _reply_anchor_for_event(event) or _receipt_ids[0]
+                    )
+                    _send_metadata["notify"] = False
+                    _send_metadata[
+                        "_gateway_recovery_component_index"
+                    ] = f"deferred-command-{cmd}"
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_send_metadata,
                 )
                 if (
                     event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)

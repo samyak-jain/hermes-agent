@@ -16466,6 +16466,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # clear the adapter's pending queue so the stale "/reset" text
         # doesn't get re-processed as a user message after the
         # interrupt completes.
+        _reset_receipt_ids = event.metadata.get(
+            _GATEWAY_RECEIPT_IDS_KEY,
+            [],
+        )
+        _reset_idempotency_key = (
+            str(_reset_receipt_ids[0])
+            if _reset_receipt_ids
+            else None
+        )
+
         async def _commit_new() -> None:
             # Clear any pending messages so the old text doesn't replay.
             await self._interrupt_and_clear_session(
@@ -16476,7 +16486,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             # Clean up the running agent entry so the reset handler does not
             # think an agent is still active.
-            await self._handle_reset_command(event)
+            await self._handle_reset_command(
+                event,
+                idempotency_key=_reset_idempotency_key,
+            )
 
         if event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY):
             return DeferredCommandReply(
@@ -17509,8 +17522,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
                 return self._telegram_topic_root_new_message()
+            _reset_receipt_ids = event.metadata.get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            _reset_idempotency_key = (
+                str(_reset_receipt_ids[0])
+                if _reset_receipt_ids
+                else None
+            )
             async def _do_reset():
-                return await self._handle_reset_command(event)
+                return await self._handle_reset_command(
+                    event,
+                    idempotency_key=_reset_idempotency_key,
+                )
             return await self._maybe_confirm_destructive_slash(
                 event=event,
                 command="new",

@@ -424,6 +424,7 @@ class TestBasePlatformTopicSessions:
         session_key = build_session_key(event.source)
         adapter._active_sessions[session_key] = asyncio.Event()
         order = []
+        sent_metadata = None
 
         async def commit():
             order.append("commit")
@@ -435,8 +436,10 @@ class TestBasePlatformTopicSessions:
             )
         )
 
-        async def successful_send(**_kwargs):
+        async def successful_send(**kwargs):
+            nonlocal sent_metadata
             order.append("send")
+            sent_metadata = kwargs["metadata"]
             return SendResult(success=True, message_id="reply-1")
 
         adapter._send_with_retry = successful_send
@@ -450,6 +453,13 @@ class TestBasePlatformTopicSessions:
         )
 
         assert order == ["send", "commit"]
+        assert sent_metadata == {
+            "thread_id": "17585",
+            "_gateway_receipt_ids": ["1"],
+            "reply_to_message_id": "1",
+            "notify": False,
+            "_gateway_recovery_component_index": "deferred-command-stop",
+        }
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):
