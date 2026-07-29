@@ -138,6 +138,42 @@ class TestProducerHook:
         assert adapter.sent == ["final answer"]
 
     @pytest.mark.asyncio
+    async def test_empty_response_not_recorded(self):
+        adapter = _Adapter()
+        await _run(adapter, _event(), response="")
+        assert adapter.sent == []
+        assert _rows() == []
+
+    @pytest.mark.asyncio
+    async def test_durable_platform_receipt_owns_replay_exclusively(self):
+        adapter = _Adapter()
+        event = _event()
+        event.metadata["_gateway_receipt_ids"] = ["msg-42"]
+
+        await _run(adapter, event)
+
+        assert adapter.sent == ["final answer"]
+        assert _rows() == []
+
+    @pytest.mark.asyncio
+    async def test_disabled_gate_skips_recording_but_sends(self):
+        adapter = _Adapter()
+        with patch("gateway.delivery_ledger.ledger_enabled", return_value=False):
+            await _run(adapter, _event())
+        assert adapter.sent == ["final answer"]
+        assert _rows() == []
+
+    @pytest.mark.asyncio
+    async def test_ledger_crash_never_blocks_send(self):
+        adapter = _Adapter()
+        with patch(
+            "gateway.delivery_ledger.record_obligation",
+            side_effect=RuntimeError("disk full"),
+        ):
+            await _run(adapter, _event())
+        assert adapter.sent == ["final answer"]
+
+    @pytest.mark.asyncio
     async def test_slow_ledger_update_does_not_block_event_loop(self):
         adapter = _Adapter()
         slow_delivered, event_loop_witness, blocked_event_loop = _blocking_probe()

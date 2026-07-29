@@ -3194,6 +3194,102 @@ async def test_recovered_turn_waiting_for_clarification_does_not_deadlock(
 
 
 @pytest.mark.asyncio
+async def test_child_thread_control_receipt_commits_with_parent_turn(
+    adapter,
+):
+    from tools import clarify_gateway
+
+    parent_id, answer_id = [
+        str(value) for value in _recent_snowflakes(2)
+    ]
+    parent_channel = FakeChannel(channel_id=123)
+    child_channel = FakeChannel(channel_id=456, parent_id=123)
+    parent_message = make_message(
+        message_id=int(parent_id),
+        channel=parent_channel,
+    )
+    answer_message = make_message(
+        message_id=int(answer_id),
+        content="The second option",
+        channel=child_channel,
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        thread_id="456",
+        user_id="42",
+        message_id=parent_id,
+    )
+    answer_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="channel",
+        thread_id="456",
+        user_id="42",
+        message_id=answer_id,
+    )
+    parent_event = MessageEvent(
+        text=parent_message.content,
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=parent_message,
+        message_id=parent_id,
+        metadata={"_gateway_receipt_ids": [parent_id]},
+    )
+    answer_event = MessageEvent(
+        text=answer_message.content,
+        message_type=MessageType.TEXT,
+        source=answer_source,
+        raw_message=answer_message,
+        message_id=answer_id,
+        metadata={"_gateway_receipt_ids": [answer_id]},
+    )
+    session_key = adapter._discord_event_session_key(parent_event)
+    source._gateway_receipt_ids = [parent_id]
+    adapter._register_discord_recovery_receipt("123", parent_id)
+    adapter._register_discord_recovery_receipt("456", answer_id)
+    assert adapter._claim_live_discord_message(parent_message) == "claimed"
+    assert adapter._claim_live_discord_message(answer_message) == "claimed"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._message_handler = AsyncMock(return_value=None)
+
+    clarify_gateway.register(
+        "child-thread-control-receipt",
+        session_key,
+        "Which option?",
+        ["The first option", "The second option"],
+    )
+    try:
+        await adapter.on_processing_start(parent_event)
+        await adapter._dispatch_discord_event(
+            answer_event,
+            recovered=False,
+        )
+    finally:
+        clarify_gateway.clear_session(session_key)
+
+    # A crash here must leave both physical-channel receipts retryable.
+    assert source._gateway_receipt_ids == [parent_id, answer_id]
+    assert adapter._discord_recovery_cursor("123") is None
+    assert adapter._discord_recovery_cursor("456") is None
+
+    parent_event.metadata["_gateway_receipt_ids"] = list(
+        source._gateway_receipt_ids
+    )
+    await adapter.on_processing_complete(
+        parent_event,
+        ProcessingOutcome.SUCCESS,
+    )
+
+    assert adapter._discord_recovery_cursor("123") == parent_id
+    assert adapter._discord_recovery_cursor("456") == answer_id
+    assert session_key not in (
+        adapter._discord_recovery_active_receipt_lists
+    )
+
+
+@pytest.mark.asyncio
 async def test_backfill_dispatches_historical_clarification_answer(
     adapter,
     monkeypatch,
