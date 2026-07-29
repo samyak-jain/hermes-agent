@@ -1930,6 +1930,8 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _GATEWAY_DELIVERY_STATE_KEY,
+    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY,
     _GATEWAY_RECEIPT_IDS_KEY,
     _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
     _prefix_within_utf16_limit,
@@ -1949,13 +1951,24 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
-
-
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
+
+
+def _mark_gateway_recovery_delivery_failed(
+    source: Any,
+    event: Optional[MessageEvent] = None,
+) -> None:
+    """Taint the shared receipt lifecycle after any failed side effect."""
+    if event is not None:
+        event.metadata[_GATEWAY_STREAM_DELIVERY_FAILED_KEY] = True
+    state = getattr(source, _GATEWAY_DELIVERY_STATE_KEY, None)
+    if isinstance(state, dict):
+        state["failed"] = True
+    setattr(source, _GATEWAY_STREAM_DELIVERY_FAILED_KEY, True)
 
 
 logger = logging.getLogger(__name__)
@@ -13483,9 +13496,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event.metadata.get(_GATEWAY_RECEIPT_IDS_KEY)
                     and not voice_succeeded
                 ):
-                    event.metadata[
-                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY
-                    ] = True
+                    _mark_gateway_recovery_delivery_failed(
+                        source,
+                        event,
+                    )
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -13506,9 +13520,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             response, event, _media_adapter,
                         )
                         if not media_succeeded:
-                            event.metadata[
-                                _GATEWAY_STREAM_DELIVERY_FAILED_KEY
-                            ] = True
+                            _mark_gateway_recovery_delivery_failed(
+                                source,
+                                event,
+                            )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -13533,13 +13548,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "success",
                                 True,
                             ):
-                                event.metadata[
-                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY
-                                ] = True
+                                _mark_gateway_recovery_delivery_failed(
+                                    source,
+                                    event,
+                                )
                     except Exception as _e:
-                        event.metadata[
-                            _GATEWAY_STREAM_DELIVERY_FAILED_KEY
-                        ] = True
+                        _mark_gateway_recovery_delivery_failed(
+                            source,
+                            event,
+                        )
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
@@ -22001,10 +22018,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
+                            _first_response_metadata = dict(
+                                _status_thread_metadata or {}
+                            )
+                            _recovery_receipt_ids = list(
+                                getattr(
+                                    source,
+                                    "_gateway_receipt_ids",
+                                    None,
+                                )
+                                or []
+                            )
+                            _first_response_reply_to = str(
+                                event_message_id
+                                or (
+                                    _recovery_receipt_ids[0]
+                                    if _recovery_receipt_ids
+                                    else ""
+                                )
+                            )
+                            if _recovery_receipt_ids:
+                                _first_response_metadata[
+                                    _GATEWAY_RECEIPT_IDS_KEY
+                                ] = _recovery_receipt_ids
+                                _first_response_metadata[
+                                    "reply_to_message_id"
+                                ] = _first_response_reply_to
+                                _first_response_metadata["notify"] = False
+                                _first_response_metadata[
+                                    _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
+                                ] = "queued-first-response"
                             _first_send_result = await adapter.send(
                                 source.chat_id,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                reply_to=(
+                                    _first_response_reply_to or None
+                                ),
+                                metadata=(
+                                    _first_response_metadata or None
+                                ),
                             )
                             if (
                                 getattr(
@@ -22018,10 +22070,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     False,
                                 )
                             ):
-                                setattr(
+                                _mark_gateway_recovery_delivery_failed(
                                     source,
-                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
-                                    True,
                                 )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -22030,10 +22080,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "_gateway_receipt_ids",
                                 None,
                             ):
-                                setattr(
+                                _mark_gateway_recovery_delivery_failed(
                                     source,
-                                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
-                                    True,
                                 )
                     elif first_response:
                         logger.info(
@@ -22109,6 +22157,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "_gateway_receipt_ids",
                             active_receipt_ids,
                         )
+                        active_delivery_state = getattr(
+                            source,
+                            _GATEWAY_DELIVERY_STATE_KEY,
+                            None,
+                        )
+                        if isinstance(active_delivery_state, dict):
+                            setattr(
+                                next_source,
+                                _GATEWAY_DELIVERY_STATE_KEY,
+                                active_delivery_state,
+                            )
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -22168,18 +22227,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                finally:
+                    if next_source is not source:
+                        for attr in (
+                            "_gateway_receipt_ids",
+                            _GATEWAY_DELIVERY_STATE_KEY,
+                            _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                        ):
+                            try:
+                                delattr(next_source, attr)
+                            except AttributeError:
+                                pass
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

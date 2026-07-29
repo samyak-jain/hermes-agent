@@ -2127,6 +2127,7 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
 _GATEWAY_RECEIPT_IDS_KEY = "_gateway_receipt_ids"
 _GATEWAY_INLINE_OUTCOME_KEY = "_gateway_inline_processing_outcome"
 _GATEWAY_STREAM_DELIVERY_FAILED_KEY = "_gateway_stream_delivery_failed"
+_GATEWAY_DELIVERY_STATE_KEY = "_gateway_delivery_state"
 _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY = (
     "_gateway_recovery_text_chunk_index"
 )
@@ -5086,6 +5087,18 @@ class BasePlatformAdapter(ABC):
                 "_gateway_receipt_ids",
                 receipt_ids,
             )
+            delivery_state = getattr(
+                event.source,
+                _GATEWAY_DELIVERY_STATE_KEY,
+                None,
+            )
+            if not isinstance(delivery_state, dict):
+                delivery_state = {"failed": False}
+                setattr(
+                    event.source,
+                    _GATEWAY_DELIVERY_STATE_KEY,
+                    delivery_state,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5131,10 +5144,21 @@ class BasePlatformAdapter(ABC):
             try:
                 response = await self._message_handler(event)
             finally:
-                if getattr(
+                delivery_state = getattr(
                     event.source,
-                    _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
-                    False,
+                    _GATEWAY_DELIVERY_STATE_KEY,
+                    None,
+                )
+                if (
+                    getattr(
+                        event.source,
+                        _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                        False,
+                    )
+                    or (
+                        isinstance(delivery_state, dict)
+                        and delivery_state.get("failed")
+                    )
                 ):
                     # The runner can deliver the first response of an in-band
                     # queued turn before this lifecycle frame resumes.  Keep a
@@ -5147,6 +5171,11 @@ class BasePlatformAdapter(ABC):
                     delattr(
                         event.source,
                         _GATEWAY_STREAM_DELIVERY_FAILED_KEY,
+                    )
+                with suppress(AttributeError):
+                    delattr(
+                        event.source,
+                        _GATEWAY_DELIVERY_STATE_KEY,
                     )
                 if receipt_ids:
                     # A busy runner can consume queued follow-ups in-band
@@ -5373,9 +5402,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not receipt_ids
+                        and not is_ephemeral_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,

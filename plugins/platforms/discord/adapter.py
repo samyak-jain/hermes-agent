@@ -946,6 +946,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_recovery_waiters: Dict[str, asyncio.Future] = {}
         self._discord_recovery_started_events: Dict[str, asyncio.Event] = {}
         self._discord_recovery_session_keys: Dict[str, str] = {}
+        self._discord_recovery_active_receipt_lists: Dict[
+            str,
+            list[str],
+        ] = {}
         self._discord_recovery_receipts: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._discord_recovery_message_channels: Dict[str, str] = {}
         self._discord_recovery_claim_heartbeats: Dict[str, asyncio.Task] = {}
@@ -1786,6 +1790,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if waiter is not None and not waiter.done():
                 waiter.set_result(outcome)
 
+    def _attach_inline_discord_receipts_to_active_turn(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Defer a control receipt until its active parent turn commits."""
+        active_receipts = (
+            self._discord_recovery_active_receipt_lists.get(session_key)
+        )
+        if active_receipts is None:
+            return False
+        for message_id in self._discord_event_receipt_ids(event):
+            if message_id not in active_receipts:
+                active_receipts.append(message_id)
+        return True
+
     async def _dispatch_discord_event(
         self,
         event: MessageEvent,
@@ -1833,6 +1853,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 inline_outcome = ProcessingOutcome(raw_outcome)
             except ValueError:
                 inline_outcome = ProcessingOutcome.FAILURE
+            if (
+                inline_outcome == ProcessingOutcome.SUCCESS
+                and self._attach_inline_discord_receipts_to_active_turn(
+                    event,
+                    session_key,
+                )
+            ):
+                # The parent lifecycle now owns this receipt.  Leaving the
+                # child claim nonterminal makes a crash replay both messages;
+                # successful parent completion commits both physical-channel
+                # cursors together.
+                return
             await self._complete_inline_discord_event(
                 event,
                 inline_outcome,
@@ -4805,8 +4837,41 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message_id in self._discord_recovery_message_channels
             ]
         )
+        source_receipts = getattr(
+            event.source,
+            "_gateway_receipt_ids",
+            None,
+        )
+        if isinstance(source_receipts, list) and source_receipts:
+            self._discord_recovery_active_receipt_lists[
+                self._discord_event_session_key(event)
+            ] = source_receipts
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+    async def on_processing_complete(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        """Complete durable processing and always release active ownership."""
+        session_key = (
+            self._discord_event_session_key(event)
+            if event.source is not None
+            else None
+        )
+        try:
+            await self._complete_discord_processing(event, outcome)
+        finally:
+            if session_key is not None:
+                self._discord_recovery_active_receipt_lists.pop(
+                    session_key,
+                    None,
+                )
+
+    async def _complete_discord_processing(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         message_ids = self._discord_event_receipt_ids(event)
         await self._stop_discord_processing_claim_heartbeats(message_ids)
@@ -4855,7 +4920,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     waiter = self._discord_recovery_waiters.get(message_id)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(outcome)
-
     async def send(
         self,
         chat_id: str,

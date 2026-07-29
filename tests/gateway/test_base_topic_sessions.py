@@ -230,7 +230,7 @@ class TestBasePlatformTopicSessions:
                 event.source,
                 "_gateway_receipt_ids",
             ) == ["1", "2"]
-            event.source._gateway_stream_delivery_failed = True
+            event.source._gateway_delivery_state["failed"] = True
             return None
 
         async def hold_typing(_chat_id, interval=2.0, metadata=None):
@@ -250,6 +250,10 @@ class TestBasePlatformTopicSessions:
         assert not hasattr(
             event.source,
             "_gateway_stream_delivery_failed",
+        )
+        assert not hasattr(
+            event.source,
+            "_gateway_delivery_state",
         )
         assert event.metadata["_gateway_stream_delivery_failed"] is True
         assert adapter.processing_hooks == [

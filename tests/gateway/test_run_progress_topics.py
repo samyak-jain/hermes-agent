@@ -139,6 +139,30 @@ class FailedQueuedRecoverySendAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id="progress-1")
 
 
+class FailedSecondQueuedRecoverySendAdapter(ProgressCaptureAdapter):
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content == "final response 2":
+            return SendResult(
+                success=False,
+                error="ambiguous timeout",
+            )
+        return SendResult(success=True, message_id="progress-1")
+
+
 class FailingFinalEditProgressCaptureAdapter(
     MetadataEditProgressCaptureAdapter
 ):
@@ -763,6 +787,51 @@ class QueuedSilenceAgent:
         }
 
 
+class ThreeQueuedResponseAgent:
+    """Inject a third distinct queued source during the second turn."""
+
+    calls = 0
+    adapter = None
+    session_key = None
+
+    @classmethod
+    def configure_gateway_test(cls, adapter, session_key):
+        cls.adapter = adapter
+        cls.session_key = session_key
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+    ):
+        type(self).calls += 1
+        if type(self).calls == 2:
+            third_source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                chat_type="dm",
+                message_id="458",
+            )
+            type(self).adapter._pending_messages[
+                type(self).session_key
+            ] = MessageEvent(
+                text="third queued follow-up",
+                message_type=MessageType.TEXT,
+                source=third_source,
+                message_id="458",
+                metadata={"_gateway_receipt_ids": ["458"]},
+            )
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -871,21 +940,44 @@ async def _run_with_agent(
     )
     if receipt_ids:
         source._gateway_receipt_ids = list(receipt_ids)
+        source._gateway_delivery_state = {"failed": False}
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
+        pending_source = SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            message_id=(
+                str(pending_receipt_ids[0])
+                if pending_receipt_ids
+                else "queued-1"
+            ),
+        )
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
-            source=source,
-            message_id="queued-1",
+            source=pending_source,
+            message_id=(
+                str(pending_receipt_ids[0])
+                if pending_receipt_ids
+                else "queued-1"
+            ),
             metadata=(
                 {"_gateway_receipt_ids": list(pending_receipt_ids)}
                 if pending_receipt_ids
                 else {}
             ),
         )
+    configure_gateway_test = getattr(
+        agent_cls,
+        "configure_gateway_test",
+        None,
+    )
+    if callable(configure_gateway_test):
+        configure_gateway_test(adapter, session_key)
 
     result = await runner._run_agent(
         message="hello",
@@ -1328,10 +1420,53 @@ async def test_run_agent_queued_recovery_send_failure_marks_outer_lifecycle(
     assert QueuedCommentaryAgent.calls == 2
     assert source._gateway_receipt_ids == ["456", "457"]
     assert source._gateway_stream_delivery_failed is True
-    assert any(
-        call["content"] == "final response 1"
+    failed_send = next(
+        call
         for call in adapter.sent
+        if call["content"] == "final response 1"
     )
+    assert failed_send["reply_to"] == "456"
+    assert failed_send["metadata"][
+        "_gateway_recovery_text_chunk_index"
+    ] == "queued-first-response"
+    assert failed_send["metadata"]["reply_to_message_id"] == "456"
+
+
+@pytest.mark.asyncio
+async def test_middle_queued_delivery_failure_taints_shared_outer_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    ThreeQueuedResponseAgent.calls = 0
+    adapter, result, source = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ThreeQueuedResponseAgent,
+        session_id="sess-three-queued-recovery",
+        pending_text="second queued follow-up",
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        event_message_id="456",
+        receipt_ids=["456"],
+        pending_receipt_ids=["457"],
+        return_source=True,
+        adapter_cls=FailedSecondQueuedRecoverySendAdapter,
+    )
+
+    assert result["final_response"] == "final response 3"
+    assert ThreeQueuedResponseAgent.calls == 3
+    assert source._gateway_receipt_ids == ["456", "457", "458"]
+    assert source._gateway_delivery_state["failed"] is True
+    failed_send = next(
+        call
+        for call in adapter.sent
+        if call["content"] == "final response 2"
+    )
+    assert failed_send["reply_to"] == "457"
+    assert failed_send["metadata"][
+        "_gateway_recovery_text_chunk_index"
+    ] == "queued-first-response"
 
 
 @pytest.mark.asyncio
