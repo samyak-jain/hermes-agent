@@ -5057,6 +5057,87 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 deleted += 1
         return (deleted, routing_deleted)
 
+    # ── Discord reconnect recovery cursors ────────────────────────────
+
+    def get_discord_recovery_cursor(self, channel_id: str) -> Optional[str]:
+        """Return the durable completed-message high-water mark for a channel."""
+        channel_id = str(channel_id or "").strip()
+        if not channel_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_message_id FROM discord_recovery_cursors "
+                "WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+        return str(row["last_message_id"]) if row else None
+
+    def list_discord_recovery_cursors(self) -> Dict[str, str]:
+        """Return all durable Discord channel high-water marks."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT channel_id, last_message_id "
+                "FROM discord_recovery_cursors"
+            ).fetchall()
+        return {
+            str(row["channel_id"]): str(row["last_message_id"])
+            for row in rows
+        }
+
+    def advance_discord_recovery_cursor(
+        self,
+        channel_id: str,
+        message_id: str,
+        *,
+        boundary_reason: Optional[str] = None,
+    ) -> bool:
+        """Monotonically advance one Discord recovery cursor.
+
+        Discord snowflakes are decimal integers whose natural order is creation
+        order. The read/compare/write runs in one SessionDB write transaction,
+        so a stale completion cannot regress a newer replay boundary.
+        """
+        channel_id = str(channel_id or "").strip()
+        message_id = str(message_id or "").strip()
+        if not channel_id or not message_id:
+            return False
+        try:
+            candidate = int(message_id)
+        except (TypeError, ValueError):
+            return False
+
+        advanced = False
+
+        def _do(conn):
+            nonlocal advanced
+            row = conn.execute(
+                "SELECT last_message_id FROM discord_recovery_cursors "
+                "WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    if int(row["last_message_id"]) >= candidate:
+                        return
+                except (TypeError, ValueError):
+                    pass
+            conn.execute(
+                """
+                INSERT INTO discord_recovery_cursors (
+                    channel_id, last_message_id, updated_at, boundary_reason
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id = excluded.last_message_id,
+                    updated_at = excluded.updated_at,
+                    boundary_reason = excluded.boundary_reason
+                """,
+                (channel_id, message_id, time.time(), boundary_reason),
+            )
+            advanced = True
+
+        self._execute_write(_do)
+        return advanced
+
     def list_gateway_sessions(
         self,
         *,
