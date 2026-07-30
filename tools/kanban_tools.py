@@ -353,6 +353,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "goal_mode": bool(task.goal_mode),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
