@@ -5603,6 +5603,7 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    incomplete_allowlist = False
     try:
         from agent.tool_policy import LEGACY_TOOL_POLICY, filter_tool_definitions
 
@@ -5610,16 +5611,17 @@ def refresh_agent_mcp_tools(
         new_defs = filter_tool_definitions(new_defs, tool_policy)
         new_names = {t["function"]["name"] for t in new_defs}
         staged_engine_names.intersection_update(new_names)
-        if (
+        incomplete_allowlist = (
             tool_policy.mode == "allowlist"
             and not tool_policy.allowed_names.issubset(new_names)
-        ):
+        )
+        if incomplete_allowlist:
+            missing_allowlist_names = tool_policy.allowed_names - new_names
             logger.error(
-                "MCP refresh could not satisfy exact tool allowlist; denying refreshed surface"
+                "MCP refresh could not satisfy exact tool allowlist (%s); "
+                "refusing incomplete refresh",
+                ", ".join(sorted(missing_allowlist_names)),
             )
-            new_defs = []
-            new_names = set()
-            staged_engine_names.clear()
     except Exception:
         # Refresh is a mutation of an already-authorized agent. If policy
         # evaluation itself fails, publish no tools rather than retaining an
@@ -5649,6 +5651,28 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
+        if incomplete_allowlist:
+            # A registry refresh is not an authorization boundary change. If
+            # a service-gated exact tool is transiently unavailable while the
+            # registry is rebuilt (for example because a profile-local secret
+            # scope is absent in a background refresh), do not destroy the
+            # complete policy-filtered snapshot that this agent already owns.
+            #
+            # Retention is allowed only when the existing surface still
+            # satisfies the exact policy in both directions. A partial or
+            # unexpectedly broad current snapshot remains fail-closed.
+            current_is_exact = (
+                tool_policy.allowed_names.issubset(current)
+                and all(tool_policy.allows(name) for name in current)
+            )
+            if current_is_exact:
+                agent._tool_snapshot_generation = max(
+                    published_gen, snapshot_generation
+                )
+                return set()
+            new_defs = []
+            new_names = set()
+            staged_engine_names.clear()
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
