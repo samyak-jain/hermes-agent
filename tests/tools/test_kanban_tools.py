@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 
 import pytest
 
@@ -227,6 +228,81 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
     assert tenant_ids == [c]
+
+
+def test_list_includes_goal_mode_boole(monkeypatch, worker_env):
+    """kanban_list emits real booleans for goal and non-goal cards."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        plain = kb.create_task(
+            conn, title="plain task", assignee="factory", goal_mode=False
+        )
+        goal = kb.create_task(
+            conn, title="goal task", assignee="factory", goal_mode=True
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_list({"assignee": "factory"}))
+    by_id = {task["id"]: task for task in out["tasks"]}
+
+    assert by_id[plain]["goal_mode"] is False
+    assert by_id[goal]["goal_mode"] is True
+
+
+def test_list_normalizes_legacy_null_goal_mode_to_false(
+    monkeypatch, tmp_path
+):
+    """A legacy nullable goal_mode value is listed as JSON false."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    db_path = kb.kanban_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL DEFAULT 'ready',
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            goal_mode INTEGER
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO tasks ("
+        "id, title, status, priority, created_at, workspace_kind, goal_mode"
+        ") VALUES ('legacy-null', 'old task', 'ready', 0, 1, 'scratch', NULL)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    kb.init_db()
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_list({}))
+
+    assert out["tasks"][0]["id"] == "legacy-null"
+    assert out["tasks"][0]["goal_mode"] is False
 
 
 def test_list_rejects_invalid_status(monkeypatch, worker_env):
