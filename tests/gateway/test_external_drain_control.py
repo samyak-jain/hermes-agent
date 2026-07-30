@@ -239,6 +239,66 @@ def _drain_runner():
 
 
 class TestDrainStateMachine:
+    @pytest.mark.asyncio
+    async def test_startup_reconciles_marker_before_work(self, home):
+        runner, _ = _drain_runner()
+        runner._initialize_external_drain_state = (
+            GatewayRunner._initialize_external_drain_state.__get__(
+                runner, GatewayRunner
+            )
+        )
+        dc.write_drain_request()
+
+        await runner._initialize_external_drain_state()
+
+        assert runner._external_drain_active is True
+
+    @pytest.mark.asyncio
+    async def test_startup_recovery_waits_for_drain_release(self):
+        runner, _ = _drain_runner()
+        runner._complete_startup_recovery = (
+            GatewayRunner._complete_startup_recovery.__get__(
+                runner, GatewayRunner
+            )
+        )
+        runner._redeliver_pending_obligations = AsyncMock()
+        runner._schedule_resume_pending_sessions = MagicMock()
+        runner._finish_startup_restore = AsyncMock()
+        runner._replay_external_drain_inbox = AsyncMock()
+        runner._external_drain_active = True
+
+        await runner._complete_startup_recovery()
+
+        assert runner._startup_recovery_deferred_by_drain is True
+        runner._redeliver_pending_obligations.assert_not_awaited()
+        runner._schedule_resume_pending_sessions.assert_not_called()
+        runner._finish_startup_restore.assert_not_awaited()
+        runner._replay_external_drain_inbox.assert_not_awaited()
+
+        runner._external_drain_active = False
+        await runner._complete_startup_recovery()
+
+        runner._redeliver_pending_obligations.assert_awaited_once()
+        runner._schedule_resume_pending_sessions.assert_called_once()
+        runner._finish_startup_restore.assert_awaited_once()
+        runner._replay_external_drain_inbox.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_drain_release_starts_deferred_startup_recovery(self):
+        runner, _ = _drain_runner()
+        runner._startup_recovery_deferred_by_drain = True
+        runner._complete_startup_recovery = AsyncMock()
+        runner._spawn_supervised = MagicMock()
+        runner._enter_external_drain()
+
+        runner._exit_external_drain()
+
+        runner._spawn_supervised.assert_called_once_with(
+            runner._complete_startup_recovery,
+            "deferred_startup_recovery",
+            restart=False,
+        )
+
     def test_active_work_count_includes_api_cron_and_detached_work(self, monkeypatch):
         runner, _ = _drain_runner()
         runner.adapters = {

@@ -3247,6 +3247,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _startup_recovery_deferred_by_drain: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -3354,6 +3355,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._startup_recovery_deferred_by_drain = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -5511,11 +5513,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a synchronous control thread. Startup replay still drains the
             # durable inbox when the event loop becomes available.
             return
-        self._spawn_supervised(
-            self._replay_external_drain_inbox,
-            "external_drain_inbox_replay",
-            restart=False,
-        )
+        if getattr(self, "_startup_recovery_deferred_by_drain", False):
+            self._startup_recovery_deferred_by_drain = False
+            self._spawn_supervised(
+                self._complete_startup_recovery,
+                "deferred_startup_recovery",
+                restart=False,
+            )
+        else:
+            self._spawn_supervised(
+                self._replay_external_drain_inbox,
+                "external_drain_inbox_replay",
+                restart=False,
+            )
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -7598,6 +7608,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
+    async def _complete_startup_recovery(self) -> None:
+        """Resume prior work only after any boot-time external drain clears."""
+        if self._external_drain_active:
+            self._startup_recovery_deferred_by_drain = True
+            return
+        await self._redeliver_pending_obligations()
+        self._schedule_resume_pending_sessions()
+        await self._finish_startup_restore()
+        await self._replay_external_drain_inbox()
+
+    async def _initialize_external_drain_state(self) -> None:
+        """Honor a current-epoch drain before adapters can initiate work."""
+        try:
+            from gateway.drain_control import drain_requested
+
+            self._external_drain_active = await asyncio.to_thread(drain_requested)
+        except Exception:
+            # Startup is the one point where adapters are not yet connected.
+            # If marker reconciliation itself fails, preserve that safe state
+            # instead of initiating work whose drain status is unknown.
+            self._external_drain_active = True
+            logger.warning(
+                "Could not reconcile external drain during startup; "
+                "starting drained",
+                exc_info=True,
+            )
+        if self._external_drain_active:
+            logger.info(
+                "External drain present at startup — deferring recovery work "
+                "and refusing new turns before adapters connect."
+            )
+
     async def _redeliver_pending_obligations(self) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
@@ -7888,6 +7930,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+        # Reconcile before adapters connect, cron starts, or interrupted work
+        # resumes. The background watcher maintains this state after startup.
+        await self._initialize_external_drain_state()
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
@@ -8456,7 +8501,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
-        self._update_runtime_status("running")
+        self._update_runtime_status(
+            "draining" if self._external_drain_active else "running"
+        )
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -8551,14 +8598,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in the ledger — redelivering it (and clearing resume_pending for
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
-        await self._redeliver_pending_obligations()
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
-        # Messages accepted by platform adapters during the previous
-        # process's external drain were durably queued rather than rejected.
-        # Replay only after restart-interrupted sessions have been restored so
-        # the new user turns preserve conversation order.
-        await self._replay_external_drain_inbox()
+        if self._external_drain_active:
+            self._startup_recovery_deferred_by_drain = True
+            logger.info(
+                "Deferring startup recovery until the external drain clears"
+            )
+        else:
+            await self._complete_startup_recovery()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
