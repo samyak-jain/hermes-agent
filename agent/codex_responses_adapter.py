@@ -180,6 +180,7 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
 # ---------------------------------------------------------------------------
 
 _MAX_RESPONSES_CALL_ID_LENGTH = 64
+_MAX_RESPONSES_FUNCTION_NAME_LENGTH = 64
 
 
 def _normalize_responses_call_id(raw_call_id: str) -> str:
@@ -199,6 +200,28 @@ def _normalize_responses_call_id(raw_call_id: str) -> str:
     ).hexdigest()[:16]
     prefix_length = _MAX_RESPONSES_CALL_ID_LENGTH - len(digest) - 1
     return f"{value[:prefix_length]}_{digest}"
+
+
+def _normalize_responses_function_name(raw_name: str) -> str:
+    """Return a deterministic Responses-compatible function name.
+
+    Provider switches can replay tool calls created by runtimes that permit
+    dotted or namespaced function names.  OpenAI Responses only accepts
+    ``[A-Za-z0-9_-]+`` and caps function names at 64 characters, so normalize
+    the request copy without rewriting durable history.  A digest suffix
+    keeps overlong names deterministic and collision-resistant.
+    """
+    value = raw_name.strip()
+    normalized = re.sub(r"[^A-Za-z0-9_-]", "_", value)
+    if not normalized:
+        normalized = "tool"
+    if len(normalized) <= _MAX_RESPONSES_FUNCTION_NAME_LENGTH:
+        return normalized
+    digest = hashlib.sha256(
+        value.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    prefix_length = _MAX_RESPONSES_FUNCTION_NAME_LENGTH - len(digest) - 1
+    return f"{normalized[:prefix_length]}_{digest}"
 
 
 def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
@@ -569,7 +592,7 @@ def _chat_messages_to_responses_input(
                         items.append({
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": fn_name,
+                            "name": _normalize_responses_function_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -657,7 +680,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": _normalize_responses_call_id(call_id),
-                    "name": name.strip(),
+                    "name": _normalize_responses_function_name(name),
                     "arguments": arguments,
                 }
             )
