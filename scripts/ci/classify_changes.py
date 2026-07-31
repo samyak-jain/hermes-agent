@@ -17,8 +17,9 @@ Lanes:
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 
-Docker is not a lane — it builds on push-to-main and release only,
-never per-PR.
+Docker consumes the ``python``, ``frontend``, and ``docker_meta`` outputs in
+the orchestrator. Fork PRs verify images without publication credentials;
+publishing remains restricted to trusted upstream push/release events.
 
 Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
@@ -39,8 +40,13 @@ _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
-# Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
+# Prose/frontend trees that normally can't touch Python. skills/ is excluded on
+# purpose, and _py_irrelevant() has explicit exceptions for tested artifacts.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
+_PY_TESTED_ARTIFACTS = {
+    "Dockerfile",
+    "docs/relay-connector-contract.md",
+}
 
 # CI-sensitive files: eslint config, workflow files, composite actions.
 # Changes here can influence what code the autofix job executes and pushes to
@@ -70,7 +76,11 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    # Python tests execute website helper scripts and assert contracts against
+    # selected non-Python artifacts. Keep those changes on the Python lane.
+    if p.endswith(".py") or p in _PY_TESTED_ARTIFACTS:
+        return False
+    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP)
 
 
 def _is_scan(p: str) -> bool:

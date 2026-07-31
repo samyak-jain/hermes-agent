@@ -61,7 +61,20 @@ CASES = {
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
-    "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
+    # Python contract tests read Dockerfile and selected documentation.
+    "dockerfile → python + docker meta": (
+        ["Dockerfile"],
+        _lanes(python=True, docker_meta=True),
+    ),
+    "relay contract doc → python": (
+        ["docs/relay-connector-contract.md"],
+        _lanes(python=True),
+    ),
+    # Python helpers under otherwise site/frontend-only trees still need pytest.
+    "website Python helper → python + site": (
+        ["website/scripts/extract-skills.py"],
+        _lanes(python=True, site=True, scan=True),
+    ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
     "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),

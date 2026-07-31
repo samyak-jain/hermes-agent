@@ -94,6 +94,9 @@ echo "▶ launching test runner"
 # Safe, non-secret Docker test control: the CI Docker matrix has already
 # built and loaded this tag. Preserve it through env -i so each isolated
 # pytest file reuses that image instead of launching another docker build.
+if [ -n "${HERMES_TEST_IMAGE:-}" ]; then
+  echo "  reusing prebuilt Docker test image: $HERMES_TEST_IMAGE"
+fi
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \

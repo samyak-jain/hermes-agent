@@ -62,5 +62,6 @@ printf 'secret=%s\\n' "${OPENAI_API_KEY-unset}"
     )
 
     assert result.returncode == 0, result.stderr
+    assert "reusing prebuilt Docker test image: hermes-agent:test" in result.stdout
     assert "image=hermes-agent:test" in result.stdout
     assert "secret=unset" in result.stdout

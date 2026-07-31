@@ -19,6 +19,8 @@ def test_required_aggregate_waits_for_docker_and_fails_closed():
     workflow = _workflow("ci.yml")
     gate = workflow["jobs"]["all-checks-pass"]
 
+    assert gate["name"] == "All required checks pass"
+    assert "detect" in gate["needs"]
     assert "docker" in gate["needs"]
 
     command = gate["steps"][0]["run"]
@@ -40,17 +42,24 @@ def test_docker_prs_use_native_runners_without_publication_permissions():
     )
     assert workflow["permissions"] == {"contents": "read"}
 
-    push_steps = [
+    publish_steps = [
         step
         for step in build["steps"]
-        if step.get("name", "").startswith("Push ")
+        if step.get("name") in {
+            "Log in to Docker Hub",
+            "Export digest",
+            "Upload digest artifact",
+        }
+        or step.get("name", "").startswith("Push ")
     ]
-    assert push_steps
-    assert all(
-        "pull_request" not in step["if"]
-        and "github.repository == 'NousResearch/hermes-agent'" not in step["if"]
-        for step in push_steps
-    )
+    assert len(publish_steps) == 4
+    for step in publish_steps:
+        condition = step["if"]
+        assert "github.repository == 'NousResearch/hermes-agent'" in condition
+        assert "github.event_name == 'push'" in condition
+        assert "github.ref == 'refs/heads/main'" in condition
+        assert "github.event_name == 'release'" in condition
+        assert "pull_request" not in condition
 
     docker_test = next(
         step
