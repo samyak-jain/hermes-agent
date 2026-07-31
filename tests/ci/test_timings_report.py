@@ -37,7 +37,7 @@ def test_required_critical_path_includes_queue_and_stops_at_gate():
         ],
     }
 
-    assert _MOD.required_critical_path_s(timings) == 240.0
+    assert _MOD.required_critical_path_s(timings) == 242.0
 
 
 def test_required_critical_path_is_unavailable_without_completed_gate():

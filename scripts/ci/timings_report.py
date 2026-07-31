@@ -364,9 +364,9 @@ def required_critical_path_s(timings: dict) -> float | None:
     """Return feedback latency through the required aggregate job.
 
     This is the merge-blocking wall clock, including initial runner queueing:
-    workflow ``run_started_at`` (or ``created_at`` for older JSON) through
-    completion of ``All required checks pass``. It deliberately does not sum
-    parallel job durations or include advisory jobs that finish later.
+    workflow ``created_at`` through completion of ``All required checks pass``.
+    This includes queueing before the workflow starts. It deliberately does not
+    sum parallel job durations or include advisory jobs that finish later.
     """
     gate = next(
         (
@@ -376,7 +376,7 @@ def required_critical_path_s(timings: dict) -> float | None:
         ),
         None,
     )
-    start = parse_ts(timings.get("run_started_at") or timings.get("created_at"))
+    start = parse_ts(timings.get("created_at") or timings.get("run_started_at"))
     end = parse_ts(gate.get("completed_at")) if gate else None
     if start is None or end is None:
         return None
