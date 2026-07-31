@@ -14,6 +14,41 @@ _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
 
 
+def test_collection_is_scoped_to_the_requested_run_attempt(monkeypatch):
+    calls = []
+
+    def fake_api_get(path, token, params=None, list_key=None):
+        calls.append((path, params, list_key))
+        if path.endswith("/jobs"):
+            return [{
+                "id": 7,
+                "name": "Python tests / Run tests slice 1/8",
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": "2026-07-29T00:00:02Z",
+                "completed_at": "2026-07-29T00:01:02Z",
+                "steps": [],
+            }]
+        return {
+            "created_at": "2026-07-29T00:00:00Z",
+            "run_started_at": "2026-07-29T00:00:02Z",
+            "run_attempt": 2,
+        }
+
+    monkeypatch.setattr(_MOD, "api_get", fake_api_get)
+
+    timings = _MOD.collect_timings(
+        "token", "samyak-jain/hermes-agent", "123", "same-sha-across-reruns"
+    )
+
+    assert [call[0] for call in calls] == [
+        "/repos/samyak-jain/hermes-agent/actions/runs/123",
+        "/repos/samyak-jain/hermes-agent/actions/runs/123/jobs",
+    ]
+    assert timings["jobs"][0]["job_id"] == 7
+    assert timings["run_attempt"] == 2
+
+
 def test_required_critical_path_includes_queue_and_stops_at_gate():
     timings = {
         "created_at": "2026-07-29T00:00:00Z",
@@ -53,6 +88,21 @@ def test_required_critical_path_is_unavailable_without_completed_gate():
     }
 
     assert _MOD.required_critical_path_s(timings) is None
+
+
+def test_required_critical_path_does_not_include_time_between_rerun_attempts():
+    timings = {
+        "created_at": "2026-07-29T00:00:00Z",
+        "run_started_at": "2026-07-29T01:00:00Z",
+        "run_attempt": 2,
+        "jobs": [{
+            "name": "All required checks pass",
+            "conclusion": "success",
+            "completed_at": "2026-07-29T01:04:00Z",
+        }],
+    }
+
+    assert _MOD.required_critical_path_s(timings) == 240.0
 
 
 def test_stats_compare_required_critical_path_not_total_compute():

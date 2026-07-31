@@ -240,10 +240,10 @@ def _annotate_wait_times(jobs: list[dict]) -> None:
 def collect_timings(token: str, repo: str, run_id: str, head_sha: str) -> dict:
     """Collect job/step timings from the GitHub API.
 
-    1. Get orchestrator run's direct jobs (detect, all-checks-pass, etc.).
-       Skip workflow-call placeholder jobs (step name starts with "Run ./.github/").
-    2. Find sub-workflow runs via head_sha + event=workflow_call.
-    3. Get each sub-workflow run's jobs with full step timing.
+    GitHub exposes jobs from reusable workflows under the calling workflow run,
+    so fetching this run's jobs is both complete and attempt-scoped. Looking up
+    separate ``workflow_call`` runs by SHA would risk mixing concurrent runs or
+    rerun attempts for the same commit.
     """
     owner, repo_name = repo.split("/")
 
@@ -251,46 +251,24 @@ def collect_timings(token: str, repo: str, run_id: str, head_sha: str) -> dict:
     run_info = api_get(f"/repos/{owner}/{repo_name}/actions/runs/{run_id}", token)
     created_at = run_info.get("created_at", "")
 
-    # Orchestrator direct jobs
-    orch_jobs = api_get(f"/repos/{owner}/{repo_name}/actions/runs/{run_id}/jobs",
-                        token, list_key="jobs")
+    run_jobs = api_get(f"/repos/{owner}/{repo_name}/actions/runs/{run_id}/jobs",
+                       token, list_key="jobs")
 
-    direct = []
-    for job in orch_jobs:
-        steps = job.get("steps") or []
-        if any(s.get("name", "").startswith("Run ./.github/") for s in steps):
-            continue  # workflow-call placeholder
+    completed_jobs = []
+    for job in run_jobs:
         if job.get("status") in ("in_progress", "queued"):
             continue  # skip self / unfinished
-        direct.append(job)
-
-    # Sub-workflow runs
-    sub_runs = api_get(f"/repos/{owner}/{repo_name}/actions/runs", token, params={
-        "head_sha": head_sha,
-        "event": "workflow_call",
-        "per_page": 100,
-    }, list_key="workflow_runs")
-    sub_runs = [r for r in sub_runs if r.get("created_at", "") >= created_at]
-
-    sub_jobs_raw = []
-    for sr in sub_runs:
-        sr_id = sr["id"]
-        sr_name = sr.get("name", "")
-        sr_jobs = api_get(f"/repos/{owner}/{repo_name}/actions/runs/{sr_id}/jobs",
-                          token, list_key="jobs")
-        for j in sr_jobs:
-            j["_workflow_name"] = sr_name
-            j["_workflow_run_id"] = sr_id
-            sub_jobs_raw.append(j)
+        completed_jobs.append(job)
 
     # Normalize + sort
-    all_jobs = [_normalize_job(j) for j in direct + sub_jobs_raw]
+    all_jobs = [_normalize_job(j) for j in completed_jobs]
     all_jobs = [j for j in all_jobs if j["status"] not in ("in_progress", "queued")]
     all_jobs.sort(key=lambda j: j.get("started_at") or "")
     _annotate_wait_times(all_jobs)
 
     return {
         "run_id": run_id,
+        "run_attempt": run_info.get("run_attempt", 1),
         "head_sha": head_sha,
         "created_at": created_at,
         "run_started_at": run_info.get("run_started_at") or created_at,
@@ -363,10 +341,12 @@ def fmt_tick(seconds: int) -> str:
 def required_critical_path_s(timings: dict) -> float | None:
     """Return feedback latency through the required aggregate job.
 
-    This is the merge-blocking wall clock, including initial runner queueing:
-    workflow ``created_at`` through completion of ``All required checks pass``.
-    This includes queueing before the workflow starts. It deliberately does not
-    sum parallel job durations or include advisory jobs that finish later.
+    This is the merge-blocking wall clock through ``All required checks pass``.
+    Attempt 1 starts at workflow ``created_at`` so initial runner queueing is
+    included. GitHub keeps that timestamp pinned to the original trigger across
+    reruns, so later attempts start at their own ``run_started_at`` rather than
+    incorrectly including the idle time between attempts. It deliberately does
+    not sum parallel job durations or include advisory jobs that finish later.
     """
     gate = next(
         (
@@ -376,7 +356,11 @@ def required_critical_path_s(timings: dict) -> float | None:
         ),
         None,
     )
-    start = parse_ts(timings.get("created_at") or timings.get("run_started_at"))
+    if timings.get("run_attempt", 1) == 1:
+        start_value = timings.get("created_at") or timings.get("run_started_at")
+    else:
+        start_value = timings.get("run_started_at")
+    start = parse_ts(start_value)
     end = parse_ts(gate.get("completed_at")) if gate else None
     if start is None or end is None:
         return None

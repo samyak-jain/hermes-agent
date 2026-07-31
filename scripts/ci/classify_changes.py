@@ -47,6 +47,9 @@ _PY_TESTED_ARTIFACTS = {
     "Dockerfile",
     "docs/relay-connector-contract.md",
 }
+_PY_TESTED_PREFIXES = (
+    "web/src/",
+)
 
 # CI-sensitive files: eslint config, workflow files, composite actions.
 # Changes here can influence what code the autofix job executes and pushes to
@@ -78,7 +81,11 @@ def _is_docs(p: str) -> bool:
 def _py_irrelevant(p: str) -> bool:
     # Python tests execute website helper scripts and assert contracts against
     # selected non-Python artifacts. Keep those changes on the Python lane.
-    if p.endswith(".py") or p in _PY_TESTED_ARTIFACTS:
+    if (
+        p.endswith(".py")
+        or p in _PY_TESTED_ARTIFACTS
+        or p.startswith(_PY_TESTED_PREFIXES)
+    ):
         return False
     return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP)
 

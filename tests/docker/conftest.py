@@ -38,11 +38,18 @@ def _docker_available() -> bool:
 def pytest_collection_modifyitems(config, items):  # noqa: D401 - pytest hook
     """Apply docker-suite policy: timeout bump + skip on missing docker."""
     docker_ok = _docker_available()
-    if not docker_ok and os.environ.get("HERMES_TEST_IMAGE"):
-        raise pytest.UsageError(
-            "HERMES_TEST_IMAGE requires an available Docker daemon; "
-            "refusing to skip the prebuilt-image integration suite",
-        )
+    if os.environ.get("HERMES_TEST_IMAGE"):
+        missing_requirements = []
+        if not docker_ok:
+            missing_requirements.append("an available Docker daemon")
+        if shutil.which("script") is None:
+            missing_requirements.append("the `script` command")
+        if missing_requirements:
+            raise pytest.UsageError(
+                "HERMES_TEST_IMAGE requires "
+                + " and ".join(missing_requirements)
+                + "; refusing to skip required integration coverage",
+            )
     skip_docker = pytest.mark.skip(
         reason="Docker not available or daemon not running",
     )

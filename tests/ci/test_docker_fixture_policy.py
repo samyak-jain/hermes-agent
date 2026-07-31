@@ -19,6 +19,20 @@ _SPEC.loader.exec_module(_MOD)
 def test_prebuilt_image_fails_instead_of_skipping_without_docker(monkeypatch):
     monkeypatch.setenv("HERMES_TEST_IMAGE", "hermes-agent:test")
     monkeypatch.setattr(_MOD, "_docker_available", lambda: False)
+    monkeypatch.setattr(_MOD.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     with pytest.raises(pytest.UsageError, match="requires an available Docker"):
+        _MOD.pytest_collection_modifyitems(None, [])
+
+
+def test_prebuilt_image_fails_instead_of_skipping_without_script(monkeypatch):
+    monkeypatch.setenv("HERMES_TEST_IMAGE", "hermes-agent:test")
+    monkeypatch.setattr(_MOD, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        _MOD.shutil,
+        "which",
+        lambda name: None if name == "script" else f"/usr/bin/{name}",
+    )
+
+    with pytest.raises(pytest.UsageError, match="requires the `script` command"):
         _MOD.pytest_collection_modifyitems(None, [])
