@@ -1,3 +1,4 @@
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -261,6 +262,7 @@ def test_provider_switch_bounds_persisted_call_ids_and_preserves_pairing():
     assert items[1]["type"] == "function_call_output"
     assert items[0]["call_id"] == items[1]["call_id"]
     assert len(items[0]["call_id"]) <= 64
+    assert items[0]["name"] == "mcp_mcp_skill_view"
 
 
 def test_preflight_bounds_direct_function_call_pairs():
@@ -283,6 +285,34 @@ def test_preflight_bounds_direct_function_call_pairs():
 
     assert items[0]["call_id"] == items[1]["call_id"]
     assert len(items[0]["call_id"]) <= 64
+
+
+def test_preflight_normalizes_invalid_and_overlong_function_names():
+    invalid = "mcp.vendor." + ("tool.name/" * 10)
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_example",
+                "name": invalid,
+                "arguments": "{}",
+            }
+        ]
+    )
+
+    name = items[0]["name"]
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", name)
+    assert len(name) <= 64
+    assert name == _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_example",
+                "name": invalid,
+                "arguments": "{}",
+            }
+        ]
+    )[0]["name"]
 
 
 def test_preflight_codex_input_items_drops_oversized_message_id():
