@@ -33,6 +33,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+_MAX_RESPONSES_CALL_ID_LENGTH = 64
+
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
     """Stable id for tool_call message correlation.
@@ -42,9 +44,24 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
     prefix caches stay valid. See AGENTS.md Pitfall #16 (deterministic IDs in
     tool call history)."""
     if item_id:
-        return f"codex_{item_type}_{item_id}"
-    digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]
-    return f"codex_{item_type}_{digest}"
+        candidate = f"codex_{item_type}_{item_id}"
+    else:
+        digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]
+        candidate = f"codex_{item_type}_{digest}"
+
+    if len(candidate) <= _MAX_RESPONSES_CALL_ID_LENGTH:
+        return candidate
+
+    # The Codex Responses endpoint caps call_id at 64 characters. MCP item
+    # types include the server and tool name, so the otherwise-valid
+    # ``codex_<type>_<uuid>`` shape can exceed that limit. Retain a readable
+    # prefix and a digest of the complete candidate so replay stays stable and
+    # distinct long IDs remain collision-resistant.
+    digest = hashlib.sha256(
+        candidate.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    prefix_length = _MAX_RESPONSES_CALL_ID_LENGTH - len(digest) - 1
+    return f"{candidate[:prefix_length]}_{digest}"
 
 
 def _format_tool_args(d: dict) -> str:
