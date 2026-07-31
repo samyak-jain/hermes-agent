@@ -227,6 +227,64 @@ def test_chat_messages_to_responses_input_keeps_short_message_id():
     assert message_item["id"] == _VALID_ITEM_ID
 
 
+def test_provider_switch_bounds_persisted_call_ids_and_preserves_pairing():
+    oversized = (
+        "codex_mcp.mcp.skill_view_item_"
+        "818664ad-2026-0731-0840-240181640000"
+    )
+    assert len(oversized) > 64
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": oversized,
+                    "type": "function",
+                    "function": {
+                        "name": "mcp.mcp.skill_view",
+                        "arguments": "{\"name\":\"kanban-driver\"}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": oversized,
+            "content": "loaded",
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items[0]["type"] == "function_call"
+    assert items[1]["type"] == "function_call_output"
+    assert items[0]["call_id"] == items[1]["call_id"]
+    assert len(items[0]["call_id"]) <= 64
+
+
+def test_preflight_bounds_direct_function_call_pairs():
+    oversized = "call_" + ("x" * 80)
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": oversized,
+                "name": "example",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": oversized,
+                "output": "ok",
+            },
+        ]
+    )
+
+    assert items[0]["call_id"] == items[1]["call_id"]
+    assert len(items[0]["call_id"]) <= 64
+
+
 def test_preflight_codex_input_items_drops_oversized_message_id():
     items = _preflight_codex_input_items(
         [

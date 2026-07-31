@@ -179,6 +179,28 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
 # ID helpers
 # ---------------------------------------------------------------------------
 
+_MAX_RESPONSES_CALL_ID_LENGTH = 64
+
+
+def _normalize_responses_call_id(raw_call_id: str) -> str:
+    """Return a deterministic Codex-compatible call_id.
+
+    Persisted conversations can originate in another runtime whose projected
+    tool IDs are longer than the Codex Responses endpoint's 64-character
+    limit. Normalize at the request boundary as well as at ID creation so an
+    in-session provider switch can replay existing function-call/output pairs
+    without rewriting stored history or breaking their correlation.
+    """
+    value = raw_call_id.strip()
+    if len(value) <= _MAX_RESPONSES_CALL_ID_LENGTH:
+        return value
+    digest = hashlib.sha256(
+        value.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    prefix_length = _MAX_RESPONSES_CALL_ID_LENGTH - len(digest) - 1
+    return f"{value[:prefix_length]}_{digest}"
+
+
 def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     """Generate a deterministic call_id from tool call content.
 
@@ -535,7 +557,7 @@ def _chat_messages_to_responses_input(
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
                                 call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
-                        call_id = call_id.strip()
+                        call_id = _normalize_responses_call_id(call_id)
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -568,6 +590,7 @@ def _chat_messages_to_responses_input(
                     call_id = raw_tool_call_id.strip()
             if not isinstance(call_id, str) or not call_id.strip():
                 continue
+            call_id = _normalize_responses_call_id(call_id)
 
             # Multimodal tool result: convert OpenAI-style content list into
             # Responses ``function_call_output.output`` array. The Responses
@@ -633,7 +656,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call",
-                    "call_id": call_id.strip(),
+                    "call_id": _normalize_responses_call_id(call_id),
                     "name": name.strip(),
                     "arguments": arguments,
                 }
@@ -674,7 +697,7 @@ def _preflight_codex_input_items(
                 normalized.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id.strip(),
+                        "call_id": _normalize_responses_call_id(call_id),
                         "output": cleaned if cleaned else "",
                     }
                 )
@@ -685,7 +708,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call_output",
-                    "call_id": call_id.strip(),
+                    "call_id": _normalize_responses_call_id(call_id),
                     "output": output,
                 }
             )
@@ -1306,7 +1329,7 @@ def _normalize_codex_response(
             call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id.strip() else embedded_call_id
             if not isinstance(call_id, str) or not call_id.strip():
                 call_id = _deterministic_call_id(fn_name, arguments, len(tool_calls))
-            call_id = call_id.strip()
+            call_id = _normalize_responses_call_id(call_id)
             response_item_id = raw_item_id if isinstance(raw_item_id, str) else None
             response_item_id = _derive_responses_function_call_id(call_id, response_item_id)
             tool_calls.append(SimpleNamespace(
@@ -1327,7 +1350,7 @@ def _normalize_codex_response(
             call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id.strip() else embedded_call_id
             if not isinstance(call_id, str) or not call_id.strip():
                 call_id = _deterministic_call_id(fn_name, arguments, len(tool_calls))
-            call_id = call_id.strip()
+            call_id = _normalize_responses_call_id(call_id)
             response_item_id = raw_item_id if isinstance(raw_item_id, str) else None
             response_item_id = _derive_responses_function_call_id(call_id, response_item_id)
             tool_calls.append(SimpleNamespace(

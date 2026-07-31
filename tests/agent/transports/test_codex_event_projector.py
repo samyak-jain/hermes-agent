@@ -282,6 +282,18 @@ class TestHelpers:
         assert a == b
         assert "exec" in a
 
+    def test_deterministic_call_id_bounds_long_mcp_names(self) -> None:
+        item_id = "818664ad-20260731-084024-018164"
+        first = _deterministic_call_id("mcp.mcp.skill_view", item_id)
+        replay = _deterministic_call_id("mcp.mcp.skill_view", item_id)
+        sibling = _deterministic_call_id(
+            "mcp.mcp.skill_view", item_id + "-other"
+        )
+
+        assert len(first) <= 64
+        assert first == replay
+        assert first != sibling
+
     def test_format_tool_args_sorted_keys(self) -> None:
         # Sorted keys = deterministic across replays = prefix cache stays valid
         a = _format_tool_args({"b": 1, "a": 2})

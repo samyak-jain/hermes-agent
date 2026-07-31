@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
-from hermes_cli.context_switch_guard import merge_preflight_compression_warning
+from hermes_cli.context_switch_guard import (
+    enrich_model_switch_warnings_for_gateway,
+    merge_preflight_compression_warning,
+)
 from hermes_cli.model_switch import ModelSwitchResult
 
 
@@ -103,3 +108,42 @@ def test_merge_appends_to_existing_warning(monkeypatch):
     merge_preflight_compression_warning(result, agent=agent)
     assert "expensive" in result.warning_message
     assert "preflight compression" in result.warning_message
+
+
+def test_gateway_warning_awaits_async_session_store(monkeypatch):
+    seen = {}
+
+    class AsyncStore:
+        async def get_or_create_session(self, source):
+            seen["source"] = source
+            return SimpleNamespace(session_id="session-1")
+
+        async def load_transcript(self, session_id):
+            seen["session_id"] = session_id
+            return [{"role": "user", "content": "hello"}]
+
+    agent = SimpleNamespace(context_compressor=object())
+    runner = SimpleNamespace(
+        _agent_cache_lock=threading.Lock(),
+        _agent_cache={"key": (agent, None)},
+        async_session_store=AsyncStore(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.context_switch_guard.merge_preflight_compression_warning",
+        lambda result, **kwargs: seen.update(messages=kwargs["messages"]),
+    )
+
+    asyncio.run(
+        enrich_model_switch_warnings_for_gateway(
+            _result(),
+            runner,
+            session_key="key",
+            source="discord-source",
+        )
+    )
+
+    assert seen == {
+        "source": "discord-source",
+        "session_id": "session-1",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
