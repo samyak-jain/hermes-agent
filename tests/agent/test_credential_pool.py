@@ -296,7 +296,7 @@ def test_exhausted_401_entry_resets_after_five_minutes(tmp_path, monkeypatch):
     assert entry.last_status == "ok"
 
 
-def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
+def test_explicit_429_reset_timestamp_is_capped_by_local_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host
     monkeypatch.setattr(
@@ -321,6 +321,46 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
                         "last_error_code": 429,
                         "last_error_reason": "device_code_exhausted",
                         "last_error_reset_at": time.time() + 7 * 24 * 60 * 60,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.has_available() is True
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+    assert selected.last_status == "ok"
+
+
+def test_short_explicit_429_reset_timestamp_remains_authoritative(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "short-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "last_status": "exhausted",
+                        "last_status_at": now - 60,
+                        "last_error_code": 429,
+                        "last_error_reset_at": now + 20 * 60,
                     }
                 ]
             },
