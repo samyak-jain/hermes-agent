@@ -56,7 +56,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config_readonly
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -2198,12 +2198,10 @@ def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
-        import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+        # Always read the effective configuration. Managed installations can
+        # lock fallback_providers/fallback_model to an empty list even when the
+        # agent-owned config.yaml still contains an old metered fallback.
+        cfg = load_config_readonly()
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -6008,27 +6006,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_fallback_model() -> list | None:
-        """Load fallback provider chain from config.yaml.
+        """Load fallback provider chain from the effective configuration.
 
         Returns the merged effective chain from ``fallback_providers`` plus any
         legacy ``fallback_model`` entries. ``fallback_providers`` stays first
-        when both keys are present.
+        when both keys are present. Managed-scope overrides are authoritative.
         """
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
+            fb = get_fallback_chain(load_config_readonly())
+            if fb:
+                return fb
         except Exception:
             pass
         return None
 
     def _refresh_fallback_model(self) -> list | None:
-        """Re-read fallback_providers from disk for the next agent create/reuse.
+        """Re-read the effective fallback chain for the next agent create/reuse.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway
         previously froze ``self._fallback_model`` at process start, so a chain
@@ -6036,23 +6029,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reached messaging sessions even though the same process's cron jobs
         fell back correctly. Fixes #60955.
 
-        A TRANSIENT read/parse failure (user mid-edit of config.yaml with a
-        non-atomic write) keeps the last known-good chain instead of wiping a
-        cached agent's working fallback for that turn.  Only a successful read
-        that genuinely lacks the key clears the chain.
+        A TRANSIENT load failure keeps the last known-good chain instead of
+        wiping a cached agent's working fallback for that turn. Only a
+        successful effective-config read that genuinely lacks the key clears
+        the chain. This must go through ``load_config_readonly`` so a stale raw
+        config cannot bypass a managed-scope fail-closed policy.
         """
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if not cfg_path.exists():
-                self._fallback_model = None
-                return self._fallback_model
-            with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+            cfg = load_config_readonly()
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
-                "fallback_providers refresh: config.yaml read failed; "
+                "fallback_providers refresh: effective config load failed; "
                 "keeping last known-good chain", exc_info=True,
             )
             return self._fallback_model

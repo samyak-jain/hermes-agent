@@ -194,6 +194,32 @@ def test_resolve_codex_runtime_credentials_pool_fallback_skips_exhausted(tmp_pat
     assert resolved["source"] == "credential_pool"
 
 
+def test_resolve_codex_runtime_credentials_pool_fallback_skips_expired_jwt(
+    tmp_path, monkeypatch
+):
+    """An expired pool token must not be selected merely because cooldown ended."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    expired_token = _jwt_with_exp(int(time.time()) - 60)
+    valid_token = _jwt_with_exp(int(time.time()) + 3600)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {"source": "device_code", "access_token": expired_token},
+                {"source": "device_code", "access_token": valid_token},
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials()
+    assert resolved["api_key"] == valid_token
+    assert resolved["source"] == "credential_pool"
+
+
 def test_resolve_codex_runtime_credentials_pool_fallback_no_usable_entry(tmp_path, monkeypatch):
     """When both singleton and pool are empty/unusable, the original AuthError propagates."""
     hermes_home = tmp_path / "hermes"

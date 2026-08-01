@@ -15,10 +15,22 @@ import time
 from types import SimpleNamespace
 
 
+def _use_config_home(tmp_path, monkeypatch, *, managed_dir=None):
+    """Point the effective config loader at this test's isolated files."""
+    from hermes_cli.config import invalidate_config_caches
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if managed_dir is None:
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    invalidate_config_caches(tmp_path / "config.yaml")
+
+
 def test_refresh_fallback_model_rereads_config(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
 
-    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    _use_config_home(tmp_path, monkeypatch)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         "fallback_providers:\n"
@@ -51,7 +63,7 @@ def test_refresh_fallback_model_rereads_config(tmp_path, monkeypatch):
 def test_refresh_fallback_model_clears_when_config_removed(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
 
-    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    _use_config_home(tmp_path, monkeypatch)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         "fallback_providers:\n"
@@ -79,7 +91,7 @@ def test_refresh_fallback_model_keeps_last_known_good_on_read_failure(
     that genuinely lacks the key clears it."""
     from gateway.run import GatewayRunner
 
-    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    _use_config_home(tmp_path, monkeypatch)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         "fallback_providers:\n"
@@ -219,10 +231,10 @@ def test_background_and_main_agent_paths_call_refresh():
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
-    """_load_fallback_model remains a pure static reader used by refresh."""
+    """_load_fallback_model remains an effective-config reader used by refresh."""
     from gateway.run import GatewayRunner
 
-    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    _use_config_home(tmp_path, monkeypatch)
     (tmp_path / "config.yaml").write_text(
         "fallback_providers:\n"
         "  - provider: deepseek\n"
@@ -237,3 +249,32 @@ def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
         {"provider": "deepseek", "model": "deepseek-v4-flash"},
         {"provider": "nous", "model": "Hermes-4"},
     ]
+
+
+def test_managed_empty_fallback_chain_masks_stale_raw_chain(tmp_path, monkeypatch):
+    """Managed fail-closed policy must win during gateway refresh, not just boot."""
+    from gateway.run import GatewayRunner
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: anthropic\n"
+        "    model: claude-opus-4-8\n"
+        "fallback_model:\n"
+        "  provider: anthropic\n"
+        "  model: claude-opus-4-8\n"
+    )
+    (managed / "config.yaml").write_text(
+        "fallback_providers: []\nfallback_model: []\n"
+    )
+    _use_config_home(tmp_path, monkeypatch, managed_dir=managed)
+
+    runner = SimpleNamespace(
+        _fallback_model=[{"provider": "anthropic", "model": "claude-opus-4-8"}]
+    )
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    assert GatewayRunner._load_fallback_model() is None
+    assert bound() is None
+    assert runner._fallback_model is None
