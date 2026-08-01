@@ -3937,6 +3937,11 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
+            # A pool entry without an active cooldown can still hold an expired
+            # JWT (for example after a failed refresh). Never hand that token to
+            # a new child and let the provider reject it after construction.
+            if _codex_access_token_is_expiring(token, 0):
+                return False
             # Skip entries currently in an exhaustion cooldown window.
             reset_at = entry.get("last_error_reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():

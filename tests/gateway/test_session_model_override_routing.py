@@ -66,6 +66,14 @@ def _make_runner():
     return runner
 
 
+def _use_effective_config_home(tmp_path, monkeypatch):
+    from hermes_cli.config import invalidate_config_caches
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    invalidate_config_caches(tmp_path / "config.yaml")
+
+
 def _codex_override():
     return {
         "model": "gpt-5.4",
@@ -184,7 +192,7 @@ fallback_providers:
 """.lstrip(),
         encoding="utf-8",
     )
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _use_effective_config_home(tmp_path, monkeypatch)
 
     def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
         if requested in {None, "", "openai-codex"}:
@@ -232,7 +240,7 @@ fallback_providers:
 """.lstrip(),
         encoding="utf-8",
     )
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _use_effective_config_home(tmp_path, monkeypatch)
     monkeypatch.setenv("MY_FALLBACK_KEY", "env-secret")
 
     def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
@@ -260,4 +268,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

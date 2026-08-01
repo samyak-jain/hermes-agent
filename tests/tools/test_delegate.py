@@ -842,6 +842,34 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_failed_child_with_error_prose_is_not_reported_completed(self):
+        """Provider error text is diagnostic output, not a successful result."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "API credit balance is too low",
+                "completed": False,
+                "failed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test failed child", parent_agent=parent)
+            )
+            entry = result["results"][0]
+
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "failed")
+            self.assertEqual(entry["summary"], "API credit balance is too low")
+
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""
         parent = _make_mock_parent(depth=0)
@@ -3386,7 +3414,7 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 
 
 class TestFallbackModelInheritance(unittest.TestCase):
-    """Subagents must inherit the parent's fallback provider chain."""
+    """Subagents inherit fallback only while inheriting the parent provider."""
 
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
@@ -3426,6 +3454,33 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 max_iterations=10,
                 parent_agent=parent,
                 task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
+
+    def test_explicit_provider_does_not_inherit_parent_fallback(self):
+        """A pinned child route must fail closed instead of changing provider."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "anthropic", "model": "claude-opus-4-8"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test pinned route",
+                context=None,
+                toolsets=None,
+                model="gpt-5.6-sol",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="openai-codex",
+                override_base_url="https://chatgpt.com/backend-api/codex",
+                override_api_key="codex-token",
+                override_api_mode="codex_responses",
             )
 
         _, kwargs = MockAgent.call_args
