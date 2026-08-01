@@ -125,7 +125,10 @@ SUPPORTED_POOL_STRATEGIES = {
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# Provider-supplied reset_at timestamps override these defaults except for
+# 429s. A 429 reset deadline is advisory: quota can be reset externally before
+# that timestamp, so never let one response suppress all provider probes for
+# longer than the bounded local TTL.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
@@ -386,6 +389,17 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
     if reset_at is not None:
+        if entry.last_error_code == 429:
+            # A provider's quota window is not authoritative state. Plan
+            # upgrades, administrative resets, and rolling-window recovery can
+            # make capacity available before the advertised reset timestamp.
+            # Re-probe at least hourly while retaining reset_at for diagnostics.
+            if not entry.last_status_at:
+                return time.time()
+            return min(
+                reset_at,
+                entry.last_status_at + EXHAUSTED_TTL_429_SECONDS,
+            )
         return reset_at
     if entry.last_status_at:
         return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
