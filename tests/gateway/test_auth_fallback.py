@@ -5,6 +5,14 @@ from unittest.mock import patch
 import pytest
 
 
+def _use_effective_config_home(tmp_path, monkeypatch):
+    from hermes_cli.config import invalidate_config_caches
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    invalidate_config_caches(tmp_path / "config.yaml")
+
+
 class TestResolveRuntimeAgentKwargsAuthFallback:
     """_resolve_runtime_agent_kwargs should try fallback on AuthError."""
 
@@ -20,7 +28,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             "  model: meta-llama/llama-4-maverick\n"
         )
 
-        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        _use_effective_config_home(tmp_path, monkeypatch)
 
         call_count = {"n": 0}
 
@@ -61,7 +69,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         config_path = tmp_path / "config.yaml"
         config_path.write_text("model:\n  provider: openai-codex\n")
 
-        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        _use_effective_config_home(tmp_path, monkeypatch)
 
         with patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -83,7 +91,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             "  model: Hermes-4\n"
         )
 
-        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        _use_effective_config_home(tmp_path, monkeypatch)
 
         calls = []
 
