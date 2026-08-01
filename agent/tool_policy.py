@@ -128,6 +128,32 @@ def policy_from_config(config: Mapping[str, Any] | None) -> ToolAccessPolicy:
     return parse_tool_policy(raw, source="agent.tool_policy")
 
 
+def deny_tools(
+    policy: ToolAccessPolicy,
+    names: Iterable[str],
+    *,
+    source: str,
+) -> ToolAccessPolicy:
+    """Return ``policy`` narrowed by an exact-name deny set.
+
+    This is an intersection, never an elevation: allowlists lose the named
+    tools, denylists gain them, and unrestricted/legacy policies become a
+    denylist. Invalid policies remain invalid and fail closed.
+    """
+    denied = frozenset(str(name).strip() for name in names if str(name).strip())
+    if not denied or not policy.valid:
+        return policy
+    if policy.mode == "allowlist":
+        return ToolAccessPolicy(
+            mode="allowlist",
+            allowed_names=policy.allowed_names - denied,
+            source=source,
+        )
+    if policy.mode == "denylist":
+        denied = policy.denied_names | denied
+    return ToolAccessPolicy(mode="denylist", denied_names=denied, source=source)
+
+
 def filter_tool_definitions(definitions: Iterable[dict], policy: ToolAccessPolicy) -> list[dict]:
     return [
         definition

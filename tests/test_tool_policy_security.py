@@ -7,6 +7,7 @@ from agent.tool_policy import (
     ToolAccessPolicy,
     allowed_tool_names_for_dispatch,
     authorize_agent_tool,
+    deny_tools,
     parse_tool_policy,
 )
 from model_tools import get_tool_definitions, handle_function_call
@@ -54,6 +55,43 @@ def test_invalid_policy_fails_closed():
     typo = parse_tool_policy({"mode": "unrestricted", "toolz": []}, source="test")
     assert not typo.valid
     assert not typo.allows("terminal")
+
+
+def test_deny_tools_narrows_every_valid_policy_mode():
+    unrestricted = deny_tools(
+        ToolAccessPolicy(mode="unrestricted", source="channel"),
+        {"cronjob"},
+        source="automated",
+    )
+    assert unrestricted.allows("terminal")
+    assert not unrestricted.allows("cronjob")
+
+    allowlist = deny_tools(
+        ToolAccessPolicy(
+            mode="allowlist",
+            allowed_names=frozenset({"cronjob", "terminal"}),
+            source="channel",
+        ),
+        {"cronjob"},
+        source="automated",
+    )
+    assert allowlist.allowed_names == frozenset({"terminal"})
+
+    denylist = deny_tools(
+        ToolAccessPolicy(
+            mode="denylist",
+            denied_names=frozenset({"dangerous"}),
+            source="channel",
+        ),
+        {"cronjob"},
+        source="automated",
+    )
+    assert denylist.denied_names == frozenset({"dangerous", "cronjob"})
+
+
+def test_deny_tools_preserves_invalid_fail_closed_policy():
+    invalid = parse_tool_policy({"mode": "invalid"}, source="broken")
+    assert deny_tools(invalid, {"cronjob"}, source="automated") is invalid
 
 
 def test_late_injected_allowlist_tool_is_checked_only_after_all_injections():

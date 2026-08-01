@@ -13614,6 +13614,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                automated_trigger=str(
+                    (event.metadata or {}).get("automated_trigger") or ""
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -19489,6 +19492,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        automated_trigger: str = "",
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19507,6 +19511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                automated_trigger=automated_trigger,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19518,6 +19523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                automated_trigger=automated_trigger,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19639,6 +19645,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        automated_trigger: str = "",
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19676,6 +19683,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         tool_policy = _resolve_tool_policy_for_source(user_config, source)
+        if automated_trigger == "cron_result":
+            from agent.tool_policy import deny_tools
+
+            # A routed cron completion is untrusted automation entering an
+            # otherwise interactive session. It may perform useful follow-up
+            # work, but it must not mutate the scheduler that invoked it.
+            tool_policy = deny_tools(
+                tool_policy,
+                {"cronjob"},
+                source="gateway.cron_result",
+            )
         _profile_terminal_registered = False
         _profile_name = str(source.profile or self._active_profile_name() or "default")
         _profile_terminal_cfg = (
@@ -22750,6 +22768,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    automated_trigger=(
+                        str(
+                            (getattr(pending_event, "metadata", None) or {}).get(
+                                "automated_trigger"
+                            )
+                            or ""
+                        )
+                        if pending_event is not None
+                        else ""
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
