@@ -251,6 +251,34 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_with_operator_supplied_stable_id(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Restore managed job",
+            schedule="every 1h",
+            job_id="494259113bd4",
+        )
+
+        assert job["id"] == "494259113bd4"
+        assert get_job("494259113bd4")["name"] == "Restore managed job"
+
+    @pytest.mark.parametrize(
+        "job_id",
+        ["", "ABCDEF123456", "../escape000", "too-short", "12345678901g"],
+    )
+    def test_create_rejects_invalid_operator_supplied_id(
+        self, tmp_cron_dir, job_id
+    ):
+        with pytest.raises(ValueError, match="12 lowercase hexadecimal"):
+            create_job(prompt="Bad ID", schedule="every 1h", job_id=job_id)
+
+    def test_create_rejects_duplicate_operator_supplied_id(self, tmp_cron_dir):
+        create_job(prompt="First", schedule="every 1h", job_id="494259113bd4")
+
+        with pytest.raises(ValueError, match="already exists"):
+            create_job(prompt="Second", schedule="every 1h", job_id="494259113bd4")
+
+        assert [job["prompt"] for job in list_jobs()] == ["First"]
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")

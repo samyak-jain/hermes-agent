@@ -1135,6 +1135,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     agent_respond: Optional[bool] = None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1184,6 +1185,9 @@ def create_job(
                 agent can review it and respond automatically. Requires a live
                 gateway at fire time; delivery falls back to the normal cron
                 message path when the origin session cannot be reached.
+        job_id: Optional stable 12-character lowercase hexadecimal ID for an
+                operator-controlled restore/import. Ordinary callers should
+                omit it and receive a generated ID. Duplicate IDs fail closed.
 
     Returns:
         The created job dict
@@ -1202,7 +1206,14 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
-    job_id = uuid.uuid4().hex[:12]
+    if job_id is not None:
+        job_id = str(job_id).strip()
+        if re.fullmatch(r"[0-9a-f]{12}", job_id) is None:
+            raise ValueError(
+                "job_id must be exactly 12 lowercase hexadecimal characters"
+            )
+    else:
+        job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
@@ -1320,6 +1331,8 @@ def create_job(
 
     with _jobs_lock():
         jobs = load_jobs()
+        if any(existing.get("id") == job_id for existing in jobs):
+            raise ValueError(f"cron job ID {job_id!r} already exists")
         jobs.append(job)
         save_jobs(jobs)
 
