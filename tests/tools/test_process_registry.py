@@ -774,7 +774,7 @@ class TestSpawnEnvSanitization:
         # remains retrievable so process(wait/log) can explain the failure.
         assert session.id not in registry._running
         assert registry.get(session.id) is session
-        waited = registry.wait(session.id, timeout=0)
+        waited = registry.wait(session.id, timeout=1)
         assert waited["status"] == "exited"
         assert waited["exit_code"] == 2
         assert waited["completion_reason"] == "failed_start"

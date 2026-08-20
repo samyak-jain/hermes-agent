@@ -18180,10 +18180,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else None
             )
             async def _do_reset():
-                return await self._handle_reset_command(
-                    event,
-                    idempotency_key=_reset_idempotency_key,
-                )
+                if _reset_idempotency_key is not None:
+                    return await self._handle_reset_command(
+                        event,
+                        idempotency_key=_reset_idempotency_key,
+                    )
+                return await self._handle_reset_command(event)
             return await self._maybe_confirm_destructive_slash(
                 event=event,
                 command="new",

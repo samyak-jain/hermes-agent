@@ -2922,13 +2922,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._missed_message_backfill_task
             except asyncio.CancelledError:
                 pass
-        if (
-            self._missed_message_backfill_retry_task
-            and not self._missed_message_backfill_retry_task.done()
-        ):
-            self._missed_message_backfill_retry_task.cancel()
+        backfill_retry_task = getattr(
+            self, "_missed_message_backfill_retry_task", None
+        )
+        if backfill_retry_task and not backfill_retry_task.done():
+            backfill_retry_task.cancel()
             try:
-                await self._missed_message_backfill_retry_task
+                await backfill_retry_task
             except asyncio.CancelledError:
                 pass
 
@@ -2939,15 +2939,21 @@ class DiscordAdapter(BasePlatformAdapter):
         self._liveness_task = None
         self._missed_message_backfill_task = None
         self._missed_message_backfill_retry_task = None
-        self._discord_recovery_barrier.set()
-        for waiter in self._discord_recovery_waiters.values():
+        recovery_barrier = getattr(self, "_discord_recovery_barrier", None)
+        if recovery_barrier is not None:
+            recovery_barrier.set()
+        recovery_waiters = getattr(self, "_discord_recovery_waiters", {})
+        for waiter in recovery_waiters.values():
             if not waiter.done():
                 waiter.cancel()
-        self._discord_recovery_waiters.clear()
-        heartbeat_tasks = list(
-            dict.fromkeys(self._discord_recovery_claim_heartbeats.values())
+        recovery_waiters.clear()
+        recovery_heartbeats = getattr(
+            self, "_discord_recovery_claim_heartbeats", {}
         )
-        self._discord_recovery_claim_heartbeats.clear()
+        heartbeat_tasks = list(
+            dict.fromkeys(recovery_heartbeats.values())
+        )
+        recovery_heartbeats.clear()
         for task in heartbeat_tasks:
             task.cancel()
         if heartbeat_tasks:

@@ -7851,7 +7851,6 @@ def tick(
                 fut = pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
-                _clear_run_claim_best_effort()
                 dispatch_error = f"Executor dispatch failed: {submit_err}"
                 finish_execution(
                     execution["id"],
@@ -7875,9 +7874,17 @@ def tick(
                         dispatch_error,
                         expected_run_claim=expected_run_claim,
                     )
+                    # ``get_due_jobs`` normally returns the freshly stamped
+                    # one-shot claim, allowing the generation-checked helper
+                    # above to clear it atomically. Preserve upstream's
+                    # best-effort cleanup for legacy/manual due-job producers
+                    # that omit the claim from their returned job shape.
+                    if expected_run_claim is None:
+                        _clear_run_claim_best_effort()
                 except Exception:
                     logger.exception(
-                        "Job '%s': failed to persist executor dispatch error",
+                        "Job '%s': failed to persist executor dispatch error; "
+                        "run claim will expire at TTL",
                         job.get("name", job_id),
                     )
                 # Interpreter began finalizing between the guard above and the

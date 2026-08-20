@@ -1654,22 +1654,10 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
 
 def _load_effective_snapshot_config() -> Dict[str, Any]:
     """Load agent-owned plus managed config for cron inference snapshots."""
-    import yaml
-    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.config import load_config_readonly
 
-    cfg: Dict[str, Any] = {}
-    cfg_path = get_hermes_home() / "config.yaml"
-    if cfg_path.exists():
-        with cfg_path.open(encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    try:
-        from hermes_cli import managed_scope
-
-        cfg = managed_scope.apply_managed_overlay(cfg)
-    except Exception:
-        pass
-    expanded = _expand_env_vars(cfg)
-    return expanded if isinstance(expanded, dict) else {}
+    cfg = load_config_readonly()
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def _resolve_profile_snapshot_config() -> Dict[str, Any]:

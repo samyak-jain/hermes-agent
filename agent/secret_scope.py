@@ -321,14 +321,16 @@ def build_profile_secret_scope(
     ``.env`` files. A profile's external-secret snapshot is populated by
     ``hydrate_profile_secret_sources`` before this helper is called.
 
-    A profile-local ``.env`` remains supported and wins over the host mapping.
+    A profile-local ``.env`` remains supported as the baseline. Hydrated
+    external-secret values override matching placeholders from that file, and
+    an explicitly namespaced profile credential is the most specific source.
     Genuinely global vars need not be copied because ``get_secret`` reads them
     directly from ``os.environ``.
     """
     home = Path(hermes_home)
     explicit_profile = profile_name is not None
     name = str(profile_name or _profile_name_from_home(home))
-    secrets: Dict[str, str] = {}
+    secrets: Dict[str, str] = load_env_file(home / ".env")
     if name == "default" and explicit_profile:
         secrets.update(
             {
@@ -361,5 +363,4 @@ def build_profile_secret_scope(
                 if key.startswith(prefix) and len(key) > len(prefix)
             }
         )
-    secrets.update(load_env_file(home / ".env"))
     return secrets
