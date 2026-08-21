@@ -4165,3 +4165,68 @@ async def test_age_bound_does_not_cross_active_claim(adapter, caplog):
     assert adapter._discord_recovery_cursor("123") == str(old_cursor)
     assert "age boundary" in caplog.text
     assert "deferred behind active durable work" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_age_bound_abandons_stale_failed_receipt(adapter):
+    channel = FakeChannel(channel_id=123)
+    old_id = str(
+        _snowflake_at(datetime.now(timezone.utc) - dt.timedelta(days=2))
+    )
+    adapter._record_discord_message_seen(
+        make_message(message_id=int(old_id), channel=channel),
+        status="discovered",
+    )
+    stale = (datetime.now(timezone.utc) - dt.timedelta(days=2)).isoformat()
+    adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "UPDATE discord_messages SET status='failed', updated_at=?, "
+            "last_attempt_at=? WHERE message_id=?",
+            (stale, stale, old_id),
+        )
+    )
+    adapter._advance_discord_recovery_cursor("123", str(int(old_id) - 1))
+
+    messages = [
+        message
+        async for message in adapter._iter_channel_and_thread_messages(
+            channel,
+            limit=10,
+            after=datetime.now(timezone.utc) - dt.timedelta(minutes=5),
+            seen_channels=set(),
+        )
+    ]
+
+    assert messages == []
+    row = adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT status FROM discord_messages WHERE message_id=?",
+            (old_id,),
+        ).fetchone()
+    )
+    assert row == ("abandoned",)
+    assert int(adapter._discord_recovery_cursor("123")) > int(old_id)
+
+
+@pytest.mark.asyncio
+async def test_scan_failure_keeps_barrier_closed_and_schedules_retry(
+    adapter,
+    monkeypatch,
+):
+    scheduled = MagicMock()
+    monkeypatch.setattr(
+        adapter,
+        "_known_missed_message_backfill_channels",
+        AsyncMock(side_effect=RuntimeError("history unavailable")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_discord_recovery_retry",
+        scheduled,
+    )
+    adapter._discord_recovery_barrier.set()
+
+    await adapter._run_missed_message_backfill()
+
+    assert adapter._discord_recovery_barrier.is_set() is False
+    scheduled.assert_called_once_with(1.0)

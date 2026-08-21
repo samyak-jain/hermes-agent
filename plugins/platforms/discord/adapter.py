@@ -3465,9 +3465,11 @@ class DiscordAdapter(BasePlatformAdapter):
         scanned = 0
         missed = 0
         retry_delays: list[float] = []
+        scan_completed = False
         try:
             if not self._client:
                 return
+            self._discord_recovery_barrier.clear()
             # GatewayRunner queues normal inbound events while restoring active
             # sessions and returns before those queued turns execute. Backfill
             # must wait for that gate to open or it could persist a cursor for
@@ -3486,6 +3488,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "[%s] Missed-message recovery aborted: durable ledger unavailable",
                     self.name,
                 )
+                retry_delays.append(1.0)
                 return
             scan_id = await asyncio.to_thread(
                 self._record_recovery_scan_start,
@@ -3504,6 +3507,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     missed=0,
                     dispatched=0,
                 )
+                scan_completed = True
                 return
 
             by_channel: Dict[str, List[Any]] = defaultdict(list)
@@ -3893,6 +3897,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 missed=missed,
                 dispatched=dispatched,
             )
+            scan_completed = True
             logger.info(
                 "[%s] Missed-message backfill complete: scanned=%d missed=%d dispatched=%d",
                 self.name,
@@ -3923,11 +3928,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     error=str(exc),
                 )
             logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
+            retry_delays.append(1.0)
         finally:
             # Never strand live Discord callbacks if discovery itself fails.
             # Failed channels retain their old cursor, and failed message IDs
             # are released, so the next reconnect retries them.
-            self._discord_recovery_barrier.set()
+            if scan_completed or self._disconnecting:
+                self._discord_recovery_barrier.set()
             if retry_delays and not self._disconnecting:
                 self._schedule_discord_recovery_retry(min(retry_delays))
 
@@ -4046,6 +4053,41 @@ class DiscordAdapter(BasePlatformAdapter):
             exponent = 0
         return min(600.0, 15.0 * (2**exponent))
 
+    def _abandon_expired_discord_recovery_receipts(
+        self,
+        channel_id: str,
+    ) -> int:
+        from gateway.delivery_ledger import (
+            MAX_ATTEMPTS,
+            STALE_AFTER_SECONDS,
+        )
+
+        cutoff = (
+            dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(seconds=STALE_AFTER_SECONDS)
+        ).isoformat()
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            cursor = conn.execute(
+                """
+                UPDATE discord_messages
+                   SET status='abandoned',
+                       claim_owner=NULL,
+                       updated_at=?
+                 WHERE channel_id=?
+                   AND status IN ('failed', 'cancelled')
+                   AND (
+                       attempts >= ?
+                       OR COALESCE(last_attempt_at, created_at, updated_at) < ?
+                   )
+                """,
+                (now, channel_id, MAX_ATTEMPTS, cutoff),
+            )
+            return int(cursor.rowcount or 0)
+
+        return int(self._with_discord_recovery_db(_op, default=0) or 0)
+
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
             return
@@ -4098,6 +4140,18 @@ class DiscordAdapter(BasePlatformAdapter):
             seconds=self._missed_message_backfill_window_seconds()
         )
         cutoff_snowflake = _snowflake_at(cutoff)
+        abandoned = await asyncio.to_thread(
+            self._abandon_expired_discord_recovery_receipts,
+            channel_key,
+        )
+        if abandoned:
+            logger.warning(
+                "[%s] Abandoned %d exhausted Discord recovery receipt(s) "
+                "in channel %s",
+                self.name,
+                abandoned,
+                channel_key,
+            )
         cursor = await asyncio.to_thread(
             self._discord_recovery_cursor,
             channel_key,
