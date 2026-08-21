@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugins.browser.browserbase.provider import BrowserbaseBrowserProvider
+from plugins.browser.browserbase import provider as browserbase_provider
+from plugins.browser.browserbase.provider import (
+    BrowserbaseBrowserProvider,
+    BrowserbaseContextBusyError,
+)
 
 
 def _response(payload: dict, status_code: int = 201):
@@ -213,3 +217,100 @@ def test_corrupt_context_cache_fails_without_creating_new_identity(
         BrowserbaseBrowserProvider().create_session("task")
 
     assert post_calls == []
+
+
+def test_busy_persistent_context_times_out_with_actionable_error(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    _configure(
+        monkeypatch,
+        tmp_path,
+        BROWSERBASE_CONTEXT_ID="context-busy",
+        BROWSERBASE_PROXIES="false",
+    )
+    monkeypatch.setattr(browserbase_provider, "_CONTEXT_LEASE_TIMEOUT_SECONDS", 0.01)
+    post_calls = []
+    monkeypatch.setattr(
+        browserbase_provider.requests,
+        "post",
+        lambda *args, **kwargs: post_calls.append((args, kwargs)),
+    )
+    provider = BrowserbaseBrowserProvider()
+    lease = provider._context_session_lock("context-busy")
+    lease.acquire()
+    try:
+        with pytest.raises(BrowserbaseContextBusyError, match="Close that browser task"):
+            provider.create_session("second-task")
+    finally:
+        lease.release()
+
+    assert "waiting up to" in caplog.text
+    assert post_calls == []
+
+
+class _RacingProvider:
+    def __init__(self, browser_tool, *, inject_winner: bool = False) -> None:
+        self.browser_tool = browser_tool
+        self.inject_winner = inject_winner
+        self.closed = []
+        self.emergency = []
+
+    def create_session(self, task_id):
+        if self.inject_winner:
+            self.browser_tool._active_sessions[task_id] = {
+                "session_name": "winner",
+                "bb_session_id": "winner-id",
+            }
+        return {
+            "session_name": "orphan",
+            "bb_session_id": "orphan-id",
+            "cdp_url": "https://discovery.example",
+        }
+
+    def close_session(self, session_id):
+        self.closed.append(session_id)
+        return True
+
+    def emergency_cleanup(self, session_id):
+        self.emergency.append(session_id)
+
+
+def _isolate_browser_session_creation(monkeypatch):
+    from tools import browser_tool
+
+    monkeypatch.setattr(browser_tool, "_active_sessions", {})
+    monkeypatch.setattr(browser_tool, "_session_last_activity", {})
+    monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda task_id: None)
+    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+    return browser_tool
+
+
+def test_cdp_resolution_failure_closes_created_cloud_session(monkeypatch) -> None:
+    browser_tool = _isolate_browser_session_creation(monkeypatch)
+    provider = _RacingProvider(browser_tool)
+    monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+    monkeypatch.setattr(
+        browser_tool,
+        "_resolve_cdp_override",
+        lambda url: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+    )
+
+    result = browser_tool._get_session_info("task")
+
+    assert result["fallback_from_cloud"] is True
+    assert provider.closed == ["orphan-id"]
+    assert provider.emergency == []
+
+
+def test_double_check_drop_closes_created_cloud_session(monkeypatch) -> None:
+    browser_tool = _isolate_browser_session_creation(monkeypatch)
+    provider = _RacingProvider(browser_tool, inject_winner=True)
+    monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+    monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda url: url)
+
+    result = browser_tool._get_session_info("task")
+
+    assert result["session_name"] == "winner"
+    assert provider.closed == ["orphan-id"]
+    assert provider.emergency == []
