@@ -10,6 +10,7 @@ import {
   mcpServer,
   promptForTurn,
   systemPromptForThread,
+  toolCallIdFromMcpExtra,
   titleForThread,
 } from "./turn.js";
 
@@ -54,6 +55,84 @@ test("one prompt tier does not add an unnecessary cache boundary", () => {
 test("runtime MCP tools do not add a redundant instructions message", () => {
   const server = mcpServer({} as never, thread(), "turn-1");
   assert.equal((server.instance.server as any)._instructions, undefined);
+});
+
+test("runtime MCP tools preserve Claude's provider tool_use ID", async () => {
+  let resolveToolRequest!: (params: Record<string, unknown>) => void;
+  const toolRequest = new Promise<Record<string, unknown>>((resolve) => {
+    resolveToolRequest = resolve;
+  });
+  const rpc = {
+    request: async (_method: string, params: Record<string, unknown>) => {
+      resolveToolRequest(params);
+      return { content: "ok" };
+    },
+  };
+  const server = mcpServer(
+    rpc as never,
+    thread({
+      tools: [
+        {
+          name: "probe",
+          description: "identity probe",
+          inputSchema: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+          },
+        },
+      ],
+    }),
+    "turn-1",
+  );
+  const sent: unknown[] = [];
+  const transport: any = {
+    async start() {},
+    async send(message: unknown) {
+      sent.push(message);
+    },
+    async close() {},
+  };
+  await server.instance.connect(transport);
+  transport.onmessage({
+    jsonrpc: "2.0",
+    id: 7,
+    method: "tools/call",
+    params: {
+      name: "probe",
+      arguments: { value: "x" },
+      _meta: {
+        "claudecode/toolUseId": "toolu_provider_identity_123",
+        progressToken: 2,
+      },
+    },
+  });
+
+  assert.deepEqual(await toolRequest, {
+    threadId: "thr_test",
+    turnId: "turn-1",
+    toolCallId: "toolu_provider_identity_123",
+    name: "probe",
+    arguments: { value: "x" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((sent.at(-1) as any)?.id, 7);
+  await server.instance.close();
+});
+
+test("provider tool_use ID extraction fails closed on malformed metadata", () => {
+  assert.equal(toolCallIdFromMcpExtra(undefined), undefined);
+  assert.equal(toolCallIdFromMcpExtra({ _meta: {} }), undefined);
+  assert.equal(
+    toolCallIdFromMcpExtra({ _meta: { "claudecode/toolUseId": 7 } }),
+    undefined,
+  );
+  assert.equal(
+    toolCallIdFromMcpExtra({
+      _meta: { "claudecode/toolUseId": "toolu_provider_identity_123" },
+    }),
+    "toolu_provider_identity_123",
+  );
 });
 
 test("new SDK sessions skip automatic model-generated titles", () => {

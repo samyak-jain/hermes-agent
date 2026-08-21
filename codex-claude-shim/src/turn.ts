@@ -25,6 +25,20 @@ interface ToolItem {
   item: Record<string, unknown>;
 }
 
+const CLAUDE_CODE_TOOL_USE_ID_META = "claudecode/toolUseId";
+
+export function toolCallIdFromMcpExtra(extra: unknown): string | undefined {
+  if (typeof extra !== "object" || extra === null) return undefined;
+  const meta = (extra as { _meta?: unknown })._meta;
+  if (typeof meta !== "object" || meta === null) return undefined;
+  const toolUseId = (meta as Record<string, unknown>)[
+    CLAUDE_CODE_TOOL_USE_ID_META
+  ];
+  return typeof toolUseId === "string" && toolUseId.length > 0
+    ? toolUseId
+    : undefined;
+}
+
 export function titleForThread(thread: ThreadState): string | undefined {
   // Hermes owns its user-visible titles. A fixed local Claude-session title
   // prevents the SDK from spending a separate model request summarizing the
@@ -69,13 +83,20 @@ function hostToolDefinition(
     definition.name,
     definition.description ?? "",
     jsonSchemaShape(definition.inputSchema ?? {}),
-    async (arguments_: Record<string, unknown>) => {
+    async (arguments_: Record<string, unknown>, extra: unknown) => {
+      // Claude Code attaches the provider's tool_use block ID to the MCP
+      // request metadata. Preserve it across the host callback so streamed
+      // tool-use events and execution/results share one unambiguous identity.
+      // The fallback keeps compatibility with custom MCP callers that do not
+      // originate from Claude Code; it is not used to correlate provider calls.
+      const toolCallId =
+        toolCallIdFromMcpExtra(extra) ?? `tool_${randomUUID()}`;
       const response = await rpc.request<{ content?: string; isError?: boolean }>(
         "agent/tool/call",
         {
           threadId: thread.threadId,
           turnId,
-          toolCallId: `tool_${randomUUID()}`,
+          toolCallId,
           name: definition.name,
           arguments: arguments_,
         },
