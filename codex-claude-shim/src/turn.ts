@@ -49,7 +49,7 @@ export function handleSystemMessage(
   if (message.subtype === "init" && message.session_id) {
     threads.bindClaudeSession(thread, message.session_id);
   }
-  return false;
+  return message.subtype === "compact_boundary";
 }
 
 export function promptForTurn(thread: ThreadState, userText: string): {
@@ -124,16 +124,25 @@ function renderToolResult(content: unknown): string {
   return content == null ? "" : JSON.stringify(content);
 }
 
-function usageFromResult(result: any): { usage: Usage; contextWindow?: number } {
-  const raw = result?.usage ?? {};
+export function usageFromSdkMessage(raw: any): Usage {
   const usage: Usage = {
     inputTokens: Number(raw.input_tokens ?? 0),
     cachedInputTokens: Number(raw.cache_read_input_tokens ?? 0),
+    cacheCreationInputTokens: Number(raw.cache_creation_input_tokens ?? 0),
     outputTokens: Number(raw.output_tokens ?? 0),
     reasoningOutputTokens: 0,
     totalTokens: 0,
   };
-  usage.totalTokens = usage.inputTokens + usage.cachedInputTokens + usage.outputTokens;
+  usage.totalTokens =
+    usage.inputTokens +
+    usage.cachedInputTokens +
+    usage.cacheCreationInputTokens +
+    usage.outputTokens;
+  return usage;
+}
+
+export function usageFromResult(result: any): { usage: Usage; contextWindow?: number } {
+  const usage = usageFromSdkMessage(result?.usage ?? {});
   const modelUsage = Object.values(result?.modelUsage ?? {}) as any[];
   const contextWindow = modelUsage.find((entry) => Number(entry?.contextWindow) > 0)
     ?.contextWindow;
@@ -143,9 +152,24 @@ function usageFromResult(result: any): { usage: Usage; contextWindow?: number } 
 function addUsage(total: Usage, last: Usage): void {
   total.inputTokens += last.inputTokens;
   total.cachedInputTokens += last.cachedInputTokens;
+  total.cacheCreationInputTokens += last.cacheCreationInputTokens;
   total.outputTokens += last.outputTokens;
   total.reasoningOutputTokens += last.reasoningOutputTokens;
   total.totalTokens += last.totalTokens;
+}
+
+export function tokenUsageForTurn(
+  aggregate: Usage,
+  lastAssistant: Usage | undefined,
+  total: Usage,
+  modelContextWindow?: number,
+) {
+  return {
+    last: lastAssistant,
+    turn: aggregate,
+    total,
+    modelContextWindow,
+  };
 }
 
 export async function runTurn(options: {
@@ -155,13 +179,24 @@ export async function runTurn(options: {
   turnId: string;
   userText: string;
   compaction?: boolean;
+  queryFn?: typeof query;
 }): Promise<TurnResult> {
-  const { rpc, threads, thread, turnId, userText, compaction = false } = options;
+  const {
+    rpc,
+    threads,
+    thread,
+    turnId,
+    userText,
+    compaction = false,
+    queryFn = query,
+  } = options;
   const threadId = thread.threadId;
   const turnPrompt = promptForTurn(thread, userText);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
   let currentMessageItem: string | undefined;
+  let lastAssistantUsage: Usage | undefined;
+  let sawCompactBoundary = false;
 
   const sdkOptions: Options = {
     cwd: thread.cwd,
@@ -189,7 +224,7 @@ export async function runTurn(options: {
     stderr: (data) => process.stderr.write(data),
   };
 
-  const runningQuery = query({ prompt: turnPrompt.prompt, options: sdkOptions });
+  const runningQuery = queryFn({ prompt: turnPrompt.prompt, options: sdkOptions });
   thread.activeTurn = { turnId, query: runningQuery, abort };
   rpc.notify("turn/started", { threadId, turn: { id: turnId } });
 
@@ -198,7 +233,8 @@ export async function runTurn(options: {
     for await (const message of runningQuery as AsyncIterable<SDKMessage>) {
       switch (message.type) {
         case "system":
-          handleSystemMessage(threads, thread, message);
+          sawCompactBoundary =
+            handleSystemMessage(threads, thread, message) || sawCompactBoundary;
           break;
         case "stream_event": {
           const event: any = (message as any).event;
@@ -224,6 +260,9 @@ export async function runTurn(options: {
           break;
         }
         case "assistant":
+          if ((message as any).message?.usage) {
+            lastAssistantUsage = usageFromSdkMessage((message as any).message.usage);
+          }
           for (const block of (message as any).message?.content ?? []) {
             if (block.type === "text") {
               const itemId = currentMessageItem ?? `item_${randomUUID()}`;
@@ -304,6 +343,7 @@ export async function runTurn(options: {
       : { status: "failed", error: error?.message ?? String(error) };
   } finally {
     thread.activeTurn = undefined;
+    rpc.rejectPendingOutboundForTurn(turnId, "turn aborted");
   }
 
   if (result.usage) {
@@ -311,18 +351,25 @@ export async function runTurn(options: {
     rpc.notify("thread/tokenUsage/updated", {
       threadId,
       turnId,
-      tokenUsage: {
-        last: result.usage,
-        total: thread.usageTotal,
-        modelContextWindow: result.contextWindow,
-      },
+      tokenUsage: tokenUsageForTurn(
+        result.usage,
+        lastAssistantUsage,
+        thread.usageTotal,
+        result.contextWindow,
+      ),
     });
   }
-  if (compaction && result.status === "completed") {
+  if (compaction && result.status === "completed" && sawCompactBoundary) {
     const item = { id: `item_${randomUUID()}`, type: "contextCompaction" };
     rpc.notify("item/started", { threadId, turnId, item });
     rpc.notify("item/completed", { threadId, turnId, item });
     rpc.notify("thread/compacted", { threadId, turnId });
+  } else if (compaction && result.status === "completed") {
+    result = {
+      ...result,
+      status: "failed",
+      error: "compaction completed without a compact boundary",
+    };
   }
   rpc.notify("turn/completed", {
     threadId,
