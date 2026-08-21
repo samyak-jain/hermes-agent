@@ -555,7 +555,7 @@ def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
     )
     soul = "# Soul\nBe warm, candid, and curious."
     with (
-        patch("run_agent.load_soul_md", return_value=soul),
+        patch("run_agent.load_soul_md", return_value=soul) as load_soul,
         patch("run_agent.build_environment_hints", return_value=""),
         patch(
             "run_agent.build_context_files_prompt",
@@ -581,6 +581,7 @@ def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
     assert "Model: claude-fable-5" in parts["volatile"]
     assert "Provider: anthropic" in parts["volatile"]
     assert "\n\n".join(parts.values()).count(soul) == 1
+    load_soul.assert_called_once()
     assert context_files.call_args.kwargs["skip_soul"] is True
 
 
@@ -612,11 +613,29 @@ def test_app_server_prompt_keeps_canonical_context_but_omits_native_tool_loop_bo
     assert "# Persona precedence" not in app_server["stable"]
     assert "environment" in canonical["stable"]
     assert "environment" not in app_server["stable"]
+    assert "environment" in app_server["context"]
+    assert "You have persistent memory across sessions" in app_server["context"]
+    assert "session_search" in app_server["context"]
+    assert "## Mid-turn user steering" in app_server["context"]
     assert "You run on Hermes Agent" in canonical["stable"]
     assert "You run on Hermes Agent" not in app_server["stable"]
-    assert app_server["context"] == (
-        canonical["context"]
-        + "\n\n"
-        + "## Current Session Context\n**Source:** Discord"
-    )
+    assert canonical["context"] in app_server["context"]
+    assert "## Current Session Context\n**Source:** Discord" in app_server["context"]
     assert app_server["volatile"] == canonical["volatile"]
+
+
+def test_app_server_soul_load_is_scoped_to_agent_profile(tmp_path):
+    profile_home = tmp_path / "profiles" / "worker"
+    agent = _make_agent(
+        _session_db=SimpleNamespace(db_path=profile_home / "state.db"),
+    )
+    with (
+        patch("hermes_constants.get_hermes_home_override", return_value=None),
+        patch("run_agent.load_soul_md", return_value="# Soul") as load_soul,
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        build_app_server_system_prompt_parts(agent)
+
+    load_soul.assert_called_once_with(None, home_override=profile_home)
