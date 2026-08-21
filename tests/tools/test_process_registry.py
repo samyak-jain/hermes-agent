@@ -869,19 +869,16 @@ class TestSpawnEnvSanitization:
 
     def test_fast_remote_completion_moves_once_and_notifies_once(self, registry):
         class FakeEnv:
-            def __init__(self):
-                self.responses = iter(
-                    [
-                        {"output": "benign output\n"},
-                        {"output": "1\n"},
-                        {"output": "0\n"},
-                    ]
-                )
-
             def execute(self, command, **kwargs):
                 if "nohup bash" in command:
                     return {"output": "4321\n", "returncode": 0}
-                return next(self.responses)
+                return {
+                    "output": (
+                        "HERMES_BG_EXIT=0\n"
+                        "HERMES_BG_LOG_FOLLOWS\n"
+                        "benign output\n"
+                    )
+                }
 
         captured_target = {}
 
@@ -914,15 +911,16 @@ class TestSpawnEnvSanitization:
         class FakeEnv:
             def __init__(self):
                 self.commands = []
-                self._responses = iter([
-                    {"output": "hello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
-                ])
 
             def execute(self, command, **kwargs):
                 self.commands.append((command, kwargs))
-                return next(self._responses)
+                return {
+                    "output": (
+                        "HERMES_BG_EXIT=0\n"
+                        "HERMES_BG_LOG_FOLLOWS\n"
+                        "hello\n"
+                    )
+                }
 
         env = FakeEnv()
 
@@ -936,9 +934,47 @@ class TestSpawnEnvSanitization:
                 "/path with spaces/hermes_bg.exit",
             )
 
-        assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
-        assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert len(env.commands) == 1
+        command = env.commands[0][0]
+        assert "tail -n 1 -- '/path with spaces/hermes_bg.exit'" in command
+        assert "cat '/path with spaces/hermes_bg.log'" in command
+        assert "kill -0" not in command
+
+    def test_supervised_poller_uses_one_backend_round_trip(self, registry):
+        session = _make_session(sid="proc_supervised_poll")
+        session.backend_id = "hermes-bg-test"
+        session.exited = False
+
+        class FakeEnv:
+            def __init__(self):
+                self.polls = []
+                self.released = []
+
+            def poll_background_unit(self, unit, **kwargs):
+                self.polls.append((unit, kwargs))
+                return {"output": "done\n", "running": False, "exit_code": 0}
+
+            def release_background_unit(self, unit):
+                self.released.append(unit)
+
+        env = FakeEnv()
+        session.env_ref = env
+
+        with patch("tools.process_registry.time.sleep", return_value=None), patch.object(
+            registry, "_move_to_finished"
+        ):
+            registry._env_poller_loop(
+                session,
+                env,
+                "/tmp/job.log",
+                "/tmp/job.pid",
+                "/tmp/job.exit",
+            )
+
+        assert len(env.polls) == 1
+        assert env.released == ["hermes-bg-test"]
+        assert session.output_buffer == "done\n"
+        assert session.exit_code == 0
 
 
 # =========================================================================
@@ -1162,6 +1198,39 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data == []
+
+    def test_recovery_stops_persisted_ssh_backend_unit(
+        self, registry, tmp_path, monkeypatch
+    ):
+        checkpoint = tmp_path / "procs.json"
+        entry = {
+            "session_id": "proc_remote",
+            "command": "sleep 999",
+            "pid": 4321,
+            "task_id": "t1",
+            "pid_scope": "sandbox",
+            "backend_id": "hermes-bg-recovered",
+        }
+        checkpoint.write_text(json.dumps([entry]))
+
+        class FakeSSHEnvironment:
+            def __init__(self):
+                self.stopped = []
+
+            def kill_background_unit(self, unit):
+                self.stopped.append(unit)
+
+        env = FakeSSHEnvironment()
+        monkeypatch.setattr(
+            "tools.environments.ssh.SSHEnvironment", FakeSSHEnvironment
+        )
+        monkeypatch.setattr("tools.terminal_tool.ensure_task_env", lambda task_id: env)
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+
+        assert env.stopped == ["hermes-bg-recovered"]
+        assert json.loads(checkpoint.read_text()) == []
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline

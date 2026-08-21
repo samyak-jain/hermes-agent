@@ -318,6 +318,122 @@ class TestSSHSystemdSupervision:
             "hermes-cmd-"
         )
 
+    def test_remote_executable_probes_are_batched(self, monkeypatch):
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            systemd_run=True,
+        )
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "bash=/bin/bash\n"
+                    "mkdir=/bin/mkdir\n"
+                    "rm=/bin/rm\n"
+                    "systemd-run=/usr/bin/systemd-run\n"
+                    "systemctl=/usr/bin/systemctl\n"
+                    "sleep=/bin/sleep\n"
+                    "tail=/usr/bin/tail\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(ssh_env.subprocess, "run", fake_run)
+
+        for name, candidates in ssh_env._REMOTE_EXECUTABLE_CANDIDATES.items():
+            assert env._resolve_remote_executable(name, candidates).startswith("/")
+
+        assert len(calls) == 1
+        assert set(env._remote_executable_cache) == set(
+            ssh_env._REMOTE_EXECUTABLE_CANDIDATES
+        )
+
+    def test_stop_remote_units_uses_cached_systemctl(self, monkeypatch):
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            systemd_run=True,
+        )
+        env._remote_executable_cache["systemctl"] = "/nix/store/bin/systemctl"
+        calls = []
+        monkeypatch.setattr(
+            ssh_env.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append(command)
+            or subprocess.CompletedProcess(command, 0),
+        )
+
+        env._stop_remote_units(["hermes-bg-test"])
+
+        assert len(calls) == 1
+        assert "/nix/store/bin/systemctl stop" in calls[0][-1]
+
+    def test_supervised_poll_returns_log_and_unit_state_in_one_round_trip(
+        self, monkeypatch
+    ):
+        env = ssh_env.SSHEnvironment(
+            host="sandbox",
+            user="root",
+            sync_files=False,
+            systemd_run=True,
+        )
+        env._remote_executable_cache.update(
+            {
+                "systemctl": "/usr/bin/systemctl",
+                "tail": "/usr/bin/tail",
+            }
+        )
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "HERMES_BG_RUNNING=0\n"
+                    "HERMES_BG_EXIT=17\n"
+                    "HERMES_BG_LOG_FOLLOWS\n"
+                    "remote output\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(ssh_env.subprocess, "run", fake_run)
+
+        result = env.poll_background_unit(
+            "hermes-bg-test",
+            log_path="/tmp/job.log",
+            pid_path="/tmp/job.pid",
+            exit_path="/tmp/job.exit",
+        )
+
+        assert result == {
+            "output": "remote output\n",
+            "running": False,
+            "exit_code": 17,
+        }
+        assert len(calls) == 1
+
+    def test_control_directory_cleanup_is_best_effort(self, monkeypatch, tmp_path):
+        control_dir = tmp_path / "control"
+        control_dir.mkdir()
+        (control_dir / "socket").write_text("", encoding="utf-8")
+        monkeypatch.setattr(ssh_env, "_control_dir", control_dir)
+        monkeypatch.setattr(ssh_env, "_control_dir_identity", (1, 1))
+
+        ssh_env._cleanup_control_dir()
+
+        assert not control_dir.exists()
+        assert ssh_env._control_dir is None
+
     def test_kill_stops_remote_unit_before_local_client(self, monkeypatch):
         stopped = []
         proc = MagicMock()
@@ -348,6 +464,8 @@ class TestSSHSystemdSupervision:
         )
         env._remote_executable_cache = {
             "bash": "/run/current-system/sw/bin/bash",
+            "mkdir": "/run/current-system/sw/bin/mkdir",
+            "rm": "/run/current-system/sw/bin/rm",
             "systemd-run": "/run/current-system/sw/bin/systemd-run",
             "systemctl": "/run/current-system/sw/bin/systemctl",
             "sleep": "/run/current-system/sw/bin/sleep",
@@ -373,14 +491,26 @@ class TestSSHSystemdSupervision:
 
     @staticmethod
     def _fake_systemd_tools(tmp_path):
-        bash = shutil.which("bash")
+        real_bash = shutil.which("bash")
         sleep = shutil.which("sleep")
         tail = shutil.which("tail")
-        assert bash and sleep and tail
+        assert real_bash and sleep and tail
+
+        bash = tmp_path / "bash"
+        bash.write_text(
+            f"""#!{real_bash}
+if [[ "${{1:-}}" == "-lc" ]]; then
+    shift
+    exec {real_bash} -c "$@"
+fi
+exec {real_bash} "$@"
+"""
+        )
+        bash.chmod(0o755)
 
         systemd_run = tmp_path / "systemd-run"
         systemd_run.write_text(
-            f"""#!{bash}
+            f"""#!{real_bash}
 set -eu
 while (( $# )); do
     if [[ "$1" == "--" ]]; then
@@ -396,7 +526,7 @@ done
 
         systemctl = tmp_path / "systemctl"
         systemctl.write_text(
-            f"""#!{bash}
+            f"""#!{real_bash}
 case "${{1:-}}" in
     is-active|stop|reset-failed) exit 0 ;;
     show)
@@ -410,7 +540,9 @@ exit 0
         )
         systemctl.chmod(0o755)
         return {
-            "bash": bash,
+            "bash": str(bash),
+            "mkdir": shutil.which("mkdir"),
+            "rm": shutil.which("rm"),
             "systemd-run": str(systemd_run),
             "systemctl": str(systemctl),
             "sleep": sleep,

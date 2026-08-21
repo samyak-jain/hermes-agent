@@ -90,6 +90,7 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+ROUTED_COMPLETION_TYPES = frozenset({"async_delegation", "spawn_result"})
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -232,6 +233,46 @@ def _capture_routing_origin() -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
         pass
     return origin
+
+
+def _reject_if_draining() -> Optional[Dict[str, str]]:
+    try:
+        from gateway.drain_control import drain_requested
+
+        if drain_requested():
+            return {
+                "status": "rejected",
+                "error": (
+                    "Gateway drain is active; new background subagents are "
+                    "temporarily disabled until the planned restart completes."
+                ),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _route_selectors_match(
+    selectors: tuple[str, str, str],
+    recorded: tuple[str, str, str],
+) -> bool:
+    return any(
+        candidate and candidate == value
+        for candidate, value in zip(selectors, recorded)
+    )
+
+
+def _discard_failed_dispatch(delegation_id: str) -> None:
+    with _records_lock:
+        _records.pop(delegation_id, None)
+    try:
+        _delete_durable_delegation(delegation_id)
+    except Exception:
+        logger.debug(
+            "Could not delete failed async dispatch %s",
+            delegation_id,
+            exc_info=True,
+        )
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
@@ -491,7 +532,7 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") not in {"async_delegation", "spawn_result"}:
+    if evt.get("type") not in ROUTED_COMPLETION_TYPES:
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
@@ -574,12 +615,12 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") in {"async_delegation", "spawn_result"}:
+    if claim_id and evt.get("type") in ROUTED_COMPLETION_TYPES:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") in {"async_delegation", "spawn_result"}:
+    if claim_id and evt.get("type") in ROUTED_COMPLETION_TYPES:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
@@ -643,12 +684,9 @@ def get_owned_durable_delegation(
         str(row[1] or ""),
         str(row[2] or ""),
     )
-    if not any(
-        candidate and candidate == recorded
-        for candidate, recorded in zip(
-            selectors,
-            (origin_session, origin_ui, parent_id),
-        )
+    if not _route_selectors_match(
+        selectors,
+        (origin_session, origin_ui, parent_id),
     ):
         return None
 
@@ -898,21 +936,9 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    try:
-        from gateway.drain_control import drain_requested
-
-        if drain_requested():
-            return {
-                "status": "rejected",
-                "error": (
-                    "Gateway drain is active; new background subagents are "
-                    "temporarily disabled until the planned restart completes."
-                ),
-            }
-    except Exception:
-        # Drain control is a gateway-only facility. Non-gateway surfaces keep
-        # their existing behavior if it is unavailable.
-        pass
+    draining = _reject_if_draining()
+    if draining is not None:
+        return draining
 
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
@@ -961,9 +987,6 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
-
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
@@ -984,13 +1007,11 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
+        _persist_dispatch(record)
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _discard_failed_dispatch(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -1166,19 +1187,9 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
-    try:
-        from gateway.drain_control import drain_requested
-
-        if drain_requested():
-            return {
-                "status": "rejected",
-                "error": (
-                    "Gateway drain is active; new background subagents are "
-                    "temporarily disabled until the planned restart completes."
-                ),
-            }
-    except Exception:
-        pass
+    draining = _reject_if_draining()
+    if draining is not None:
+        return draining
 
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
@@ -1227,9 +1238,6 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
-
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
@@ -1256,12 +1264,11 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
-        # Propagate the dispatching profile to the detached batch children.
+        _persist_dispatch(record)
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _discard_failed_dispatch(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1652,11 +1659,11 @@ def interrupt_delegation(
     """
     delegation_id = str(delegation_id or "").strip()
     selectors = (
-        ("session_key", str(session_key or "")),
-        ("origin_ui_session_id", str(origin_ui_session_id or "")),
-        ("parent_session_id", str(parent_session_id or "")),
+        str(session_key or ""),
+        str(origin_ui_session_id or ""),
+        str(parent_session_id or ""),
     )
-    if not delegation_id or not any(value for _, value in selectors):
+    if not delegation_id or not any(selectors):
         return False
 
     with _records_lock:
@@ -1665,9 +1672,13 @@ def interrupt_delegation(
             return False
         if completion_type and record.get("completion_type") != completion_type:
             return False
-        if not any(
-            value and str(record.get(field) or "") == value
-            for field, value in selectors
+        if not _route_selectors_match(
+            selectors,
+            (
+                str(record.get("session_key") or ""),
+                str(record.get("origin_ui_session_id") or ""),
+                str(record.get("parent_session_id") or ""),
+            ),
         ):
             return False
         interrupt_fn = record.get("interrupt_fn")

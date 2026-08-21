@@ -60,14 +60,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
-# A delegated child normally cannot regain any tool from the hard blocklist.
-# The configuration broker is the one narrow exception: a host-managed profile
-# may deliberately move config work out of a coordinator's schema and into its
-# children without granting memory, identity, messaging, scheduling, or
-# recursive delegation side effects.
-DELEGATE_PROFILE_GRANTABLE_TOOLS = frozenset({"config"})
-
-
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
 # ---------------------------------------------------------------------------
@@ -156,60 +148,6 @@ def _get_subagent_grant_toolsets(cfg: Optional[dict] = None) -> List[str]:
     return grants
 
 
-def _get_profile_subagent_tool_grants(
-    cfg: Optional[dict] = None,
-    *,
-    profile: Optional[str] = None,
-) -> frozenset[str]:
-    """Return narrowly grantable blocked tools for the active profile.
-
-    ``delegation.profile_subagent_tool_grants`` is intentionally exact-name
-    and profile-scoped. Unknown tools and every hard-blocked capability except
-    those in ``DELEGATE_PROFILE_GRANTABLE_TOOLS`` are ignored.
-    """
-    if cfg is None:
-        cfg = _load_config()
-    raw_profiles = cfg.get("profile_subagent_tool_grants")
-    if raw_profiles in (None, {}):
-        return frozenset()
-    if not isinstance(raw_profiles, dict):
-        logger.error(
-            "delegation.profile_subagent_tool_grants must be a mapping"
-        )
-        return frozenset()
-    if profile is None:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-
-            profile = get_active_profile_name()
-        except Exception:
-            profile = "default"
-    raw = raw_profiles.get(str(profile or "default"))
-    if raw is None:
-        return frozenset()
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, (list, tuple, set, frozenset)):
-        logger.error(
-            "delegation.profile_subagent_tool_grants.%s must be a list",
-            profile,
-        )
-        return frozenset()
-    requested = {
-        str(name).strip()
-        for name in raw
-        if isinstance(name, str) and str(name).strip()
-    }
-    rejected = requested - DELEGATE_PROFILE_GRANTABLE_TOOLS
-    if rejected:
-        logger.error(
-            "Ignoring non-grantable delegated child tools for profile %s: %s",
-            profile,
-            ", ".join(sorted(rejected)),
-        )
-    return frozenset(requested & DELEGATE_PROFILE_GRANTABLE_TOOLS)
-
-
 def _get_child_tool_policy_mode(cfg: Optional[dict] = None) -> str:
     if cfg is None:
         cfg = _load_config()
@@ -230,11 +168,7 @@ def _get_child_tool_policy_mode(cfg: Optional[dict] = None) -> str:
     return mode
 
 
-def _get_child_terminal_overrides(
-    cfg: Optional[dict] = None,
-    *,
-    profile: Optional[str] = None,
-) -> Dict[str, Any]:
+def _get_child_terminal_overrides(cfg: Optional[dict] = None) -> Dict[str, Any]:
     """Resolve the trusted terminal backend applied only to child tasks.
 
     ``delegation.child_terminal`` is infrastructure configuration, never a
@@ -243,32 +177,11 @@ def _get_child_terminal_overrides(
     """
     if cfg is None:
         cfg = _load_config()
-    raw = None
-    raw_profiles = cfg.get("profile_child_terminal")
-    if raw_profiles not in (None, {}):
-        if not isinstance(raw_profiles, dict):
-            raise ValueError(
-                "delegation.profile_child_terminal must be a mapping"
-            )
-        if profile is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-
-                profile = get_active_profile_name()
-            except Exception:
-                profile = "default"
-        raw = raw_profiles.get(str(profile or "default"))
-    if raw is None:
-        raw = cfg.get("child_terminal")
+    raw = cfg.get("child_terminal")
     if raw in (None, {}):
         return {}
     if not isinstance(raw, dict):
-        source = (
-            f"delegation.profile_child_terminal.{profile}"
-            if profile and isinstance(raw_profiles, dict) and profile in raw_profiles
-            else "delegation.child_terminal"
-        )
-        raise ValueError(f"{source} must be a mapping")
+        raise ValueError("delegation.child_terminal must be a mapping")
 
     backend = str(raw.get("backend") or "").strip().lower()
     supported_backends = {
@@ -1500,10 +1413,7 @@ def _seed_child_session_cwd(child_task_id: str, parent_task_id: Optional[str]) -
     record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
 
 
-def _strip_blocked_tools(
-    toolsets: List[str],
-    allowed_blocked_tools: frozenset[str] = frozenset(),
-) -> List[str]:
+def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
     The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
@@ -1513,21 +1423,17 @@ def _strip_blocked_tools(
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
     _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation"})
-    blocked_names = DELEGATE_BLOCKED_TOOLS - allowed_blocked_tools
     blocked_toolset_names = {
         name
         for name, defn in TOOLSETS.items()
         if name in _COMPOSITE_BLOCKED_TOOLSETS
-        or all(t in blocked_names for t in defn.get("tools", []))
+        or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
     }
     blocked_toolset_names.add("kanban")
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
-def _blocked_toolsets_for_role(
-    role: str,
-    allowed_blocked_tools: frozenset[str] = frozenset(),
-) -> List[str]:
+def _blocked_toolsets_for_role(role: str) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
     ``_strip_blocked_tools`` can remove fully blocked toolsets, but it must keep
@@ -1537,7 +1443,7 @@ def _blocked_toolsets_for_role(
     restriction survives later registry/MCP refreshes through the agent's
     stored ``disabled_toolsets``.
     """
-    blocked_names = set(DELEGATE_BLOCKED_TOOLS - allowed_blocked_tools)
+    blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
         blocked_names.discard("delegate_task")
     return sorted(
@@ -1548,10 +1454,7 @@ def _blocked_toolsets_for_role(
     )
 
 
-def _unscoped_blocked_tools_for_role(
-    role: str,
-    allowed_blocked_tools: frozenset[str] = frozenset(),
-) -> frozenset[str]:
+def _unscoped_blocked_tools_for_role(role: str) -> frozenset[str]:
     """Return blocked names that cannot be represented by a toolset deny.
 
     Upstream's ``disabled_toolsets`` subtraction is the primary delegated-child
@@ -1559,13 +1462,11 @@ def _unscoped_blocked_tools_for_role(
     gateway-injected tools (currently ``send_message``) have no owning toolset,
     so the exact-name policy remains only for that residual set.
     """
-    blocked_names = set(DELEGATE_BLOCKED_TOOLS - allowed_blocked_tools)
+    blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
         blocked_names.discard("delegate_task")
     covered_names: set[str] = set()
-    for toolset_name in _blocked_toolsets_for_role(
-        role, allowed_blocked_tools
-    ):
+    for toolset_name in _blocked_toolsets_for_role(role):
         covered_names.update(TOOLSETS.get(toolset_name, {}).get("tools", ()))
     return frozenset(blocked_names - covered_names)
 
@@ -1586,6 +1487,56 @@ def _emit_parent_console(parent_agent, line: str) -> None:
         except Exception:
             pass
     print(line)
+
+
+def _resolve_child_toolsets(
+    parent_agent,
+    toolsets: Optional[List[str]],
+    cfg: dict,
+) -> tuple[List[str], str]:
+    child_policy_mode = _get_child_tool_policy_mode(cfg)
+    if child_policy_mode == "all_configured":
+        child_toolsets = (
+            list(dict.fromkeys(toolsets)) if toolsets else ["all"]
+        )
+    elif child_policy_mode == "deny_all":
+        child_toolsets = []
+    else:
+        parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+        if parent_enabled is not None:
+            parent_toolsets = set(parent_enabled)
+        elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+            import model_tools
+
+            parent_toolsets = {
+                resolved
+                for name in parent_agent.valid_tool_names
+                if (resolved := model_tools.get_toolset_for_tool(name)) is not None
+            }
+        else:
+            parent_toolsets = set(DEFAULT_TOOLSETS)
+
+        if toolsets:
+            expanded_parent = _expand_parent_toolsets(parent_toolsets)
+            child_toolsets = [
+                name for name in toolsets if name in expanded_parent
+            ]
+            if _get_inherit_mcp_toolsets():
+                child_toolsets = _preserve_parent_mcp_toolsets(
+                    child_toolsets, parent_toolsets
+                )
+        elif parent_agent and parent_enabled is not None:
+            child_toolsets = list(parent_enabled)
+        elif parent_toolsets:
+            child_toolsets = sorted(parent_toolsets)
+        else:
+            child_toolsets = list(DEFAULT_TOOLSETS)
+
+    if child_policy_mode != "deny_all":
+        for granted_toolset in _get_subagent_grant_toolsets(cfg):
+            if granted_toolset not in child_toolsets:
+                child_toolsets.append(granted_toolset)
+    return _strip_blocked_tools(child_toolsets), child_policy_mode
 
 
 def _build_child_progress_callback(
@@ -1887,79 +1838,10 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
-    child_policy_mode = _get_child_tool_policy_mode(delegation_cfg)
-    profile_subagent_tool_grants = _get_profile_subagent_tool_grants(
-        delegation_cfg
+    child_toolsets, child_policy_mode = _resolve_child_toolsets(
+        parent_agent, toolsets, delegation_cfg
     )
     child_terminal_overrides = _get_child_terminal_overrides(delegation_cfg)
-
-    # all_configured deliberately resolves the complete registered/configured
-    # universe. Registry check functions still gate unavailable services, and
-    # the exact child denylist below removes security-blocked names after all
-    # composites (including future toolsets) have expanded.
-    if child_policy_mode == "all_configured":
-        child_toolsets = ["all"]
-        if toolsets:
-            child_toolsets = list(dict.fromkeys(toolsets))
-    elif child_policy_mode == "deny_all":
-        child_toolsets = []
-    else:
-        child_toolsets = None
-
-    # When no explicit toolsets given, inherit from parent's enabled toolsets
-    # so disabled tools (e.g. web) don't leak to subagents.
-    # Note: enabled_toolsets=None means "all tools enabled" (the default),
-    # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if child_toolsets is None:  # legacy policy
-        if parent_enabled is not None:
-            parent_toolsets = set(parent_enabled)
-        elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-            # enabled_toolsets is None (all tools) — derive from loaded tool names
-            import model_tools
-
-            parent_toolsets = {
-                ts
-                for name in parent_agent.valid_tool_names
-                if (ts := model_tools.get_toolset_for_tool(name)) is not None
-            }
-        else:
-            parent_toolsets = set(DEFAULT_TOOLSETS)
-
-        if toolsets:
-            # Intersect with parent — subagent must not gain tools the parent lacks.
-            expanded_parent = _expand_parent_toolsets(parent_toolsets)
-            child_toolsets = [t for t in toolsets if t in expanded_parent]
-            if _get_inherit_mcp_toolsets():
-                child_toolsets = _preserve_parent_mcp_toolsets(
-                    child_toolsets, parent_toolsets
-                )
-            child_toolsets = _strip_blocked_tools(
-                child_toolsets, profile_subagent_tool_grants
-            )
-        elif parent_agent and parent_enabled is not None:
-            child_toolsets = _strip_blocked_tools(
-                parent_enabled, profile_subagent_tool_grants
-            )
-        elif parent_toolsets:
-            child_toolsets = _strip_blocked_tools(
-                sorted(parent_toolsets), profile_subagent_tool_grants
-            )
-        else:
-            child_toolsets = _strip_blocked_tools(
-                DEFAULT_TOOLSETS, profile_subagent_tool_grants
-            )
-
-    # Operator-granted toolsets are independent of parent visibility. This is
-    # what permits a main agent with disabled_toolsets: [browser] to delegate
-    # browser work while keeping browser schemas out of its own API calls.
-    if child_policy_mode != "deny_all":
-        for granted_toolset in _get_subagent_grant_toolsets(delegation_cfg):
-            if granted_toolset not in child_toolsets:
-                child_toolsets.append(granted_toolset)
-    child_toolsets = _strip_blocked_tools(
-        child_toolsets, profile_subagent_tool_grants
-    )
 
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
@@ -1980,9 +1862,7 @@ def _build_child_agent(
     child_disabled_toolsets = list(
         dict.fromkeys(
             inherited_disabled
-            + _blocked_toolsets_for_role(
-                effective_role, profile_subagent_tool_grants
-            )
+            + _blocked_toolsets_for_role(effective_role)
             + ["kanban"]
         )
     )
@@ -2000,9 +1880,7 @@ def _build_child_agent(
         if child_policy_mode == "deny_all"
         else ToolAccessPolicy(
             mode="denylist",
-            denied_names=_unscoped_blocked_tools_for_role(
-                effective_role, profile_subagent_tool_grants
-            ),
+            denied_names=_unscoped_blocked_tools_for_role(effective_role),
             source=f"delegation.{effective_role}",
         )
     )
@@ -3722,6 +3600,35 @@ _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
 
+def resolve_async_delivery_route(
+    parent_agent,
+    origin_ui_session_id: str = "",
+) -> tuple[str, str, Optional[str]]:
+    from tools.approval import get_current_session_key
+
+    session_key = get_current_session_key(default="")
+    try:
+        from gateway.session_context import get_session_env
+
+        source = get_session_env("HERMES_SESSION_SOURCE", "")
+        origin_ui_session_id = (
+            get_session_env("HERMES_UI_SESSION_ID", "")
+            or origin_ui_session_id
+        )
+        if source == "tui":
+            agent_session_id = str(
+                getattr(parent_agent, "session_id", "") or ""
+            )
+            if agent_session_id:
+                session_key = agent_session_id
+    except Exception:
+        pass
+    parent_session_id = getattr(parent_agent, "session_id", None)
+    if not session_key:
+        session_key = str(parent_session_id or "")
+    return session_key, origin_ui_session_id, parent_session_id
+
+
 def _build_child_preserving_parent_tools(**kwargs):
     """Build a child without leaking its resolved toolset into the parent."""
     import model_tools
@@ -3759,10 +3666,16 @@ def _finalize_child_results(
     task_list: List[Dict[str, Any]],
     children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
+    *,
+    retrieval_id: Optional[str] = None,
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
+        _apply_summary_budget(
+            results,
+            parent_agent,
+            retrieval_id=retrieval_id,
+        )
         child_by_index = {index: child for index, _task, child in children}
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
@@ -3842,6 +3755,27 @@ def _finalize_child_results(
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
 
+def finalize_single_child_result(
+    result: Dict[str, Any],
+    goal: str,
+    child,
+    parent_agent,
+    *,
+    retrieval_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    task_index = result.setdefault("task_index", 0)
+    task = {"goal": goal}
+    task_list = [{"goal": ""} for _ in range(task_index)] + [task]
+    _finalize_child_results(
+        [result],
+        task_list,
+        [(task_index, task, child)],
+        parent_agent,
+        retrieval_id=retrieval_id,
+    )
+    return result
+
+
 def _run_child_lifecycle(
     task_index: int,
     goal: str,
@@ -3851,14 +3785,7 @@ def _run_child_lifecycle(
     """Run one child and apply the same host lifecycle used by delegate_task."""
     result = _run_single_child(task_index, goal, child, parent_agent)
     result.setdefault("task_index", task_index)
-    task = {"goal": goal}
-    _finalize_child_results(
-        [result],
-        [{"goal": ""} for _ in range(task_index)] + [task],
-        [(task_index, task, child)],
-        parent_agent,
-    )
-    return result
+    return finalize_single_child_result(result, goal, child, parent_agent)
 
 
 def _recover_tasks_from_json_string(
@@ -4399,7 +4326,13 @@ def delegate_task(
         # headroom (split across the batch) before they enter the parent's
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
-        _finalize_child_results(results, task_list, children, parent_agent)
+        if len(results) == 1 and len(children) == 1:
+            _index, _task, _child = children[0]
+            finalize_single_child_result(
+                results[0], _task["goal"], _child, parent_agent
+            )
+        else:
+            _finalize_child_results(results, task_list, children, parent_agent)
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -4440,7 +4373,6 @@ def delegate_task(
     # keep chatting, get the combined summaries back together at the end.
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
-        from tools.approval import get_current_session_key
 
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
@@ -4493,44 +4425,11 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
-        try:
-            from gateway.session_context import get_session_env
-
-            _source = get_session_env("HERMES_SESSION_SOURCE", "")
-            # Refresh from the same task-local source when available, but retain
-            # the immutable value captured before child construction otherwise.
-            _origin_ui_session_id = (
-                get_session_env("HERMES_UI_SESSION_ID", "") or _origin_ui_session_id
-            )
-            # In desktop/TUI, the routable session key is the durable
-            # AIAgent.session_id. Context compression can rotate that id during
-            # the same turn before the TUI-side session dict is re-anchored;
-            # if we capture the stale approval/session context key here, the
-            # async completion becomes an orphan and any desktop poller may
-            # consume it. Gateway chats are different: their session_key is the
-            # platform conversation key (agent:main:...), so keep it there.
-            if _source == "tui":
-                _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-                if _agent_session_id:
-                    _session_key = _agent_session_id
-        except Exception:
-            _source = ""
-        if not _session_key:
-            # CLI (single-process) path: the approval contextvar is only bound
-            # during gateway/TUI turns and HERMES_SESSION_KEY is not in the CLI
-            # environment, so the key resolves empty here. Since #64240 the CLI
-            # drains completions through a positive-ownership filter keyed on
-            # the durable AIAgent.session_id — an empty session_key would fail
-            # closed and the CLI could never claim its own completions, while
-            # a restored foreign event with an empty key could leak into any
-            # unfiltered consumer (#64484). Stamp the parent's durable session
-            # id instead; compression rotations are handled on the drain side
-            # via resolve_resume_session_id lineage resolution.
-            _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-            if _agent_session_id:
-                _session_key = _agent_session_id
-        _parent_session_id = getattr(parent_agent, "session_id", None)
+        (
+            _session_key,
+            _origin_ui_session_id,
+            _parent_session_id,
+        ) = resolve_async_delivery_route(parent_agent, _origin_ui_session_id)
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the

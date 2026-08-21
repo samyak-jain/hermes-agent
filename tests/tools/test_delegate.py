@@ -250,7 +250,7 @@ class TestStripBlockedTools(unittest.TestCase):
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
 
-    def test_profile_grant_moves_config_to_child_only(self):
+    def test_removed_profile_grant_does_not_unblock_config(self):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["spawn"]
         parent.disabled_toolsets = []
@@ -266,10 +266,6 @@ class TestStripBlockedTools(unittest.TestCase):
             patch(
                 "tools.delegate_tool._load_config",
                 return_value=delegation_config,
-            ),
-            patch(
-                "hermes_cli.profiles.get_active_profile_name",
-                return_value="vegapunk",
             ),
         ):
             MockAgent.return_value = MagicMock()
@@ -287,7 +283,7 @@ class TestStripBlockedTools(unittest.TestCase):
 
         kwargs = MockAgent.call_args[1]
         self.assertEqual(kwargs["enabled_toolsets"], ["all"])
-        self.assertNotIn("config", kwargs["disabled_toolsets"])
+        self.assertIn("config", kwargs["disabled_toolsets"])
         self.assertNotIn("config", kwargs["tool_policy"].denied_names)
         for blocked in ("memory", "soul", "cronjob", "clarify"):
             self.assertIn(blocked, DELEGATE_BLOCKED_TOOLS)

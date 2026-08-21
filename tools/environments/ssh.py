@@ -1,5 +1,6 @@
 """SSH remote execution environment with ControlMaster connection persistence."""
 
+import atexit
 import hashlib
 import logging
 import os
@@ -36,6 +37,36 @@ _control_dir: Path | None = None
 _control_dir_identity: tuple[int, int | None] | None = None
 _control_dir_lock = threading.Lock()
 
+_REMOTE_EXECUTABLE_CANDIDATES = {
+    "bash": ("/run/current-system/sw/bin/bash", "/usr/bin/bash", "/bin/bash"),
+    "mkdir": (
+        "/run/current-system/sw/bin/mkdir",
+        "/usr/bin/mkdir",
+        "/bin/mkdir",
+    ),
+    "rm": ("/run/current-system/sw/bin/rm", "/usr/bin/rm", "/bin/rm"),
+    "systemd-run": (
+        "/run/current-system/sw/bin/systemd-run",
+        "/usr/bin/systemd-run",
+        "/bin/systemd-run",
+    ),
+    "systemctl": (
+        "/run/current-system/sw/bin/systemctl",
+        "/usr/bin/systemctl",
+        "/bin/systemctl",
+    ),
+    "sleep": (
+        "/run/current-system/sw/bin/sleep",
+        "/usr/bin/sleep",
+        "/bin/sleep",
+    ),
+    "tail": (
+        "/run/current-system/sw/bin/tail",
+        "/usr/bin/tail",
+        "/bin/tail",
+    ),
+}
+
 
 def _get_control_dir() -> Path:
     """Return a private SSH control directory for this process identity.
@@ -68,6 +99,20 @@ def _get_control_dir() -> Path:
         _control_dir = control_dir
         _control_dir_identity = identity
         return control_dir
+
+
+def _cleanup_control_dir() -> None:
+    global _control_dir, _control_dir_identity
+
+    with _control_dir_lock:
+        control_dir = _control_dir
+        _control_dir = None
+        _control_dir_identity = None
+    if control_dir is not None:
+        shutil.rmtree(control_dir, ignore_errors=True)
+
+
+atexit.register(_cleanup_control_dir)
 
 
 def _ensure_ssh_available() -> None:
@@ -494,16 +539,38 @@ class SSHEnvironment(BaseEnvironment):
         cached = self._remote_executable_cache.get(name)
         if cached:
             return cached
+        requirements = dict(_REMOTE_EXECUTABLE_CANDIDATES)
+        requirements[name] = candidates
+        self._resolve_remote_executables(requirements)
+        return self._remote_executable_cache[name]
 
-        quoted_candidates = " ".join(shlex.quote(path) for path in candidates)
-        probe = (
-            f"for _hermes_exe in {quoted_candidates}; do "
-            'if [ -x "$_hermes_exe" ]; then printf \'%s\\n\' "$_hermes_exe"; '
-            "exit 0; fi; done; "
-            f"command -v {shlex.quote(name)} 2>/dev/null || exit 127"
-        )
+    def _resolve_remote_executables(
+        self,
+        requirements: dict[str, tuple[str, ...]],
+    ) -> None:
+        missing = {
+            name: candidates
+            for name, candidates in requirements.items()
+            if name not in self._remote_executable_cache
+        }
+        if not missing:
+            return
+        statements = ["set -e"]
+        for name, candidates in missing.items():
+            quoted_candidates = " ".join(
+                shlex.quote(path) for path in candidates
+            )
+            statements.append(
+                f"_hermes_path=''; for _hermes_exe in {quoted_candidates}; do "
+                'if [ -x "$_hermes_exe" ]; then _hermes_path="$_hermes_exe"; '
+                "break; fi; done; "
+                f"if [ -z \"$_hermes_path\" ]; then _hermes_path=$(command -v "
+                f"{shlex.quote(name)} 2>/dev/null || true); fi; "
+                'case "$_hermes_path" in /*) ;; *) exit 127 ;; esac; '
+                f"printf '%s=%s\\n' {shlex.quote(name)} \"$_hermes_path\""
+            )
         cmd = self._build_ssh_command()
-        cmd.append(probe)
+        cmd.append("; ".join(statements))
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -511,17 +578,20 @@ class SSHEnvironment(BaseEnvironment):
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
-        resolved = (result.stdout or "").strip().splitlines()
-        path = resolved[-1].strip() if resolved else ""
-        if result.returncode != 0 or not path.startswith("/"):
+        resolved = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, path = line.partition("=")
+            if separator and key in missing and path.startswith("/"):
+                resolved[key] = path.strip()
+        if result.returncode != 0 or set(resolved) != set(missing):
             diagnostic = (result.stderr or result.stdout or "").strip()
             suffix = f": {diagnostic}" if diagnostic else ""
+            unresolved = sorted(set(missing) - set(resolved))
             raise RuntimeError(
-                f"SSH target has no absolute path for required executable "
-                f"{name!r}{suffix}"
+                "SSH target has no absolute path for required executable(s) "
+                f"{', '.join(unresolved)}{suffix}"
             )
-        self._remote_executable_cache[name] = path
-        return path
+        self._remote_executable_cache.update(resolved)
 
     def _systemd_properties(self, *, runtime_seconds: int) -> list[str]:
         properties = [
@@ -551,19 +621,22 @@ class SSHEnvironment(BaseEnvironment):
         if not units:
             return
         quoted_units = " ".join(shlex.quote(unit) for unit in units)
-        cmd = self._build_ssh_command()
-        cmd.append(
-            "systemctl stop --no-block "
-            f"{quoted_units} >/dev/null 2>&1 || true"
-        )
         try:
+            systemctl = self._resolve_remote_executable(
+                "systemctl", _REMOTE_EXECUTABLE_CANDIDATES["systemctl"]
+            )
+            cmd = self._build_ssh_command()
+            cmd.append(
+                f"{shlex.quote(systemctl)} stop --no-block "
+                f"{quoted_units} >/dev/null 2>&1 || true"
+            )
             subprocess.run(
                 cmd,
                 capture_output=True,
                 timeout=8,
                 stdin=subprocess.DEVNULL,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, RuntimeError, subprocess.SubprocessError):
             pass
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
@@ -679,6 +752,12 @@ class SSHEnvironment(BaseEnvironment):
                 "/bin/tail",
             ),
         )
+        remote_mkdir = self._resolve_remote_executable(
+            "mkdir", _REMOTE_EXECUTABLE_CANDIDATES["mkdir"]
+        )
+        remote_rm = self._resolve_remote_executable(
+            "rm", _REMOTE_EXECUTABLE_CANDIDATES["rm"]
+        )
 
         working_directory = str(cwd or self.cwd or "").strip()
         if working_directory == "~":
@@ -717,8 +796,10 @@ class SSHEnvironment(BaseEnvironment):
 
         launcher = (
             "set +e; "
-            f"mkdir -p {shlex.quote(str(Path(log_path).parent))}; "
-            f"rm -f {shlex.quote(log_path)} {shlex.quote(pid_path)} "
+            f"{shlex.quote(remote_mkdir)} -p "
+            f"{shlex.quote(str(Path(log_path).parent))}; "
+            f"{shlex.quote(remote_rm)} -f {shlex.quote(log_path)} "
+            f"{shlex.quote(pid_path)} "
             f"{shlex.quote(exit_path)}; "
             f"{shlex.join(remote_argv)}; "
             "_hermes_launch_rc=$?; "
@@ -799,6 +880,75 @@ class SSHEnvironment(BaseEnvironment):
         return {
             "output": "\n".join(output_parts),
             "returncode": int(result.returncode),
+        }
+
+    def poll_background_unit(
+        self,
+        unit: str,
+        *,
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+        timeout: int = 10,
+    ) -> dict:
+        if not unit.startswith("hermes-bg-"):
+            raise ValueError("Refusing to poll a non-Hermes background unit")
+        systemctl = self._resolve_remote_executable(
+            "systemctl", _REMOTE_EXECUTABLE_CANDIDATES["systemctl"]
+        )
+        tail = self._resolve_remote_executable(
+            "tail", _REMOTE_EXECUTABLE_CANDIDATES["tail"]
+        )
+        marker = "HERMES_BG_LOG_FOLLOWS"
+        script = (
+            "set +e; _hermes_active=unknown; _hermes_status=''; "
+            f"while IFS='=' read -r _hermes_key _hermes_value; do "
+            'case "$_hermes_key" in '
+            'ActiveState) _hermes_active="$_hermes_value" ;; '
+            'ExecMainStatus) _hermes_status="$_hermes_value" ;; esac; done < <('
+            f"{shlex.quote(systemctl)} show {shlex.quote(unit)} "
+            "--property=ActiveState,ExecMainStatus --no-pager 2>/dev/null); "
+            f"if [ -s {shlex.quote(exit_path)} ]; then "
+            f"IFS= read -r _hermes_exit < {shlex.quote(exit_path)}; "
+            "_hermes_running=0; "
+            "else case \"$_hermes_active\" in "
+            "active|activating|reloading|deactivating) _hermes_running=1 ;; "
+            "*) _hermes_running=0; _hermes_exit=$_hermes_status ;; esac; fi; "
+            "printf 'HERMES_BG_RUNNING=%s\\nHERMES_BG_EXIT=%s\\n' "
+            '"$_hermes_running" "$_hermes_exit"; '
+            f"printf '{marker}\\n'; "
+            f"{shlex.quote(tail)} -c +1 -- {shlex.quote(log_path)} "
+            "2>/dev/null || true"
+        )
+        cmd = self._build_ssh_command()
+        cmd.append(script)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"SSH background poll failed for {unit}: {diagnostic}"
+            )
+        header, separator, output = (result.stdout or "").partition(
+            f"{marker}\n"
+        )
+        if not separator:
+            raise RuntimeError(f"Invalid SSH background poll response for {unit}")
+        values = {}
+        for line in header.splitlines():
+            key, found, value = line.partition("=")
+            if found:
+                values[key] = value.strip()
+        exit_value = values.get("HERMES_BG_EXIT", "")
+        return {
+            "output": output,
+            "running": values.get("HERMES_BG_RUNNING") == "1",
+            "exit_code": int(exit_value) if exit_value else None,
         }
 
     def kill_background_unit(self, unit: str) -> None:

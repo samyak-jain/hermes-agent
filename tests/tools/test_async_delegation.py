@@ -344,6 +344,51 @@ def test_progressing_runner_is_never_stalled(monkeypatch):
     assert evt["summary"] == "done"
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_persist_failure_releases_running_slot(monkeypatch, batch):
+    deleted = []
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda record: (_ for _ in ()).throw(OSError("sqlite unavailable")),
+    )
+    monkeypatch.setattr(
+        ad,
+        "_delete_durable_delegation",
+        lambda delegation_id: deleted.append(delegation_id),
+    )
+
+    if batch:
+        result = ad.dispatch_async_delegation_batch(
+            goals=["work"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"results": []},
+            delegation_id="deleg_persist_batch",
+        )
+        expected_id = "deleg_persist_batch"
+    else:
+        result = ad.dispatch_async_delegation(
+            goal="work",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"status": "completed"},
+            delegation_id="deleg_persist_single",
+        )
+        expected_id = "deleg_persist_single"
+
+    assert result["status"] == "rejected"
+    assert "sqlite unavailable" in result["error"]
+    assert ad.active_count() == 0
+    assert deleted == [expected_id]
+
+
 def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     """Interrupt-responsive children finalize through the NORMAL path.
 
