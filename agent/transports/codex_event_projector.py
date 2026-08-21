@@ -59,7 +59,10 @@ def codex_item_identity(item: dict) -> tuple[str, str]:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
         name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
-        return name, _deterministic_call_id(name, item_id)
+        # The call_id input mirrors the native MCP tool-name convention
+        # (mcp__server__tool), NOT the dotted display name, so ids stay
+        # consistent with registration names across live/history paths.
+        return name, _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
     if item_type == "dynamicToolCall":
         tool = item.get("tool") or "unknown"
         return tool, _deterministic_call_id(f"dyn_{tool}", item_id)

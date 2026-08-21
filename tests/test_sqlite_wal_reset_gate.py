@@ -319,7 +319,6 @@ class TestNoDowngradeUnderConcurrentOpeners:
             "is_sqlite_wal_reset_vulnerable",
             lambda version_info=None: False,
         )
-        monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
         db = tmp_path / "cfg_delete.db"
         seed = sqlite3.connect(str(db))
         try:
@@ -338,9 +337,15 @@ class TestNoDowngradeUnderConcurrentOpeners:
             conn = sqlite3.connect(str(db), timeout=0.2)
             try:
                 with pytest.raises(
-                    sqlite3.OperationalError, match="refusing to downgrade"
+                    sqlite3.OperationalError,
+                    match="refusing a live journal transition",
                 ):
-                    apply_wal_with_fallback(conn, db_label="cfg_delete.db")
+                    hermes_state.apply_sqlite_storage_policy(
+                        conn,
+                        db_label="cfg_delete.db",
+                        journal_mode="delete",
+                        synchronous="auto",
+                    )
             finally:
                 conn.close()
         finally:

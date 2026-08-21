@@ -801,13 +801,17 @@ def apply_sqlite_storage_policy(
     if target_sync not in _SQLITE_SYNCHRONOUS_MODES:
         raise ValueError(f"unsupported SQLite synchronous mode: {target_sync}")
 
-    current = _on_disk_journal_mode(conn)
+    current, probe_exc = _probe_on_disk_journal_mode(conn)
     if current is None:
+        # Keep the underlying SQLite error in the message: slash-command
+        # diagnostics (format_session_db_unavailable) key their NFS/SMB
+        # hint off "locking protocol" appearing in the recorded cause.
+        detail = f" (probe failed: {probe_exc})" if probe_exc is not None else ""
         raise sqlite3.OperationalError(
             f"{db_label}: could not verify journal mode before applying "
             f"configured journal_mode={target_journal}; refusing a live "
-            "journal transition"
-        )
+            f"journal transition{detail}"
+        ) from probe_exc
     if current in {"memory", "off"}:
         return current
 
@@ -1006,11 +1010,17 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
     return f"{prefix}: {cause}{hint}."
 
 
-def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+def _probe_on_disk_journal_mode(
+    conn: sqlite3.Connection,
+) -> Tuple[Optional[str], Optional[Exception]]:
     """Read the journal mode from the SQLite DB header on disk.
 
-    Returns the mode string (e.g. ``"wal"``, ``"delete"``), or ``None``
-    if the value cannot be determined (new DB, or PRAGMA read failed).
+    Returns ``(mode, None)`` with the mode string (e.g. ``"wal"``,
+    ``"delete"``), or ``(None, exc)`` if the PRAGMA read failed —
+    ``exc`` carries the underlying error so refuse-to-transition
+    callers can surface the real cause (e.g. ``locking protocol`` on
+    NFS/SMB) instead of a bare "could not verify" message.
+    ``(None, None)`` means the read succeeded but yielded no mode.
 
     A PRAGMA read can fail transiently with ``disk i/o error`` on
     virtualized block devices (XFS on cloud hosts).  Treating that as
@@ -1028,23 +1038,28 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
         except sqlite3.OperationalError as exc:
             last_exc = exc
             if "disk i/o error" not in str(exc).lower():
-                return None
+                return None, last_exc
             time.sleep(0.05)
             continue
         if row is None:
-            return None
+            return None, None
         mode = row[0]
         if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
             try:
                 mode = mode.decode("ascii")
             except UnicodeDecodeError:
-                return None
-        return str(mode).strip().lower() if mode is not None else None
+                return None, None
+        return (str(mode).strip().lower() if mode is not None else None), None
     if last_exc is not None:
         logger.debug(
             "_on_disk_journal_mode: retries exhausted on disk read (%s)", last_exc
         )
-    return None
+    return None, last_exc
+
+
+def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+    mode, _ = _probe_on_disk_journal_mode(conn)
+    return mode
 
 
 def _apply_wal_size_limit(conn: sqlite3.Connection) -> None:
