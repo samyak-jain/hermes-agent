@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from dataclasses import fields
 
 import pytest
 import yaml
@@ -82,6 +83,34 @@ class TestMissingModelSection:
 
 
 class TestExactToolPolicyValidation:
+    def test_typed_gateway_fields_are_derived_from_dataclasses(self):
+        from gateway.config import ChannelOverride, SessionResetPolicy, StreamingConfig
+
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "123": {
+                                field.name: None for field in fields(ChannelOverride)
+                            }
+                        }
+                    }
+                },
+                "session_reset": {
+                    field.name: None for field in fields(SessionResetPolicy)
+                },
+                "streaming": {
+                    **{field.name: None for field in fields(StreamingConfig)},
+                    "mode": "auto",
+                },
+            },
+            source="managed:/etc/hermes/config.yaml",
+            unknown_severity="error",
+        )
+
+        assert not [issue for issue in issues if "Unknown typed config key" in issue.message]
+
     def test_valid_global_and_channel_policies(self):
         issues = validate_config_structure({
             "agent": {"tool_policy": {
@@ -304,6 +333,30 @@ def test_managed_config_validate_command_is_ci_strict_and_value_free(
         "profile_tool_policies.vegapunk.ignored_typo"
     )
     assert "private-value-must-not-print" not in output
+
+
+def test_cache_invalidation_preserves_last_known_good_policy(tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "approvals:\n  deny:\n    - 'curl*evil.example*'\n",
+        encoding="utf-8",
+    )
+    config_module.invalidate_config_caches(config_path)
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
+
+    config_path.write_text("approvals:\n  deny: [unclosed\n", encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
 
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.

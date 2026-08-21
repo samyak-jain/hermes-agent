@@ -19,6 +19,7 @@ from hermes_cli.agent_config import (
     prepare_change,
     prepare_rollback,
 )
+from agent.redact import is_secret_config_key, is_secret_config_path
 from tools import config_tool as config_tool_module
 
 
@@ -464,11 +465,56 @@ def test_secret_path_classifier_matches_exact_adjacent_structural_phrases(path: 
 
 
 @pytest.mark.parametrize(
+    "key",
+    [
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
+    ],
+)
+def test_secret_classifiers_share_the_full_canonical_vocabulary(key: str):
+    assert is_secret_config_key(key)
+    assert is_secret_config_path(f"model.runtime_options.{key}")
+    assert _secret_shaped_path(f"model.runtime_options.{key}")
+
+
+def test_config_display_redaction_uses_canonical_secret_classifier():
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.config import redact_config_value
+
+    secrets = {
+        "apikey": "opaque-one",
+        "tokens": "opaque-two",
+        "encryption_key": "opaque-three",
+        "signingKey": "opaque-four",
+    }
+    rendered = json.dumps(redact_config_value(secrets), ensure_ascii=False)
+
+    assert not any(secret in rendered for secret in secrets.values())
+    config_text = "\n".join(
+        [
+            "service.encryption_key=opaque-five",
+            "signing_key: opaque-six",
+            '"api_keys": "opaque-seven"',
+        ]
+    )
+    redacted_text = redact_sensitive_text(config_text, force=True)
+    assert "opaque-five" not in redacted_text
+    assert "opaque-six" not in redacted_text
+    assert "opaque-seven" not in redacted_text
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "model.runtime_options.api.key_rotation_days",
         "model.runtime_options.private.key_count",
-        "model.runtime_options.auth.token_usage",
         "model.runtime_options.client.secret_format",
     ],
 )
@@ -486,6 +532,15 @@ def test_secret_path_classifier_preserves_benign_structural_suffixes(path: str):
         "access-token",
         "private_key",
         "PassWord",
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
     ],
 )
 def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
@@ -503,6 +558,51 @@ def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
 
     assert "short-secret" not in str(exc_info.value)
     assert "short-secret" not in repr(exc_info.value)
+
+
+def test_inspect_returns_raw_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "runtime_options": {"endpoint": "${BROKER_ENDPOINT}/v1"}
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("BROKER_ENDPOINT", "opaque-expanded-value")
+    config_module.invalidate_config_caches(config_path)
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+    listed = {
+        item["path"]: item["value"] for item in inspect_config()["settings"]
+    }
+
+    assert inspected["value"] == "${BROKER_ENDPOINT}/v1"
+    assert listed["model.runtime_options.endpoint"] == "${BROKER_ENDPOINT}/v1"
+    assert "opaque-expanded-value" not in json.dumps(inspected)
+
+
+def test_inspect_returns_managed_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    managed_path = Path(os.environ["HERMES_MANAGED_DIR"]) / "config.yaml"
+    managed = yaml.safe_load(managed_path.read_text(encoding="utf-8"))
+    managed["model"]["runtime_options"] = {
+        "endpoint": "${MANAGED_BROKER_ENDPOINT}/v1"
+    }
+    managed_path.write_text(yaml.safe_dump(managed, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("MANAGED_BROKER_ENDPOINT", "managed-expanded-value")
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+
+    assert inspected["value"] == "${MANAGED_BROKER_ENDPOINT}/v1"
+    assert inspected["source"] == "managed"
+    assert inspected["editable"] is False
+    assert "managed-expanded-value" not in json.dumps(inspected)
 
 
 def test_managed_shadow_report_redacts_canonical_secret_key_variants(
@@ -732,6 +832,52 @@ def test_autonomous_policy_skips_approval_and_writes_atomically(
     assert oct(backup.stat().st_mode & 0o777) == "0o600"
 
 
+def test_broker_history_and_secret_backups_are_retention_capped(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import hermes_cli.agent_config as agent_config_module
+
+    monkeypatch.setattr(agent_config_module, "_MAX_REVISIONS", 2)
+    monkeypatch.setattr(agent_config_module, "_MAX_AUDIT_RECORDS", 3)
+    for skin in ("pastel", "default", "pastel", "default"):
+        apply_change(
+            prepare_change(
+                operation="set",
+                path="display.skin",
+                value=skin,
+                reason=f"operator selected {skin}",
+            )
+        )
+
+    state_dir = broker_home / "state" / "agent-config"
+    assert len(list((state_dir / "revisions").glob("*.yaml"))) == 2
+    assert len((state_dir / "audit.jsonl").read_text().splitlines()) == 3
+    assert history(limit=100)["count"] == 3
+
+
+def test_prepare_rollback_names_missing_retained_backup(broker_home: Path):
+    changed = apply_change(
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="pastel",
+            reason="operator selected pastel",
+        )
+    )
+    backup = (
+        broker_home
+        / "state"
+        / "agent-config"
+        / "revisions"
+        / f"{changed['revision']}.yaml"
+    )
+    backup.unlink()
+
+    with pytest.raises(AgentConfigError, match=changed["revision"]):
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+
+
 def test_required_approval_denial_changes_nothing(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -894,6 +1040,46 @@ def test_shared_config_lock_is_reentrant_for_one_profile(broker_home: Path):
 
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["display"]["compact"] is True
     assert oct((broker_home / ".config.yaml.write.lock").stat().st_mode & 0o777) == "0o600"
+
+
+def test_reader_is_not_blocked_while_writer_waits_for_process_lock(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import fcntl
+    import threading
+
+    from hermes_cli.config import config_write_lock, read_raw_config
+
+    waiting = threading.Event()
+    release = threading.Event()
+
+    def blocking_flock(_fd, operation):
+        if operation == fcntl.LOCK_EX:
+            waiting.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(fcntl, "flock", blocking_flock)
+    errors = []
+
+    def writer():
+        try:
+            with config_write_lock(broker_home / "config.yaml"):
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert waiting.wait(timeout=5)
+    try:
+        assert read_raw_config()["display"]["skin"] == "default"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_rollback_only_applies_to_current_revision(

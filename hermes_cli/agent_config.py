@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -32,12 +33,22 @@ from typing import Any, Optional
 
 import yaml
 
+from agent.redact import (
+    is_secret_config_key,
+    is_secret_config_path,
+    is_secret_config_phrase,
+)
 from hermes_constants import get_hermes_home
 
 try:  # POSIX production path; Windows keeps process-local atomicity.
     import fcntl
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
+
+logger = logging.getLogger(__name__)
+
+_MAX_REVISIONS = 100
+_MAX_AUDIT_RECORDS = 1000
 
 
 SAFE_BUILTIN_PATTERNS = frozenset(
@@ -90,42 +101,6 @@ GUARDED_BUILTIN_PATTERNS = frozenset(
     }
 )
 
-# Configuration may describe where a credential comes from, but the broker
-# must never read or write credential material. Key classification first
-# canonicalizes camelCase boundaries and every punctuation/whitespace run to
-# one lowercase underscore. This makes ``clientSecret``, ``client-secret``,
-# ``client.secret``, and ``CLIENT SECRET`` equivalent without treating an
-# ordinary public key or operational counter such as ``token_usage`` as secret.
-_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
-_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
-_NON_ALNUM_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
-_LIST_INDEX_SUFFIX_RE = re.compile(r"(?:\[\d+\])+$")
-_SECRET_KEY_PHRASES = frozenset(
-    {
-        ("api", "key"),
-        ("auth", "token"),
-        ("access", "token"),
-        ("refresh", "token"),
-        ("bearer", "token"),
-        ("client", "secret"),
-        ("pass", "word"),
-        ("private", "key"),
-        ("key", "material"),
-        ("raw", "secret"),
-        ("secret", "input"),
-        ("secret", "value"),
-    }
-)
-_SECRET_KEY_WORDS = frozenset(
-    {
-        "authorization",
-        "cookie",
-        "credential",
-        "credentials",
-        "passwd",
-        "password",
-    }
-)
 _OBVIOUS_SECRET_VALUE_RE = re.compile(
     r"(?:"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
@@ -223,7 +198,12 @@ def _ownership_mode(config: dict) -> str:
     return mode if mode in {"allowlist", "unmanaged"} else "allowlist"
 
 
-def _path_class(path: str, config: dict) -> Optional[str]:
+def _path_class(
+    path: str,
+    config: dict,
+    *,
+    managed_keys: Optional[set[str]] = None,
+) -> Optional[str]:
     if _ownership_mode(config) == "unmanaged":
         from hermes_cli import managed_scope
         from hermes_cli.config import _validate_config_key
@@ -232,7 +212,9 @@ def _path_class(path: str, config: dict) -> Optional[str]:
         marker = object()
         if not known and _nested(config, path, marker) is marker:
             return None
-        return "operator_managed" if managed_scope.is_key_managed(path) else "agent_owned"
+        if managed_keys is None:
+            managed_keys = managed_scope.managed_config_keys()
+        return "operator_managed" if path in managed_keys else "agent_owned"
 
     safe_policy = _configured_patterns(config, "editable_paths")
     guarded_policy = _configured_patterns(config, "guarded_paths")
@@ -243,54 +225,12 @@ def _path_class(path: str, config: dict) -> Optional[str]:
     return None
 
 
-def _canonicalize_config_key(key: Any) -> str:
-    """Canonicalize a config key for semantic secret classification.
-
-    Camel/acronym boundaries become separators, then underscores, hyphens,
-    dots, whitespace, and all other punctuation collapse to one underscore.
-    Matching is case-insensitive via ``casefold``.
-    """
-    text = str(key)
-    text = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", text)
-    text = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", text)
-    return _NON_ALNUM_KEY_RE.sub("_", text).strip("_").casefold()
-
-
 def _is_secret_config_key(key: Any) -> bool:
-    """Return whether one key names credential material after canonicalization."""
-    canonical = _canonicalize_config_key(key)
-    if not canonical:
-        return False
-    words = tuple(part for part in canonical.split("_") if part)
-    if any(word in _SECRET_KEY_WORDS for word in words):
-        return True
-    if canonical == "secret" or (words and words[-1] == "secret"):
-        return True
-    if canonical == "token" or (words and words[-1] == "token"):
-        return True
-    return any(
-        words[index : index + len(phrase)] == phrase
-        for phrase in _SECRET_KEY_PHRASES
-        for index in range(len(words) - len(phrase) + 1)
-    )
+    return is_secret_config_key(key)
 
 
 def _secret_shaped_path(path: str) -> bool:
-    # Match declared phrases across exact adjacent mapping keys, including
-    # intervening list indexes. Requiring each structural segment to equal one
-    # phrase word keeps suffix/context fields such as ``api.key_rotation_days``
-    # and ``auth.token_usage`` public. Literal dotted mapping keys are still
-    # classified independently before path composition below.
-    raw_segments = path.split(".")
-    segments = tuple(
-        _canonicalize_config_key(_LIST_INDEX_SUFFIX_RE.sub("", segment))
-        for segment in raw_segments
-    )
-    return any(_is_secret_config_key(segment) for segment in raw_segments) or any(
-        segments[index : index + len(phrase)] == phrase
-        for phrase in _SECRET_KEY_PHRASES
-        for index in range(len(segments) - len(phrase) + 1)
-    )
+    return is_secret_config_path(path)
 
 
 def _value_looks_secret(value: Any) -> bool:
@@ -331,18 +271,35 @@ def _redact_non_secret_view(
     path: str,
     *,
     inherited_sensitive: bool = False,
+    _previous_segment: Optional[str] = None,
+    _path_checked: bool = False,
 ) -> tuple[Any, list[str]]:
     """Return a shape-preserving view with every sensitive scalar redacted."""
-    sensitive = inherited_sensitive or _secret_shaped_path(path)
+    sensitive = inherited_sensitive or (
+        not _path_checked and _secret_shaped_path(path)
+    )
+    previous_segment = _previous_segment
+    if previous_segment is None and path:
+        previous_segment = path.rsplit(".", 1)[-1]
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         redacted: list[str] = []
         for key, child in value.items():
             child_path = f"{path}.{key}" if path else str(key)
+            child_sensitive = sensitive or (
+                not isinstance(child, (dict, list))
+                and _is_secret_config_key(key)
+            )
+            if previous_segment is not None:
+                child_sensitive = child_sensitive or is_secret_config_phrase(
+                    (previous_segment, key)
+                )
             child_value, child_redacted = _redact_non_secret_view(
                 child,
                 child_path,
-                inherited_sensitive=sensitive or _is_secret_config_key(key),
+                inherited_sensitive=child_sensitive,
+                _previous_segment=str(key),
+                _path_checked=True,
             )
             out[key] = child_value
             redacted.extend(child_redacted)
@@ -356,6 +313,8 @@ def _redact_non_secret_view(
                 child,
                 child_path,
                 inherited_sensitive=sensitive,
+                _previous_segment=previous_segment,
+                _path_checked=True,
             )
             out.append(child_value)
             redacted.extend(child_redacted)
@@ -541,7 +500,13 @@ def _assert_enabled(config: dict) -> None:
         )
 
 
-def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
+def _assert_path_allowed(
+    path: str,
+    config: dict,
+    *,
+    for_write: bool,
+    managed_keys: Optional[set[str]] = None,
+) -> str:
     path = str(path or "").strip()
     if not path or path.startswith(".") or path.endswith(".") or ".." in path:
         raise AgentConfigError("A valid dotted configuration leaf is required.")
@@ -558,7 +523,7 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
             f"'{path}' is credential-shaped. Secrets must use the authentication "
             "or secret-management workflow, never config.yaml."
         )
-    classification = _path_class(path, config)
+    classification = _path_class(path, config, managed_keys=managed_keys)
     if classification is None:
         raise AgentConfigError(
             f"'{path}' is not a recognized or operator-authorized agent "
@@ -567,12 +532,41 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
     if for_write:
         from hermes_cli import managed_scope
 
-        if classification == "operator_managed" or managed_scope.is_key_managed(path):
+        if managed_keys is None:
+            managed_keys = managed_scope.managed_config_keys()
+        if classification == "operator_managed" or path in managed_keys:
             raise AgentConfigError(
                 f"'{path}' is managed by Kumo/your administrator and cannot be "
                 "changed through the agent-owned configuration."
             )
     return classification
+
+
+def _inspection_value(
+    path: str,
+    effective_value: Any,
+    raw: dict,
+    managed: dict,
+) -> Any:
+    from hermes_cli.config import _preserve_env_ref_templates
+
+    marker = object()
+    raw_value = _nested(raw, path, marker)
+    managed_value = _nested(managed, path, marker)
+    value = effective_value
+    if managed_value is not marker:
+        value = _preserve_env_ref_templates(
+            value,
+            managed_value,
+            effective_value,
+        )
+    if raw_value is not marker:
+        value = _preserve_env_ref_templates(
+            value,
+            raw_value,
+            effective_value,
+        )
+    return value
 
 
 def inspect_config(path: Optional[str] = None) -> dict:
@@ -584,6 +578,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
     _assert_enabled(effective)
     raw = read_raw_config()
     managed = managed_scope.load_managed_config()
+    managed_keys = managed_scope.managed_config_keys()
     effective_flat = _flatten(effective)
 
     if path:
@@ -591,6 +586,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
         value = _nested(effective, path, marker)
         if value is marker:
             raise AgentConfigError(f"Configuration leaf '{path}' is not set.")
+        value = _inspection_value(path, value, raw, managed)
         if not isinstance(value, (dict, list)) and (
             _secret_shaped_path(path) or _value_looks_secret(value)
         ):
@@ -598,7 +594,12 @@ def inspect_config(path: Optional[str] = None) -> dict:
                 f"Requested scalar '{path}' is sensitive and cannot be returned "
                 "through the non-secret configuration view."
             )
-        classification = _assert_path_allowed(path, effective, for_write=False)
+        classification = _assert_path_allowed(
+            path,
+            effective,
+            for_write=False,
+            managed_keys=managed_keys,
+        )
         safe_value, redacted_paths = _redact_non_secret_view(value, path)
         source = _source_for(path, raw, managed)
         result = {
@@ -619,10 +620,14 @@ def inspect_config(path: Optional[str] = None) -> dict:
         top = dotted.split(".", 1)[0]
         if top.startswith("_") or top in {"agent_config", "soul_edit"}:
             continue
-        classification = _path_class(dotted, effective)
+        classification = _path_class(
+            dotted,
+            effective,
+            managed_keys=managed_keys,
+        )
         if classification is None or _secret_shaped_path(dotted):
             continue
-        value = effective_flat[dotted]
+        value = _inspection_value(dotted, effective_flat[dotted], raw, managed)
         if isinstance(value, dict) or _value_looks_secret(value):
             continue
         source = _source_for(dotted, raw, managed)
@@ -865,6 +870,12 @@ def _write_backup(revision: str, before: bytes) -> Path:
         os.chmod(revisions, 0o700)
     except OSError:
         pass
+    backups = sorted(revisions.glob("*.yaml"), key=lambda item: item.name)
+    for expired in backups[: max(0, len(backups) - _MAX_REVISIONS + 1)]:
+        try:
+            expired.unlink()
+        except OSError as exc:
+            logger.warning("Failed to prune configuration revision %s: %s", expired, exc)
     path = revisions / f"{revision}.yaml"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -877,13 +888,22 @@ def _write_backup(revision: str, before: bytes) -> Path:
 def _append_audit(record: dict) -> None:
     path = _state_dir() / "audit.jsonl"
     encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "ab") as handle:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as handle:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0, os.SEEK_END)
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
+        handle.seek(0)
+        lines = handle.readlines()
+        if len(lines) > _MAX_AUDIT_RECORDS:
+            handle.seek(0)
+            handle.writelines(lines[-_MAX_AUDIT_RECORDS:])
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -981,9 +1001,6 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
                 "Configuration audit persistence failed, so the prepared change "
                 "was automatically rolled back."
             ) from audit_exc
-        from hermes_cli.config import invalidate_config_caches
-
-        invalidate_config_caches(config_path)
     return {
         "success": True,
         "revision": revision,
@@ -1053,6 +1070,10 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
         raise AgentConfigError(
             "The rollback reason must be under 500 characters and contain no credentials."
         )
+    from hermes_cli.config import get_config_path, load_config
+
+    effective = load_config()
+    _assert_enabled(effective)
     path = _state_dir() / "audit.jsonl"
     target = None
     try:
@@ -1070,12 +1091,13 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
     if target is None:
         raise AgentConfigError(f"Unknown configuration revision '{revision}'.")
     backup = _state_dir() / "revisions" / f"{revision}.yaml"
-    before = backup.read_bytes()
+    try:
+        before = backup.read_bytes()
+    except FileNotFoundError as exc:
+        raise AgentConfigError(
+            f"Configuration revision '{revision}' no longer has a retained backup."
+        ) from exc
     _validate_candidate(_load_yaml_bytes(before))
-    from hermes_cli.config import get_config_path, load_config
-
-    effective = load_config()
-    _assert_enabled(effective)
     current = _read_raw_bytes(get_config_path())
     current_exists = get_config_path().exists()
     if (
@@ -1156,9 +1178,6 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
             raise AgentConfigError(
                 "Rollback audit persistence failed, so the rollback itself was undone."
             ) from audit_exc
-        from hermes_cli.config import invalidate_config_caches
-
-        invalidate_config_caches(config_path)
     return {
         "success": True,
         "revision": rollback_revision,

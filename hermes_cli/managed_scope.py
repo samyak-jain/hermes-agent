@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -50,7 +51,7 @@ def _under_pytest() -> bool:
     that exercise managed scope set ``HERMES_MANAGED_DIR`` explicitly, which is
     still honored (the override path below runs before this guard takes effect).
     """
-    return "PYTEST_CURRENT_TEST" in os.environ
+    return "pytest" in sys.modules
 
 
 def get_managed_dir() -> Optional[Path]:
@@ -69,7 +70,14 @@ def get_managed_dir() -> Optional[Path]:
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
-        return p if p.is_dir() else None
+        if p.is_dir():
+            return p
+        logger.error(
+            "managed scope: HERMES_MANAGED_DIR points to a missing or "
+            "non-directory path: %s",
+            p,
+        )
+        return None
     if _under_pytest():
         return None
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
@@ -197,13 +205,20 @@ def apply_managed_overlay(config: dict) -> dict:
 
 
 def _parse_env(f) -> Dict[str, str]:
+    from hermes_cli.config import _parse_env_value, _strip_inline_comment
+
     out: Dict[str, str] = {}
-    for line in f:
-        line = line.strip()
+    for raw in f:
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
         key, _, value = line.partition("=")
-        out[key.strip()] = value.strip().strip("\"'")
+        key = key.strip().lstrip("\ufeff")
+        if not key:
+            continue
+        out[key] = _parse_env_value(_strip_inline_comment(value))
     return out
 
 
