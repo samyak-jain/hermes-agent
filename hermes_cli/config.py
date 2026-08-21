@@ -4849,43 +4849,18 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
-# Key names (case-insensitive, exact match) whose VALUE is a credential and
-# must be masked before printing any config dict to the terminal. Covers the
-# fields a custom provider stuffs into the `model`/`custom_providers` blocks
-# (`api_key`) plus the usual token/secret/password shapes. Exact-match only so
-# benign keys like `token_count` or `secret_santa` don't get masked.
-_SECRET_CONFIG_KEYS = frozenset({
-    "api_key",
-    "apikey",
-    "key",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "secret",
-    "client_secret",
-    "password",
-    "passwd",
-    "auth",
-    "authorization",
-    "private_key",
-    "bearer",
-    "jwt",
-})
-
-
 def redact_config_value(value: Any, _depth: int = 0) -> Any:
     """Return a copy of ``value`` with credential-shaped keys masked for display.
 
-    Recursively walks dicts/lists and replaces the value of any key in
-    ``_SECRET_CONFIG_KEYS`` (case-insensitive) with a masked form via
-    :func:`agent.redact.mask_secret`. Non-secret keys and scalar values pass
+    Recursively walks dicts/lists and replaces the value of any key classified
+    as secret with a masked form via :func:`agent.redact.mask_secret`.
+    Non-secret keys and scalar values pass
     through unchanged. Use this before ``print``-ing any config sub-tree that
     might carry a custom-provider ``api_key`` — ``print`` bypasses the logging
     redactor, and opaque tokens (e.g. Cloudflare ``cfut_...``) don't match the
     vendor-prefix regexes either, so structural key-name masking is required.
     """
-    from agent.redact import mask_secret
+    from agent.redact import is_secret_config_key, mask_secret
 
     # Defensive bound on recursion depth for pathological/cyclic configs.
     if _depth > 20:
@@ -4893,7 +4868,7 @@ def redact_config_value(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(k, str) and k.lower() in _SECRET_CONFIG_KEYS and isinstance(v, str) and v:
+            if is_secret_config_key(k) and isinstance(v, str) and v:
                 out[k] = mask_secret(v)
             else:
                 out[k] = redact_config_value(v, _depth + 1)
@@ -5969,9 +5944,10 @@ def set_config_value(
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
-    _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
-        from agent.redact import mask_secret
+    from agent.redact import is_secret_config_key, mask_secret
+
+    _leaf_key = key.rsplit(".", 1)[-1]
+    if is_secret_config_key(_leaf_key) and isinstance(value, str) and value:
         _display_value = mask_secret(value)
     else:
         _display_value = value

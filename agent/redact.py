@@ -180,7 +180,10 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 #      (optionally after ``export``), so conversational ``I have password=foo``
 #      mid-sentence is left alone.
 # The colon-form URL guard (skip when ``://`` present) lives at the call site.
-_SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
+_SECRET_CFG_NAMES = (
+    r"(?:api[ _.\-]?key|token|secret|passwd|password|pass|pw|credential|auth|"
+    r"authorization|bearer|jwt|cookie|key)"
+)
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
 # can never match either pattern, so the (potentially backtrack-heavy) subs
@@ -220,7 +223,7 @@ _CFG_ANCHORED_RE = re.compile(
 # from the key set so ``Authorization:`` / ``author:`` don't match (the former
 # is masked by _AUTH_HEADER_RE); ``auth_token``/``auth-token`` still match via
 # the ``token`` keyword. Quoted values defer to _JSON_FIELD_RE via the lookahead.
-_YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
+_YAML_CFG_NAMES = _SECRET_CFG_NAMES
 # NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
 # leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
 _YAML_ASSIGN_RE = re.compile(
@@ -253,41 +256,114 @@ _YAML_ASSIGN_RE = re.compile(
 # (``secretary``, ``tokenizer``, ``authored``, ``credentialing``) no longer
 # match. ALL-CAPS keys keep the legacy embedded matching (``MYTOKEN=…``) — an
 # all-caps key is almost never prose, the same rationale as _ENV_ASSIGN_RE.
-_KEY_KEYWORD_RE = re.compile(
-    r"(?:api|auth|access|refresh|session|secret)[ _.\\-]?(?:key|token)"
-    r"|token|secret|passwd|password|pass|pw|credential|auth|key",
-    re.IGNORECASE,
+_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_NON_ALNUM_CONFIG_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
+_LIST_INDEX_SUFFIX_RE = re.compile(r"(?:\[\d+\])+$")
+_SECRET_CONFIG_KEY_WORDS = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "credentials",
+        "jwt",
+        "key",
+        "pass",
+        "passwd",
+        "password",
+        "pw",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+    }
+)
+_SECRET_CONFIG_KEY_PHRASES = frozenset(
+    {
+        ("access", "token"),
+        ("api", "key"),
+        ("auth", "key"),
+        ("auth", "token"),
+        ("bearer", "token"),
+        ("client", "secret"),
+        ("encryption", "key"),
+        ("id", "token"),
+        ("key", "material"),
+        ("pass", "word"),
+        ("private", "key"),
+        ("raw", "secret"),
+        ("refresh", "token"),
+        ("secret", "input"),
+        ("secret", "key"),
+        ("secret", "value"),
+        ("session", "token"),
+        ("signing", "key"),
+    }
 )
 
 
-def _is_word_start(s: str, i: int) -> bool:
-    """True if position ``i`` in ``s`` begins a word (not mid-word)."""
-    if i == 0:
-        return True
-    prev, cur = s[i - 1], s[i]
-    if not prev.isalpha():
-        return True
-    if cur.isupper() and prev.islower():
-        return True  # camelCase: clientSecret
-    # Acronym run ending: APIToken — the 'T' begins a new word when it is
-    # followed by lowercase while the preceding run is uppercase.
-    if cur.isupper() and prev.isupper() and i + 1 < len(s) and s[i + 1].islower():
-        return True
-    return False
+def _canonicalize_config_key(key: object) -> str:
+    text = str(key)
+    text = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", text)
+    text = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", text)
+    return _NON_ALNUM_CONFIG_KEY_RE.sub("_", text).strip("_").casefold()
 
 
-def _is_word_end(s: str, j: int, *, allow_plural: bool = True) -> bool:
-    """True if position ``j`` (exclusive end) in ``s`` ends a word."""
-    if j >= len(s):
+def _secret_phrase_matches(words: tuple[str, ...]) -> bool:
+    normalized = tuple(
+        word[:-1] if word in {"keys", "secrets", "tokens"} else word
+        for word in words
+    )
+    return any(
+        normalized[index : index + len(phrase)] == phrase
+        for phrase in _SECRET_CONFIG_KEY_PHRASES
+        for index in range(len(normalized) - len(phrase) + 1)
+    )
+
+
+def is_secret_config_key(key: object) -> bool:
+    """Return whether one configuration key names credential material."""
+    canonical = _canonicalize_config_key(key)
+    if not canonical:
+        return False
+    words = tuple(part for part in canonical.split("_") if part)
+    if canonical in _SECRET_CONFIG_KEY_WORDS:
         return True
-    cur = s[j]
-    if not cur.isalpha():
+    if any(word in {"credential", "credentials", "passwd", "password"} for word in words):
         return True
-    if cur.isupper() and s[j - 1].islower():
-        return True  # camelCase continuation: secretKey
-    if allow_plural and cur in "sS":
-        return _is_word_end(s, j + 1, allow_plural=False)
-    return False
+    return _secret_phrase_matches(words)
+
+
+def is_secret_config_phrase(segments: tuple[object, ...]) -> bool:
+    """Return whether adjacent structural keys form a secret phrase."""
+    canonical = tuple(
+        _canonicalize_config_key(_LIST_INDEX_SUFFIX_RE.sub("", str(segment)))
+        for segment in segments
+    )
+    normalized = tuple(
+        segment[:-1] if segment in {"keys", "secrets", "tokens"} else segment
+        for segment in canonical
+    )
+    return any(
+        normalized[index : index + len(phrase)] == phrase
+        for phrase in _SECRET_CONFIG_KEY_PHRASES
+        for index in range(len(normalized) - len(phrase) + 1)
+    )
+
+
+def is_secret_config_path(path: str) -> bool:
+    """Return whether a dotted configuration path identifies a secret."""
+    raw_segments = str(path).split(".")
+    segments = tuple(
+        _canonicalize_config_key(_LIST_INDEX_SUFFIX_RE.sub("", segment))
+        for segment in raw_segments
+    )
+    if any(is_secret_config_key(segment) for segment in raw_segments):
+        return True
+    return is_secret_config_phrase(segments)
 
 
 def _key_has_secret_keyword(key: str) -> bool:
@@ -299,27 +375,10 @@ def _key_has_secret_keyword(key: str) -> bool:
     _ENV_ASSIGN_RE key too: all-caps keys short-circuit to the legacy
     embedded-match behavior.
     """
-    letters = [c for c in key if c.isalpha()]
-    if letters and all(c.isupper() for c in letters):
-        # Legacy all-caps behavior (MYTOKEN=…): an all-caps key is almost
-        # never prose. Exception: a bare ``KEY``/``PASS``/``PW`` embedded in
-        # a longer all-caps word (``KEYBOARD``, ``PASSAGE``) is prose, not a
-        # credential — only a word-bounded compound (``API_KEY``,
-        # ``MYSQL_PASSWORD``, ``FAL_KEY``, ``DB_PW``) counts (issue #77484).
-        for m in _KEY_KEYWORD_RE.finditer(key):
-            if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
-                return True
-        return False
-    for m in _KEY_KEYWORD_RE.finditer(key):
-        if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
-            return True
-    return False
+    return is_secret_config_key(key)
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
-    re.IGNORECASE,
+    r'("[A-Za-z][A-Za-z0-9_. -]*")\s*:\s*"([^"]+)"',
 )
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
@@ -893,6 +952,8 @@ def redact_sensitive_text(
                 # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
+                    return m.group(0)
+                if not is_secret_config_key(key):
                     return m.group(0)
                 return f'{key}: "{_mask_token(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)

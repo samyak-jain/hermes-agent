@@ -32,6 +32,11 @@ from typing import Any, Optional
 
 import yaml
 
+from agent.redact import (
+    is_secret_config_key,
+    is_secret_config_path,
+    is_secret_config_phrase,
+)
 from hermes_constants import get_hermes_home
 
 try:  # POSIX production path; Windows keeps process-local atomicity.
@@ -90,42 +95,6 @@ GUARDED_BUILTIN_PATTERNS = frozenset(
     }
 )
 
-# Configuration may describe where a credential comes from, but the broker
-# must never read or write credential material. Key classification first
-# canonicalizes camelCase boundaries and every punctuation/whitespace run to
-# one lowercase underscore. This makes ``clientSecret``, ``client-secret``,
-# ``client.secret``, and ``CLIENT SECRET`` equivalent without treating an
-# ordinary public key or operational counter such as ``token_usage`` as secret.
-_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
-_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
-_NON_ALNUM_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
-_LIST_INDEX_SUFFIX_RE = re.compile(r"(?:\[\d+\])+$")
-_SECRET_KEY_PHRASES = frozenset(
-    {
-        ("api", "key"),
-        ("auth", "token"),
-        ("access", "token"),
-        ("refresh", "token"),
-        ("bearer", "token"),
-        ("client", "secret"),
-        ("pass", "word"),
-        ("private", "key"),
-        ("key", "material"),
-        ("raw", "secret"),
-        ("secret", "input"),
-        ("secret", "value"),
-    }
-)
-_SECRET_KEY_WORDS = frozenset(
-    {
-        "authorization",
-        "cookie",
-        "credential",
-        "credentials",
-        "passwd",
-        "password",
-    }
-)
 _OBVIOUS_SECRET_VALUE_RE = re.compile(
     r"(?:"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
@@ -243,54 +212,12 @@ def _path_class(path: str, config: dict) -> Optional[str]:
     return None
 
 
-def _canonicalize_config_key(key: Any) -> str:
-    """Canonicalize a config key for semantic secret classification.
-
-    Camel/acronym boundaries become separators, then underscores, hyphens,
-    dots, whitespace, and all other punctuation collapse to one underscore.
-    Matching is case-insensitive via ``casefold``.
-    """
-    text = str(key)
-    text = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", text)
-    text = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", text)
-    return _NON_ALNUM_KEY_RE.sub("_", text).strip("_").casefold()
-
-
 def _is_secret_config_key(key: Any) -> bool:
-    """Return whether one key names credential material after canonicalization."""
-    canonical = _canonicalize_config_key(key)
-    if not canonical:
-        return False
-    words = tuple(part for part in canonical.split("_") if part)
-    if any(word in _SECRET_KEY_WORDS for word in words):
-        return True
-    if canonical == "secret" or (words and words[-1] == "secret"):
-        return True
-    if canonical == "token" or (words and words[-1] == "token"):
-        return True
-    return any(
-        words[index : index + len(phrase)] == phrase
-        for phrase in _SECRET_KEY_PHRASES
-        for index in range(len(words) - len(phrase) + 1)
-    )
+    return is_secret_config_key(key)
 
 
 def _secret_shaped_path(path: str) -> bool:
-    # Match declared phrases across exact adjacent mapping keys, including
-    # intervening list indexes. Requiring each structural segment to equal one
-    # phrase word keeps suffix/context fields such as ``api.key_rotation_days``
-    # and ``auth.token_usage`` public. Literal dotted mapping keys are still
-    # classified independently before path composition below.
-    raw_segments = path.split(".")
-    segments = tuple(
-        _canonicalize_config_key(_LIST_INDEX_SUFFIX_RE.sub("", segment))
-        for segment in raw_segments
-    )
-    return any(_is_secret_config_key(segment) for segment in raw_segments) or any(
-        segments[index : index + len(phrase)] == phrase
-        for phrase in _SECRET_KEY_PHRASES
-        for index in range(len(segments) - len(phrase) + 1)
-    )
+    return is_secret_config_path(path)
 
 
 def _value_looks_secret(value: Any) -> bool:
@@ -331,18 +258,35 @@ def _redact_non_secret_view(
     path: str,
     *,
     inherited_sensitive: bool = False,
+    _previous_segment: Optional[str] = None,
+    _path_checked: bool = False,
 ) -> tuple[Any, list[str]]:
     """Return a shape-preserving view with every sensitive scalar redacted."""
-    sensitive = inherited_sensitive or _secret_shaped_path(path)
+    sensitive = inherited_sensitive or (
+        not _path_checked and _secret_shaped_path(path)
+    )
+    previous_segment = _previous_segment
+    if previous_segment is None and path:
+        previous_segment = path.rsplit(".", 1)[-1]
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         redacted: list[str] = []
         for key, child in value.items():
             child_path = f"{path}.{key}" if path else str(key)
+            child_sensitive = sensitive or (
+                not isinstance(child, (dict, list))
+                and _is_secret_config_key(key)
+            )
+            if previous_segment is not None:
+                child_sensitive = child_sensitive or is_secret_config_phrase(
+                    (previous_segment, key)
+                )
             child_value, child_redacted = _redact_non_secret_view(
                 child,
                 child_path,
-                inherited_sensitive=sensitive or _is_secret_config_key(key),
+                inherited_sensitive=child_sensitive,
+                _previous_segment=str(key),
+                _path_checked=True,
             )
             out[key] = child_value
             redacted.extend(child_redacted)
@@ -356,6 +300,8 @@ def _redact_non_secret_view(
                 child,
                 child_path,
                 inherited_sensitive=sensitive,
+                _previous_segment=previous_segment,
+                _path_checked=True,
             )
             out.append(child_value)
             redacted.extend(child_redacted)
@@ -575,6 +521,33 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
     return classification
 
 
+def _inspection_value(
+    path: str,
+    effective_value: Any,
+    raw: dict,
+    managed: dict,
+) -> Any:
+    from hermes_cli.config import _preserve_env_ref_templates
+
+    marker = object()
+    raw_value = _nested(raw, path, marker)
+    managed_value = _nested(managed, path, marker)
+    value = effective_value
+    if managed_value is not marker:
+        value = _preserve_env_ref_templates(
+            value,
+            managed_value,
+            effective_value,
+        )
+    if raw_value is not marker:
+        value = _preserve_env_ref_templates(
+            value,
+            raw_value,
+            effective_value,
+        )
+    return value
+
+
 def inspect_config(path: Optional[str] = None) -> dict:
     """Return the non-secret agent-visible effective configuration view."""
     from hermes_cli import managed_scope
@@ -591,6 +564,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
         value = _nested(effective, path, marker)
         if value is marker:
             raise AgentConfigError(f"Configuration leaf '{path}' is not set.")
+        value = _inspection_value(path, value, raw, managed)
         if not isinstance(value, (dict, list)) and (
             _secret_shaped_path(path) or _value_looks_secret(value)
         ):
@@ -622,7 +596,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
         classification = _path_class(dotted, effective)
         if classification is None or _secret_shaped_path(dotted):
             continue
-        value = effective_flat[dotted]
+        value = _inspection_value(dotted, effective_flat[dotted], raw, managed)
         if isinstance(value, dict) or _value_looks_secret(value):
             continue
         source = _source_for(dotted, raw, managed)

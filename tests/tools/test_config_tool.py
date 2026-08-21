@@ -19,6 +19,7 @@ from hermes_cli.agent_config import (
     prepare_change,
     prepare_rollback,
 )
+from agent.redact import is_secret_config_key, is_secret_config_path
 from tools import config_tool as config_tool_module
 
 
@@ -464,11 +465,56 @@ def test_secret_path_classifier_matches_exact_adjacent_structural_phrases(path: 
 
 
 @pytest.mark.parametrize(
+    "key",
+    [
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
+    ],
+)
+def test_secret_classifiers_share_the_full_canonical_vocabulary(key: str):
+    assert is_secret_config_key(key)
+    assert is_secret_config_path(f"model.runtime_options.{key}")
+    assert _secret_shaped_path(f"model.runtime_options.{key}")
+
+
+def test_config_display_redaction_uses_canonical_secret_classifier():
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.config import redact_config_value
+
+    secrets = {
+        "apikey": "opaque-one",
+        "tokens": "opaque-two",
+        "encryption_key": "opaque-three",
+        "signingKey": "opaque-four",
+    }
+    rendered = json.dumps(redact_config_value(secrets), ensure_ascii=False)
+
+    assert not any(secret in rendered for secret in secrets.values())
+    config_text = "\n".join(
+        [
+            "service.encryption_key=opaque-five",
+            "signing_key: opaque-six",
+            '"api_keys": "opaque-seven"',
+        ]
+    )
+    redacted_text = redact_sensitive_text(config_text, force=True)
+    assert "opaque-five" not in redacted_text
+    assert "opaque-six" not in redacted_text
+    assert "opaque-seven" not in redacted_text
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "model.runtime_options.api.key_rotation_days",
         "model.runtime_options.private.key_count",
-        "model.runtime_options.auth.token_usage",
         "model.runtime_options.client.secret_format",
     ],
 )
@@ -486,6 +532,15 @@ def test_secret_path_classifier_preserves_benign_structural_suffixes(path: str):
         "access-token",
         "private_key",
         "PassWord",
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
     ],
 )
 def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
@@ -503,6 +558,51 @@ def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
 
     assert "short-secret" not in str(exc_info.value)
     assert "short-secret" not in repr(exc_info.value)
+
+
+def test_inspect_returns_raw_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "runtime_options": {"endpoint": "${BROKER_ENDPOINT}/v1"}
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("BROKER_ENDPOINT", "opaque-expanded-value")
+    config_module.invalidate_config_caches(config_path)
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+    listed = {
+        item["path"]: item["value"] for item in inspect_config()["settings"]
+    }
+
+    assert inspected["value"] == "${BROKER_ENDPOINT}/v1"
+    assert listed["model.runtime_options.endpoint"] == "${BROKER_ENDPOINT}/v1"
+    assert "opaque-expanded-value" not in json.dumps(inspected)
+
+
+def test_inspect_returns_managed_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    managed_path = Path(os.environ["HERMES_MANAGED_DIR"]) / "config.yaml"
+    managed = yaml.safe_load(managed_path.read_text(encoding="utf-8"))
+    managed["model"]["runtime_options"] = {
+        "endpoint": "${MANAGED_BROKER_ENDPOINT}/v1"
+    }
+    managed_path.write_text(yaml.safe_dump(managed, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("MANAGED_BROKER_ENDPOINT", "managed-expanded-value")
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+
+    assert inspected["value"] == "${MANAGED_BROKER_ENDPOINT}/v1"
+    assert inspected["source"] == "managed"
+    assert inspected["editable"] is False
+    assert "managed-expanded-value" not in json.dumps(inspected)
 
 
 def test_managed_shadow_report_redacts_canonical_secret_key_variants(
