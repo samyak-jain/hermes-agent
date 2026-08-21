@@ -1251,40 +1251,22 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
-        bg_command = None
-        build_supervised = getattr(env, "build_background_command", None)
-        if callable(build_supervised):
-            supervised = build_supervised(
+        try:
+            result = self._launch_supervised_or_legacy(
+                session,
+                env,
                 command=command,
+                cwd=cwd,
                 log_path=log_path,
                 pid_path=pid_path,
                 exit_path=exit_path,
-                cwd=cwd,
-                ttl_seconds=getattr(
-                    env, "background_ttl_seconds", MAX_ACTIVE_PROCESS_AGE
-                ),
+                quoted_command=quoted_command,
+                quoted_temp_dir=quoted_temp_dir,
+                quoted_log_path=quoted_log_path,
+                quoted_pid_path=quoted_pid_path,
+                quoted_exit_path=quoted_exit_path,
+                timeout=timeout,
             )
-            if supervised is not None:
-                bg_command, session.backend_id = supervised
-
-        if bg_command is None:
-            bg_command = (
-                f"mkdir -p {quoted_temp_dir} && "
-                f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-                f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-                f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
-            )
-
-        try:
-            launch_background = getattr(env, "launch_background_command", None)
-            if callable(launch_background) and session.backend_id:
-                result = launch_background(bg_command, timeout=timeout)
-            else:
-                result = env.execute(
-                    bg_command,
-                    timeout=timeout,
-                    rewrite_compound_background=False,
-                )
             output = result.get("output", "").strip()
             returncode = result.get("returncode", result.get("exit_code", 0))
             try:
@@ -1328,16 +1310,14 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if session.exited:
-            cleanup_backend = getattr(env, "kill_background_unit", None)
-            if callable(cleanup_backend) and session.backend_id:
-                try:
-                    cleanup_backend(session.backend_id)
-                except Exception as cleanup_error:
-                    logger.debug(
-                        "Could not clean failed background unit %s: %s",
-                        session.backend_id,
-                        cleanup_error,
-                    )
+            try:
+                self._release_backend(session, killed=True)
+            except Exception as cleanup_error:
+                logger.debug(
+                    "Could not clean failed background unit %s: %s",
+                    session.backend_id,
+                    cleanup_error,
+                )
             # A returned session ID is a retrieval contract. Keep failed starts
             # in the finished registry so process(wait/log) can explain them.
             self._move_to_finished(session)
@@ -1363,6 +1343,73 @@ class ProcessRegistry:
             self._write_checkpoint()
 
         return session
+
+    def _launch_supervised_or_legacy(
+        self,
+        session: ProcessSession,
+        env: Any,
+        *,
+        command: str,
+        cwd: Optional[str],
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+        quoted_command: str,
+        quoted_temp_dir: str,
+        quoted_log_path: str,
+        quoted_pid_path: str,
+        quoted_exit_path: str,
+        timeout: int,
+    ) -> Dict[str, Any]:
+        bg_command = None
+        build_supervised = getattr(env, "build_background_command", None)
+        if callable(build_supervised):
+            supervised = build_supervised(
+                command=command,
+                log_path=log_path,
+                pid_path=pid_path,
+                exit_path=exit_path,
+                cwd=cwd,
+                ttl_seconds=getattr(
+                    env, "background_ttl_seconds", MAX_ACTIVE_PROCESS_AGE
+                ),
+            )
+            if supervised is not None:
+                bg_command, session.backend_id = supervised
+
+        if bg_command is None:
+            bg_command = (
+                f"mkdir -p {quoted_temp_dir} && "
+                f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
+                f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
+                f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            )
+
+        launch_background = getattr(env, "launch_background_command", None)
+        if callable(launch_background) and session.backend_id:
+            return launch_background(bg_command, timeout=timeout)
+        return env.execute(
+            bg_command,
+            timeout=timeout,
+            rewrite_compound_background=False,
+        )
+
+    @staticmethod
+    def _release_backend(session: ProcessSession, killed: bool) -> bool:
+        if not session.env_ref or not session.backend_id:
+            return False
+        method_name = (
+            "kill_background_unit" if killed else "release_background_unit"
+        )
+        release = getattr(session.env_ref, method_name, None)
+        if not callable(release):
+            if killed:
+                raise RuntimeError(
+                    "Remote background supervisor cannot be stopped by this backend"
+                )
+            return False
+        release(session.backend_id)
+        return True
 
     # ----- Reader / Poller Threads -----
 
@@ -1503,15 +1550,29 @@ class ProcessRegistry:
     ):
         """Background thread: poll a sandbox log file for non-local backends."""
         quoted_log_path = shlex.quote(log_path)
-        quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
         prev_output_len = 0  # track delta for watch pattern scanning
         while not session.exited:
             time.sleep(2)  # Poll every 2 seconds
             try:
-                # Read new output from the log file
-                result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
-                new_output = result.get("output", "")
+                if session.backend_id:
+                    try:
+                        poll_result = env.poll_background_unit(
+                            session.backend_id,
+                            log_path=log_path,
+                            pid_path=pid_path,
+                            exit_path=exit_path,
+                            timeout=10,
+                        )
+                    except AttributeError:
+                        poll_result = self._poll_legacy_backend(
+                            env, quoted_log_path, quoted_exit_path
+                        )
+                else:
+                    poll_result = self._poll_legacy_backend(
+                        env, quoted_log_path, quoted_exit_path
+                    )
+                new_output = str(poll_result.get("output") or "")
                 if new_output:
                     # Compute delta for watch pattern scanning
                     delta = new_output[prev_output_len:] if len(new_output) > prev_output_len else ""
@@ -1524,31 +1585,15 @@ class ProcessRegistry:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
-                # Check if process is still running
-                check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
-                    timeout=5,
-                )
-                check_output = check.get("output", "").strip()
-                if check_output and check_output.splitlines()[-1].strip() != "0":
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
+                if not poll_result.get("running", True):
                     try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
+                        session.exit_code = int(poll_result.get("exit_code"))
+                    except (TypeError, ValueError):
                         session.exit_code = -1
                     session.exited = True
                     if session.completion_reason != "killed":
                         session.completion_reason = "exited"
-                    release_backend = getattr(
-                        env, "release_background_unit", None
-                    )
-                    if callable(release_backend) and session.backend_id:
-                        release_backend(session.backend_id)
+                    self._release_backend(session, killed=False)
                     self._move_to_finished(session)
                     return
 
@@ -1558,11 +1603,38 @@ class ProcessRegistry:
                 session.exit_code = -1
                 session.completion_reason = "lost"
                 session.termination_source = "backend_lost"
-                release_backend = getattr(env, "release_background_unit", None)
-                if callable(release_backend) and session.backend_id:
-                    release_backend(session.backend_id)
+                self._release_backend(session, killed=False)
                 self._move_to_finished(session)
                 return
+
+    @staticmethod
+    def _poll_legacy_backend(
+        env: Any,
+        quoted_log_path: str,
+        quoted_exit_path: str,
+    ) -> Dict[str, Any]:
+        marker = "HERMES_BG_LOG_FOLLOWS"
+        command = (
+            f"if [ -s {quoted_exit_path} ]; then "
+            f"printf 'HERMES_BG_EXIT='; tail -n 1 -- {quoted_exit_path}; "
+            "else printf 'HERMES_BG_EXIT=\\n'; fi; "
+            f"printf '{marker}\\n'; cat {quoted_log_path} 2>/dev/null || true"
+        )
+        result = env.execute(command, timeout=10)
+        payload = str(result.get("output") or "")
+        header, separator, output = payload.partition(f"{marker}\n")
+        if not separator:
+            raise RuntimeError("Invalid background poll response")
+        exit_value = ""
+        for line in header.splitlines():
+            if line.startswith("HERMES_BG_EXIT="):
+                exit_value = line.partition("=")[2].strip()
+                break
+        return {
+            "output": output,
+            "running": not bool(exit_value),
+            "exit_code": int(exit_value) if exit_value else None,
+        }
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1747,6 +1819,8 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        from tools.async_delegation import ROUTED_COMPLETION_TYPES
+
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         while not self.completion_queue.empty():
@@ -1758,7 +1832,7 @@ class ProcessRegistry:
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
             # legacy single-session delivery.
-            is_agent_result = evt.get("type") in {"async_delegation", "spawn_result"}
+            is_agent_result = evt.get("type") in ROUTED_COMPLETION_TYPES
             evt_session_key = str(evt.get("session_key") or "")
             evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
             requires_positive_proof = is_agent_result or bool(
@@ -2185,12 +2259,7 @@ class ProcessRegistry:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.backend_id:
-                kill_backend = getattr(session.env_ref, "kill_background_unit", None)
-                if not callable(kill_backend):
-                    raise RuntimeError(
-                        "Remote background supervisor cannot be stopped by this backend"
-                    )
-                kill_backend(session.backend_id)
+                self._release_backend(session, killed=True)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 # Prefer a process-group kill so grandchildren cannot escape
@@ -2695,21 +2764,15 @@ class ProcessRegistry:
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
-            pid = entry.get("pid")
-            if not pid:
-                continue
-
             pid_scope = entry.get("pid_scope", "host")
             if pid_scope != "host":
-                # Sandbox-backed processes keep only in-sandbox PIDs in the
-                # checkpoint, which are not meaningful to the restarted host
-                # process once the original environment handle is gone.
-                logger.info(
-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
-                    entry.get("command", "unknown")[:60],
-                    pid,
-                    pid_scope,
-                )
+                backend_id = str(entry.get("backend_id") or "")
+                if backend_id and not self._stop_recovered_backend(entry):
+                    unresolved_scope_entries.append(entry)
+                continue
+
+            pid = entry.get("pid")
+            if not pid:
                 continue
 
             # The PID must be alive AND still the same process we spawned. A
@@ -2786,6 +2849,36 @@ class ProcessRegistry:
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
 
         return recovered
+
+    def _stop_recovered_backend(self, entry: Dict[str, Any]) -> bool:
+        backend_id = str(entry.get("backend_id") or "")
+        if not backend_id:
+            return False
+        try:
+            from tools.environments.ssh import SSHEnvironment
+            from tools.terminal_tool import ensure_task_env
+
+            env = ensure_task_env(str(entry.get("task_id") or "default"))
+            if not isinstance(env, SSHEnvironment):
+                return False
+            session = ProcessSession(
+                id=str(entry.get("session_id") or "recovered"),
+                command=str(entry.get("command") or "unknown"),
+                env_ref=env,
+                backend_id=backend_id,
+                pid_scope="sandbox",
+            )
+            self._release_backend(session, killed=True)
+            logger.info("Stopped recovered SSH background unit %s", backend_id)
+            return True
+        except Exception:
+            logger.warning(
+                "Could not stop recovered remote background unit %s; its "
+                "configured TTL remains the restart cleanup backstop",
+                backend_id,
+                exc_info=True,
+            )
+            return False
 
 
 # Module-level singleton
