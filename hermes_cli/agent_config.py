@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -43,6 +44,11 @@ try:  # POSIX production path; Windows keeps process-local atomicity.
     import fcntl
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
+
+logger = logging.getLogger(__name__)
+
+_MAX_REVISIONS = 100
+_MAX_AUDIT_RECORDS = 1000
 
 
 SAFE_BUILTIN_PATTERNS = frozenset(
@@ -192,7 +198,12 @@ def _ownership_mode(config: dict) -> str:
     return mode if mode in {"allowlist", "unmanaged"} else "allowlist"
 
 
-def _path_class(path: str, config: dict) -> Optional[str]:
+def _path_class(
+    path: str,
+    config: dict,
+    *,
+    managed_keys: Optional[set[str]] = None,
+) -> Optional[str]:
     if _ownership_mode(config) == "unmanaged":
         from hermes_cli import managed_scope
         from hermes_cli.config import _validate_config_key
@@ -201,7 +212,9 @@ def _path_class(path: str, config: dict) -> Optional[str]:
         marker = object()
         if not known and _nested(config, path, marker) is marker:
             return None
-        return "operator_managed" if managed_scope.is_key_managed(path) else "agent_owned"
+        if managed_keys is None:
+            managed_keys = managed_scope.managed_config_keys()
+        return "operator_managed" if path in managed_keys else "agent_owned"
 
     safe_policy = _configured_patterns(config, "editable_paths")
     guarded_policy = _configured_patterns(config, "guarded_paths")
@@ -487,7 +500,13 @@ def _assert_enabled(config: dict) -> None:
         )
 
 
-def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
+def _assert_path_allowed(
+    path: str,
+    config: dict,
+    *,
+    for_write: bool,
+    managed_keys: Optional[set[str]] = None,
+) -> str:
     path = str(path or "").strip()
     if not path or path.startswith(".") or path.endswith(".") or ".." in path:
         raise AgentConfigError("A valid dotted configuration leaf is required.")
@@ -504,7 +523,7 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
             f"'{path}' is credential-shaped. Secrets must use the authentication "
             "or secret-management workflow, never config.yaml."
         )
-    classification = _path_class(path, config)
+    classification = _path_class(path, config, managed_keys=managed_keys)
     if classification is None:
         raise AgentConfigError(
             f"'{path}' is not a recognized or operator-authorized agent "
@@ -513,7 +532,9 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
     if for_write:
         from hermes_cli import managed_scope
 
-        if classification == "operator_managed" or managed_scope.is_key_managed(path):
+        if managed_keys is None:
+            managed_keys = managed_scope.managed_config_keys()
+        if classification == "operator_managed" or path in managed_keys:
             raise AgentConfigError(
                 f"'{path}' is managed by Kumo/your administrator and cannot be "
                 "changed through the agent-owned configuration."
@@ -557,6 +578,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
     _assert_enabled(effective)
     raw = read_raw_config()
     managed = managed_scope.load_managed_config()
+    managed_keys = managed_scope.managed_config_keys()
     effective_flat = _flatten(effective)
 
     if path:
@@ -572,7 +594,12 @@ def inspect_config(path: Optional[str] = None) -> dict:
                 f"Requested scalar '{path}' is sensitive and cannot be returned "
                 "through the non-secret configuration view."
             )
-        classification = _assert_path_allowed(path, effective, for_write=False)
+        classification = _assert_path_allowed(
+            path,
+            effective,
+            for_write=False,
+            managed_keys=managed_keys,
+        )
         safe_value, redacted_paths = _redact_non_secret_view(value, path)
         source = _source_for(path, raw, managed)
         result = {
@@ -593,7 +620,11 @@ def inspect_config(path: Optional[str] = None) -> dict:
         top = dotted.split(".", 1)[0]
         if top.startswith("_") or top in {"agent_config", "soul_edit"}:
             continue
-        classification = _path_class(dotted, effective)
+        classification = _path_class(
+            dotted,
+            effective,
+            managed_keys=managed_keys,
+        )
         if classification is None or _secret_shaped_path(dotted):
             continue
         value = _inspection_value(dotted, effective_flat[dotted], raw, managed)
@@ -839,6 +870,12 @@ def _write_backup(revision: str, before: bytes) -> Path:
         os.chmod(revisions, 0o700)
     except OSError:
         pass
+    backups = sorted(revisions.glob("*.yaml"), key=lambda item: item.name)
+    for expired in backups[: max(0, len(backups) - _MAX_REVISIONS + 1)]:
+        try:
+            expired.unlink()
+        except OSError as exc:
+            logger.warning("Failed to prune configuration revision %s: %s", expired, exc)
     path = revisions / f"{revision}.yaml"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as handle:
@@ -851,13 +888,22 @@ def _write_backup(revision: str, before: bytes) -> Path:
 def _append_audit(record: dict) -> None:
     path = _state_dir() / "audit.jsonl"
     encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "ab") as handle:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as handle:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0, os.SEEK_END)
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
+        handle.seek(0)
+        lines = handle.readlines()
+        if len(lines) > _MAX_AUDIT_RECORDS:
+            handle.seek(0)
+            handle.writelines(lines[-_MAX_AUDIT_RECORDS:])
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -955,9 +1001,6 @@ def apply_change(prepared: dict, *, actor: str = "") -> dict:
                 "Configuration audit persistence failed, so the prepared change "
                 "was automatically rolled back."
             ) from audit_exc
-        from hermes_cli.config import invalidate_config_caches
-
-        invalidate_config_caches(config_path)
     return {
         "success": True,
         "revision": revision,
@@ -1027,6 +1070,10 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
         raise AgentConfigError(
             "The rollback reason must be under 500 characters and contain no credentials."
         )
+    from hermes_cli.config import get_config_path, load_config
+
+    effective = load_config()
+    _assert_enabled(effective)
     path = _state_dir() / "audit.jsonl"
     target = None
     try:
@@ -1044,12 +1091,13 @@ def prepare_rollback(revision: str, *, reason: str) -> dict:
     if target is None:
         raise AgentConfigError(f"Unknown configuration revision '{revision}'.")
     backup = _state_dir() / "revisions" / f"{revision}.yaml"
-    before = backup.read_bytes()
+    try:
+        before = backup.read_bytes()
+    except FileNotFoundError as exc:
+        raise AgentConfigError(
+            f"Configuration revision '{revision}' no longer has a retained backup."
+        ) from exc
     _validate_candidate(_load_yaml_bytes(before))
-    from hermes_cli.config import get_config_path, load_config
-
-    effective = load_config()
-    _assert_enabled(effective)
     current = _read_raw_bytes(get_config_path())
     current_exists = get_config_path().exists()
     if (
@@ -1130,9 +1178,6 @@ def apply_rollback(prepared: dict, *, actor: str = "") -> dict:
             raise AgentConfigError(
                 "Rollback audit persistence failed, so the rollback itself was undone."
             ) from audit_exc
-        from hermes_cli.config import invalidate_config_caches
-
-        invalidate_config_caches(config_path)
     return {
         "success": True,
         "revision": rollback_revision,

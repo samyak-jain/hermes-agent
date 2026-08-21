@@ -832,6 +832,52 @@ def test_autonomous_policy_skips_approval_and_writes_atomically(
     assert oct(backup.stat().st_mode & 0o777) == "0o600"
 
 
+def test_broker_history_and_secret_backups_are_retention_capped(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import hermes_cli.agent_config as agent_config_module
+
+    monkeypatch.setattr(agent_config_module, "_MAX_REVISIONS", 2)
+    monkeypatch.setattr(agent_config_module, "_MAX_AUDIT_RECORDS", 3)
+    for skin in ("pastel", "default", "pastel", "default"):
+        apply_change(
+            prepare_change(
+                operation="set",
+                path="display.skin",
+                value=skin,
+                reason=f"operator selected {skin}",
+            )
+        )
+
+    state_dir = broker_home / "state" / "agent-config"
+    assert len(list((state_dir / "revisions").glob("*.yaml"))) == 2
+    assert len((state_dir / "audit.jsonl").read_text().splitlines()) == 3
+    assert history(limit=100)["count"] == 3
+
+
+def test_prepare_rollback_names_missing_retained_backup(broker_home: Path):
+    changed = apply_change(
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="pastel",
+            reason="operator selected pastel",
+        )
+    )
+    backup = (
+        broker_home
+        / "state"
+        / "agent-config"
+        / "revisions"
+        / f"{changed['revision']}.yaml"
+    )
+    backup.unlink()
+
+    with pytest.raises(AgentConfigError, match=changed["revision"]):
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+
+
 def test_required_approval_denial_changes_nothing(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
