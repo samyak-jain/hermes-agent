@@ -1357,13 +1357,14 @@ def load_gateway_config() -> GatewayConfig:
         # while profile-scoped credentials can still enable the adapter. That
         # creates a connected but differently-authorized secondary bot.
         has_user_config = config_yaml_path.exists()
-        if has_user_config or managed_scope.get_managed_dir() is not None:
+        managed_dir = managed_scope.get_managed_dir()
+        if has_user_config or managed_dir is not None:
             yaml_cfg = {}
         if has_user_config:
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
 
-        if has_user_config or managed_scope.get_managed_dir() is not None:
+        if has_user_config or managed_dir is not None:
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
             # through hermes_cli.config.load_config, so without this a managed
