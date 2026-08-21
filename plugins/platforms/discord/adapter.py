@@ -1167,6 +1167,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._disconnecting = False
         self._missed_message_backfill_task: Optional[asyncio.Task] = None
         self._missed_message_backfill_retry_task: Optional[asyncio.Task] = None
+        self._discord_recovery_retry_deadline: Optional[float] = None
         # Live receipts wait behind the startup scan, while commands and
         # clarification replies may bypass that barrier to unblock a recovered
         # turn. Per-channel receipt states hold later successes behind any
@@ -2929,6 +2930,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._liveness_task = None
         self._missed_message_backfill_task = None
         self._missed_message_backfill_retry_task = None
+        self._discord_recovery_retry_deadline = None
         recovery_barrier = getattr(self, "_discord_recovery_barrier", None)
         if recovery_barrier is not None:
             recovery_barrier.set()
@@ -3312,18 +3314,30 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _schedule_discord_recovery_retry(self, delay: float) -> None:
         """Rescan after an observed foreign claim changes."""
+        loop = asyncio.get_running_loop()
+        delay = max(0.1, delay)
+        deadline = loop.time() + delay
         existing = self._missed_message_backfill_retry_task
         if existing is not None and not existing.done():
-            return
+            if (
+                self._discord_recovery_retry_deadline is not None
+                and deadline >= self._discord_recovery_retry_deadline
+            ):
+                return
+            existing.cancel()
 
         async def retry() -> None:
             try:
-                await asyncio.sleep(max(0.1, delay))
+                await asyncio.sleep(delay)
                 if not self._disconnecting and self._client is not None:
                     self._ensure_missed_message_backfill_task()
             except asyncio.CancelledError:
                 raise
+            finally:
+                if self._missed_message_backfill_retry_task is asyncio.current_task():
+                    self._discord_recovery_retry_deadline = None
 
+        self._discord_recovery_retry_deadline = deadline
         self._missed_message_backfill_retry_task = asyncio.create_task(
             retry()
         )
@@ -3334,6 +3348,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if runner is None:
             return
         logged = False
+        delay = 0.05
         while getattr(runner, "_startup_restore_in_progress", False):
             if not logged:
                 logger.info(
@@ -3342,7 +3357,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name,
                 )
                 logged = True
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(delay)
+            delay = min(0.5, delay * 2)
 
     async def _known_missed_message_backfill_channels(self) -> set[str]:
         """Return configured, marked, home, ambient, DM, and active channels."""
@@ -3956,6 +3972,7 @@ class DiscordAdapter(BasePlatformAdapter):
         historical inputs must be allowed through the active-session path in
         chronological order, exactly as live Gateway events would be.
         """
+        delay = 0.05
         while not blocking_task.done():
             session_key = self._discord_recovery_session_keys.get(
                 blocking_message_id
@@ -4000,10 +4017,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             done, _ = await asyncio.wait(
                 {blocking_task},
-                timeout=0.05,
+                timeout=delay,
             )
             if done:
                 break
+            delay = min(0.5, delay * 2)
         return False
 
     def _discord_failure_retry_delay(self, message_id: str) -> float:
@@ -5689,6 +5707,23 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        recovery_receipt_ids = [
+            str(value)
+            for value in (metadata or {}).get(
+                _GATEWAY_RECEIPT_IDS_KEY,
+                [],
+            )
+            if str(value)
+        ]
+        recovery_reply_to = str(
+            (metadata or {}).get("reply_to_message_id")
+            or reply_to
+            or (
+                recovery_receipt_ids[0]
+                if recovery_receipt_ids
+                else ""
+            )
+        )
         if not (content or "").strip():
             logger.warning(
                 "[%s] Dropped empty message to chat=%s (caller bug). Call site:\n%s",
@@ -5706,23 +5741,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # both never sent and never retried.
             await asyncio.to_thread(
                 self._record_discord_response,
-                reply_to=reply_to,
+                reply_to=recovery_reply_to,
                 result=result,
                 content=content,
                 final=bool(metadata and metadata.get("notify")),
+                receipt_ids=recovery_receipt_ids,
             )
             return result
 
         claim_guard = None
-        recovery_reply_to = str(reply_to or "")
-        recovery_receipt_ids = [
-            str(value)
-            for value in (metadata or {}).get(
-                _GATEWAY_RECEIPT_IDS_KEY,
-                [],
-            )
-            if str(value)
-        ]
 
         async def release_claim_guard() -> None:
             nonlocal claim_guard
@@ -5745,6 +5772,11 @@ class DiscordAdapter(BasePlatformAdapter):
             recovery_reply_to = str(
                 (metadata or {}).get("reply_to_message_id")
                 or reply_to
+                or (
+                    recovery_receipt_ids[0]
+                    if recovery_receipt_ids
+                    else ""
+                )
                 or ""
             )
             claim_epoch = self._discord_recovery_claim_epochs.get(

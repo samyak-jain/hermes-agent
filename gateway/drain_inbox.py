@@ -127,10 +127,26 @@ class DrainInbox:
                             message_key TEXT NOT NULL,
                             payload TEXT NOT NULL,
                             acknowledged INTEGER NOT NULL DEFAULT 0,
+                            invalid_at REAL,
+                            invalid_error TEXT,
                             created_at REAL NOT NULL
                         )
                         """
                     )
+                    columns = {
+                        row[1]
+                        for row in conn.execute(
+                            "PRAGMA table_info(drain_inbox)"
+                        ).fetchall()
+                    }
+                    if "invalid_at" not in columns:
+                        conn.execute(
+                            "ALTER TABLE drain_inbox ADD COLUMN invalid_at REAL"
+                        )
+                    if "invalid_error" not in columns:
+                        conn.execute(
+                            "ALTER TABLE drain_inbox ADD COLUMN invalid_error TEXT"
+                        )
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS drain_inbox_created "
                         "ON drain_inbox(created_at, id)"
@@ -200,21 +216,25 @@ class DrainInbox:
     def pending(self) -> list[QueuedDrainEvent]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, payload FROM drain_inbox ORDER BY created_at, id"
+                "SELECT id, payload FROM drain_inbox "
+                "WHERE invalid_at IS NULL ORDER BY created_at, id"
             ).fetchall()
-        result: list[QueuedDrainEvent] = []
-        for row in rows:
-            try:
-                result.append(
-                    QueuedDrainEvent(
-                        row_id=int(row["id"]),
-                        event=_event_from_payload(json.loads(row["payload"])),
+            result: list[QueuedDrainEvent] = []
+            for row in rows:
+                try:
+                    result.append(
+                        QueuedDrainEvent(
+                            row_id=int(row["id"]),
+                            event=_event_from_payload(json.loads(row["payload"])),
+                        )
                     )
-                )
-            except Exception:
-                # Keep malformed rows for operator inspection instead of
-                # silently deleting user input.
-                continue
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE drain_inbox SET invalid_at=?, invalid_error=? "
+                        "WHERE id=?",
+                        (time.time(), str(exc), int(row["id"])),
+                    )
+            conn.commit()
         return result
 
     def delete(self, row_id: int) -> None:

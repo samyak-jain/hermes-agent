@@ -468,6 +468,29 @@ async def test_repeated_ready_coalesces_instead_of_cancelling_active_recovery(ad
 
 
 @pytest.mark.asyncio
+async def test_recovery_retry_reschedules_for_shorter_delay(
+    adapter,
+    monkeypatch,
+):
+    ensured = MagicMock()
+    monkeypatch.setattr(
+        adapter,
+        "_ensure_missed_message_backfill_task",
+        ensured,
+    )
+
+    adapter._schedule_discord_recovery_retry(10.0)
+    first = adapter._missed_message_backfill_retry_task
+    adapter._schedule_discord_recovery_retry(0.1)
+    second = adapter._missed_message_backfill_retry_task
+
+    assert second is not first
+    await asyncio.sleep(0.15)
+    ensured.assert_called_once_with()
+    await asyncio.gather(first, second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_recovery_waits_until_gateway_startup_restore_has_finished(
     adapter, monkeypatch
 ):

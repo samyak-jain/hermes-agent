@@ -240,3 +240,25 @@ async def test_replay_keeps_row_when_adapter_cannot_prepare(tmp_path):
 
     assert await runner._replay_external_drain_inbox() == 0
     assert store.count() == 1
+
+
+def test_malformed_drain_row_is_flagged_after_first_parse(tmp_path):
+    store = DrainInbox(tmp_path / "drain.db")
+    assert store.pending() == []
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO drain_inbox "
+            "(dedup_key, message_key, payload, created_at) "
+            "VALUES ('bad', 'bad', '{', 1)"
+        )
+
+    assert store.pending() == []
+    assert store.pending() == []
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT invalid_at, invalid_error FROM drain_inbox "
+            "WHERE dedup_key='bad'"
+        ).fetchone()
+
+    assert row[0] is not None
+    assert row[1]
