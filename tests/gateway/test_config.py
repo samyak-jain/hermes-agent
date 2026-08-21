@@ -1146,8 +1146,8 @@ class TestLoadGatewayConfig:
         (managed_dir / "config.yaml").write_text(
             "platforms:\n"
             "  discord:\n"
-            "    allow_from:\n"
-            '      - "1531228453901439109"\n',
+            "    channel_prompts:\n"
+            '      "1531228453901439109": managed prompt\n',
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -1157,7 +1157,9 @@ class TestLoadGatewayConfig:
         discord = config.platforms[Platform.DISCORD]
 
         assert not (hermes_home / "config.yaml").exists()
-        assert discord.extra["allow_from"] == ["1531228453901439109"]
+        assert discord.extra["channel_prompts"] == {
+            "1531228453901439109": "managed prompt",
+        }
 
 
 class TestWebhookPortBridging:
