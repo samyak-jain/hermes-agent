@@ -69,7 +69,9 @@ _PREVIEW_RAW_SELECT = (
 
 
 _ENDING_PREVIEW_RAW_SELECT = (
-    "SUBSTR(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), -243, 243)"
+    "CAST(LENGTH(m3.content) AS TEXT) || X'00' || "
+    "SUBSTR(RTRIM(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' ')), "
+    "-240, 240)"
 )
 
 
@@ -87,8 +89,18 @@ def _shape_preview(raw: Any) -> str:
 
 def _shape_ending_preview(raw: Any) -> str:
     """Turn an ``_ending_preview_raw`` column into a compact tail preview."""
-    text = str(raw or "").strip()
-    return ("..." if len(text) > 240 else "") + text[-240:]
+    encoded = str(raw or "")
+    length_text, separator, tail = encoded.partition("\x00")
+    if separator:
+        try:
+            truncated = int(length_text) > 240
+        except ValueError:
+            truncated = len(tail.strip()) > 240
+        text = tail.strip()
+    else:
+        text = encoded.strip()
+        truncated = len(text) > 240
+    return ("..." if truncated else "") + text[-240:]
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
