@@ -53,7 +53,7 @@ Phase-2 verification notes:
 - The repository-wide runner completed all 2,138 files with 43,589 passing tests. It encountered a host `/tmp` quota during the run; all 238 affected tests pass when rerun with a worktree-local temp directory. Two unrelated long-running `run_agent` files exceeded the runner's 300-second per-file timeout under the loaded host; an isolated retry of `test_provider_fallback.py` reproduced the pre-existing hang after its first 12 tests and was stopped after confirming it was outside workshop execution.
 - Five genuine assertions remain, and all five reproduce from a clean archive of production starting commit `db5281cade17b6292f22768ce26123cec7956093`: one AWS-region default assertion in `tests/agent/test_bedrock_integration.py`, two model-catalog assertions in `tests/hermes_cli/test_models.py`, and two restricted-PATH SSH fixture assertions in `tests/tools/test_ssh_environment.py`. Phase 2 introduces no new full-suite assertion failure.
 
-Implementation branch: `workshop-platform`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
+Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 
 Primary inputs:
 
