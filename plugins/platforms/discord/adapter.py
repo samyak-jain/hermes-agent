@@ -4934,6 +4934,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         status = "processed" if outcome == ProcessingOutcome.SUCCESS else ("cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed")
         now = self._utc_now_iso()
+        active_cutoff = self._discord_active_claim_cutoff()
 
         def _op(conn):
             for message_id in message_ids:
@@ -4950,9 +4951,12 @@ class DiscordAdapter(BasePlatformAdapter):
                            END,
                                updated_at=?
                          WHERE message_id=?
-                           AND claim_owner IS NULL
+                           AND (
+                               claim_owner IS NULL
+                               OR updated_at < ?
+                           )
                         """,
-                        (status, now, message_id),
+                        (status, now, message_id, active_cutoff),
                     )
                     continue
                 conn.execute(

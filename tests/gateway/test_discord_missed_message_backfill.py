@@ -1183,6 +1183,37 @@ def test_record_seen_does_not_refresh_foreign_stale_claim(adapter):
     assert replacement._claim_live_discord_message(message) == "claimed"
 
 
+def test_ignore_outcome_terminally_resolves_expired_foreign_claim(adapter):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    assert adapter._claim_live_discord_message(message) == "claimed"
+    stale = (
+        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
+    ).isoformat()
+    adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
+            (stale, message_id),
+        )
+    )
+
+    replacement = DiscordAdapter(
+        PlatformConfig(enabled=True, token="replacement")
+    )
+    replacement._record_discord_claim_outcome(
+        [message_id],
+        ProcessingOutcome.SUCCESS,
+    )
+
+    row = replacement._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT status FROM discord_messages WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+    )
+    assert row == ("processed",)
+
+
 @pytest.mark.asyncio
 async def test_processing_claim_heartbeat_renews_long_running_turn(
     adapter,
