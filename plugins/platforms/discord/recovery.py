@@ -266,6 +266,8 @@ class DiscordRecoveryStore:
                 last_error TEXT,
                 claim_owner TEXT,
                 claim_epoch INTEGER NOT NULL DEFAULT 0,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
                 routing_thread_id TEXT,
                 updated_at TEXT NOT NULL
             )
@@ -280,6 +282,15 @@ class DiscordRecoveryStore:
             conn.execute(
                 "ALTER TABLE discord_messages "
                 "ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "owner_pid" not in columns:
+            conn.execute(
+                "ALTER TABLE discord_messages ADD COLUMN owner_pid INTEGER"
+            )
+        if "owner_started_at" not in columns:
+            conn.execute(
+                "ALTER TABLE discord_messages "
+                "ADD COLUMN owner_started_at INTEGER"
             )
         if "routing_thread_id" not in columns:
             conn.execute(

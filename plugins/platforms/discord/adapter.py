@@ -152,6 +152,7 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig
+from gateway.delivery_ledger import _owner_alive, _owner_stamp
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -1185,8 +1186,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_recovery_user_cancelled_sessions: set[str] = set()
         self._discord_recovery_receipts: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._discord_recovery_message_channels: Dict[str, str] = {}
-        self._discord_recovery_claim_heartbeats: Dict[str, asyncio.Task] = {}
         self._discord_recovery_claim_owner = uuid.uuid4().hex
+        (
+            self._discord_recovery_owner_pid,
+            self._discord_recovery_owner_started_at,
+        ) = _owner_stamp()
         self._discord_recovery_claim_epochs: Dict[str, int] = {}
         self._discord_cursor_db = None
         self._discord_cursor_db_lock = threading.Lock()
@@ -1787,7 +1791,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if durable_claim == "active":
                 # Discord may replay MESSAGE_CREATE after the in-memory dedupe
                 # TTL while the original turn is still waiting for user input.
-                # Its heartbeat-backed durable lease remains the owner.
+                # Its durable process claim remains the owner.
                 if not self._discord_message_has_active_claim(message_id):
                     self._schedule_discord_recovery_retry(0.1)
                 return False
@@ -1801,7 +1805,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     ProcessingOutcome.SUCCESS,
                 )
                 return False
-            self._start_discord_processing_claim_heartbeats([message_id])
         if not self._ready_event.is_set():
             try:
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
@@ -1814,9 +1817,6 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             try:
                 if cursor is not None and int(message_id) <= int(cursor):
-                    await self._stop_discord_processing_claim_heartbeats(
-                        [message_id]
-                    )
                     await asyncio.to_thread(
                         self._record_discord_claim_outcome,
                         [message_id],
@@ -1839,9 +1839,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     # it through its real lifecycle.
                     return False
                 await self._discord_recovery_barrier.wait()
-                await self._stop_discord_processing_claim_heartbeats(
-                    [message_id]
-                )
                 await asyncio.to_thread(
                     self._record_discord_claim_outcome,
                     [message_id],
@@ -1858,9 +1855,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     role_authorized=role_authorized,
                 )
             except BaseException:
-                await self._stop_discord_processing_claim_heartbeats(
-                    [message_id]
-                )
                 await asyncio.to_thread(
                     self._record_discord_claim_outcome,
                     [message_id],
@@ -1880,9 +1874,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 # registered older receipts, so hold only the cursor commit
                 # behind the recovery barrier.
                 await self._discord_recovery_barrier.wait()
-                await self._stop_discord_processing_claim_heartbeats(
-                    [message_id]
-                )
                 await asyncio.to_thread(
                     self._record_discord_claim_outcome,
                     [message_id],
@@ -2199,7 +2190,6 @@ class DiscordAdapter(BasePlatformAdapter):
         boundary_reason: Optional[str] = None,
     ) -> None:
         """Record outcomes and commit only each channel's contiguous prefix."""
-        await self._stop_discord_processing_claim_heartbeats(message_ids)
         by_channel: Dict[str, list[str]] = defaultdict(list)
         for message_id in message_ids:
             channel_id = self._discord_recovery_message_channels.get(message_id)
@@ -2389,7 +2379,6 @@ class DiscordAdapter(BasePlatformAdapter):
         outcome: ProcessingOutcome = ProcessingOutcome.SUCCESS,
     ) -> None:
         message_ids = self._discord_event_receipt_ids(event)
-        await self._stop_discord_processing_claim_heartbeats(message_ids)
         await asyncio.to_thread(
             self._record_discord_claim_outcome,
             message_ids,
@@ -2544,7 +2533,6 @@ class DiscordAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         waiter = loop.create_future()
         self._discord_recovery_waiters[message_id] = waiter
-        self._start_discord_processing_claim_heartbeats([message_id])
         try:
             admitted = await self._handle_message(
                 message,
@@ -2554,9 +2542,6 @@ class DiscordAdapter(BasePlatformAdapter):
             if started is not None:
                 started.set()
             if not admitted:
-                await self._stop_discord_processing_claim_heartbeats(
-                    [message_id]
-                )
                 await asyncio.to_thread(
                     self._record_discord_claim_outcome,
                     [message_id],
@@ -2583,7 +2568,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             if started is not None:
                 started.set()
-            await self._stop_discord_processing_claim_heartbeats([message_id])
             await asyncio.to_thread(
                 self._record_discord_claim_outcome,
                 [message_id],
@@ -2598,7 +2582,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             if started is not None:
                 started.set()
-            await self._stop_discord_processing_claim_heartbeats([message_id])
             await asyncio.to_thread(
                 self._record_discord_claim_outcome,
                 [message_id],
@@ -2947,18 +2930,6 @@ class DiscordAdapter(BasePlatformAdapter):
             if not waiter.done():
                 waiter.cancel()
         recovery_waiters.clear()
-        recovery_heartbeats = getattr(
-            self, "_discord_recovery_claim_heartbeats", {}
-        )
-        heartbeat_tasks = list(
-            dict.fromkeys(recovery_heartbeats.values())
-        )
-        recovery_heartbeats.clear()
-        for task in heartbeat_tasks:
-            task.cancel()
-        if heartbeat_tasks:
-            await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
-
         self._release_platform_lock()
 
         logger.info("[%s] Disconnected", self.name)
@@ -3313,39 +3284,27 @@ class DiscordAdapter(BasePlatformAdapter):
         return task
 
     def _discord_active_claim_retry_delay(self, message_id: str) -> float:
-        """Return when a foreign claim becomes eligible for takeover."""
-        lease_seconds = 10 * 60
+        """Return a low-frequency retry delay for a live foreign owner."""
 
         def _op(conn):
             row = conn.execute(
                 """
-                SELECT updated_at
+                SELECT owner_pid, owner_started_at
                   FROM discord_messages
                  WHERE message_id=?
                    AND status IN ('queued', 'processing')
                 """,
                 (message_id,),
             ).fetchone()
-            return row[0] if row else None
+            return row
 
-        updated_at = self._with_discord_recovery_db(_op)
-        if not updated_at:
+        owner = self._with_discord_recovery_db(_op)
+        if not owner:
             return 0.1
-        try:
-            updated = dt.datetime.fromisoformat(str(updated_at))
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=dt.timezone.utc)
-            expires = updated + dt.timedelta(seconds=lease_seconds)
-            return max(
-                0.1,
-                (expires - dt.datetime.now(dt.timezone.utc)).total_seconds()
-                + 0.1,
-            )
-        except (TypeError, ValueError):
-            return 0.1
+        return 15.0 if _owner_alive(owner[0], owner[1]) else 0.1
 
     def _schedule_discord_recovery_retry(self, delay: float) -> None:
-        """Rescan after an observed foreign lease expires."""
+        """Rescan after an observed foreign claim changes."""
         existing = self._missed_message_backfill_retry_task
         if existing is not None and not existing.done():
             return
@@ -4074,6 +4033,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 UPDATE discord_messages
                    SET status='abandoned',
                        claim_owner=NULL,
+                       owner_pid=NULL,
+                       owner_started_at=NULL,
                        updated_at=?
                  WHERE channel_id=?
                    AND status IN ('failed', 'cancelled')
@@ -4672,7 +4633,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Atomically claim live ingress or identify its durable owner.
 
         Returns ``"claimed"`` for new/retryable work, ``"active"`` while a
-        heartbeat-backed owner is still processing it, ``"complete"`` for a
+        live process owner is still handling it, ``"complete"`` for a
         successfully terminal receipt, and ``None`` when the ledger is
         unavailable.  The read and write share one recovery-store transaction
         so concurrent adapters cannot both claim the same Discord snowflake.
@@ -4693,7 +4654,6 @@ class DiscordAdapter(BasePlatformAdapter):
             else None
         )
         now = self._utc_now_iso()
-        active_cutoff = self._discord_active_claim_cutoff()
         channel_guard = self._discord_recovery_store.acquire_channel_lock(
             channel_id,
             timeout=0.1,
@@ -4722,8 +4682,8 @@ class DiscordAdapter(BasePlatformAdapter):
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 """
-                SELECT status, updated_at, replied, outage_response,
-                       claim_owner, claim_epoch
+                SELECT status, replied, outage_response, claim_owner,
+                       claim_epoch, owner_pid, owner_started_at
                   FROM discord_messages
                  WHERE message_id=?
                 """,
@@ -4733,15 +4693,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if existing:
                 (
                     status,
-                    updated_at,
                     replied,
                     outage,
                     claim_owner,
                     claim_epoch,
+                    owner_pid,
+                    owner_started_at,
                 ) = existing
                 if (
                     status in {"queued", "processing"}
-                    and updated_at >= active_cutoff
+                    and _owner_alive(owner_pid, owner_started_at)
                     and not force_takeover
                 ):
                     return "active"
@@ -4757,8 +4718,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 INSERT INTO discord_messages
                     (message_id, channel_id, thread_id, parent_channel_id,
                      author_id, created_at, status, claim_owner, claim_epoch,
-                     updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                     owner_pid, owner_started_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                 ON CONFLICT(message_id) DO UPDATE SET
                     channel_id=excluded.channel_id,
                     thread_id=excluded.thread_id,
@@ -4771,6 +4732,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     status='queued',
                     claim_owner=excluded.claim_owner,
                     claim_epoch=excluded.claim_epoch,
+                    owner_pid=excluded.owner_pid,
+                    owner_started_at=excluded.owner_started_at,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -4782,6 +4745,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     created_text,
                     self._discord_recovery_claim_owner,
                     next_epoch,
+                    self._discord_recovery_owner_pid,
+                    self._discord_recovery_owner_started_at,
                     now,
                 ),
             )
@@ -4988,14 +4953,31 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         status = "processed" if outcome == ProcessingOutcome.SUCCESS else ("cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed")
         now = self._utc_now_iso()
-        active_cutoff = self._discord_active_claim_cutoff()
 
         def _op(conn):
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
             for message_id in message_ids:
                 claim_epoch = self._discord_recovery_claim_epochs.get(
                     message_id
                 )
                 if claim_epoch is None:
+                    existing = conn.execute(
+                        """
+                        SELECT claim_owner, owner_pid, owner_started_at
+                          FROM discord_messages
+                         WHERE message_id=?
+                        """,
+                        (message_id,),
+                    ).fetchone()
+                    if existing is None:
+                        continue
+                    claim_owner, owner_pid, owner_started_at = existing
+                    if claim_owner is not None and _owner_alive(
+                        owner_pid,
+                        owner_started_at,
+                    ):
+                        continue
                     conn.execute(
                         """
                         UPDATE discord_messages
@@ -5005,12 +4987,18 @@ class DiscordAdapter(BasePlatformAdapter):
                            END,
                                updated_at=?
                          WHERE message_id=?
-                           AND (
-                               claim_owner IS NULL
-                               OR updated_at < ?
-                           )
+                           AND claim_owner IS ?
+                           AND owner_pid IS ?
+                           AND owner_started_at IS ?
                         """,
-                        (status, now, message_id, active_cutoff),
+                        (
+                            status,
+                            now,
+                            message_id,
+                            claim_owner,
+                            owner_pid,
+                            owner_started_at,
+                        ),
                     )
                     continue
                 conn.execute(
@@ -5208,128 +5196,20 @@ class DiscordAdapter(BasePlatformAdapter):
     def _discord_message_has_active_claim(self, message_id: str) -> bool:
         if not message_id:
             return False
-        cutoff = self._discord_active_claim_cutoff()
 
         def _op(conn):
             row = conn.execute(
-                "SELECT status, updated_at FROM discord_messages WHERE message_id=?",
+                "SELECT status, owner_pid, owner_started_at "
+                "FROM discord_messages WHERE message_id=?",
                 (message_id,),
             ).fetchone()
             return bool(
                 row
                 and row[0] in {"queued", "processing"}
-                and row[1] >= cutoff
+                and _owner_alive(row[1], row[2])
             )
 
         return bool(self._with_discord_recovery_db(_op, default=True))
-
-    @staticmethod
-    def _discord_active_claim_cutoff() -> str:
-        return (
-            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
-        ).isoformat()
-
-    def _refresh_discord_processing_claims(
-        self,
-        message_ids: list[str],
-    ) -> None:
-        """Renew active processing leases without reviving completed work."""
-        ids = list(dict.fromkeys(value for value in message_ids if value))
-        if not ids:
-            return
-        now = self._utc_now_iso()
-
-        def _op(conn):
-            for message_id in ids:
-                claim_epoch = self._discord_recovery_claim_epochs.get(
-                    message_id
-                )
-                if claim_epoch is None:
-                    conn.execute(
-                        """
-                        UPDATE discord_messages
-                           SET updated_at=?
-                         WHERE message_id=?
-                           AND status IN ('queued', 'processing')
-                           AND claim_owner IS NULL
-                        """,
-                        (now, message_id),
-                    )
-                    continue
-                conn.execute(
-                    """
-                    UPDATE discord_messages
-                       SET updated_at=?
-                     WHERE message_id=?
-                       AND status IN ('queued', 'processing')
-                       AND claim_owner=?
-                       AND claim_epoch=?
-                    """,
-                    (
-                        now,
-                        message_id,
-                        self._discord_recovery_claim_owner,
-                        claim_epoch,
-                    ),
-                )
-
-        self._with_discord_recovery_db(_op)
-
-    async def _discord_processing_claim_heartbeat(
-        self,
-        message_id: str,
-    ) -> None:
-        try:
-            while True:
-                await asyncio.sleep(60)
-                await asyncio.to_thread(
-                    self._refresh_discord_processing_claims,
-                    [message_id],
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning(
-                "[%s] Discord processing-claim heartbeat failed for %s: %s",
-                self.name,
-                message_id,
-                exc,
-            )
-
-    def _start_discord_processing_claim_heartbeats(
-        self,
-        message_ids: list[str],
-    ) -> None:
-        for message_id in dict.fromkeys(message_ids):
-            if not message_id:
-                continue
-            old = self._discord_recovery_claim_heartbeats.pop(
-                message_id,
-                None,
-            )
-            if old is not None:
-                old.cancel()
-            self._discord_recovery_claim_heartbeats[message_id] = (
-                asyncio.create_task(
-                    self._discord_processing_claim_heartbeat(message_id)
-                )
-            )
-
-    async def _stop_discord_processing_claim_heartbeats(
-        self,
-        message_ids: list[str],
-    ) -> None:
-        tasks = []
-        for message_id in dict.fromkeys(message_ids):
-            task = self._discord_recovery_claim_heartbeats.pop(
-                message_id,
-                None,
-            )
-            if task is not None:
-                task.cancel()
-                tasks.append(task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _record_recovery_scan_start(self, channels: set[str]) -> str:
         scan_id = f"{int(time.time() * 1000)}-{os.getpid()}"
@@ -5637,13 +5517,6 @@ class DiscordAdapter(BasePlatformAdapter):
             event,
             emoji_ack=acked,
         )
-        self._start_discord_processing_claim_heartbeats(
-            [
-                message_id
-                for message_id in message_ids
-                if message_id in self._discord_recovery_message_channels
-            ]
-        )
         source_receipts = getattr(
             event.source,
             "_gateway_receipt_ids",
@@ -5696,7 +5569,6 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         message_ids = self._discord_event_receipt_ids(event)
-        await self._stop_discord_processing_claim_heartbeats(message_ids)
 
         # Reactions are Discord side effects too. Emit them while the claim is
         # still nonterminal and guarded, then persist/advance the receipt.

@@ -144,6 +144,16 @@ def make_bot_message(*, message_id=1, content="please ingest", channel=None, men
     return message
 
 
+def mark_claim_owner_dead(adapter, message_id):
+    adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "UPDATE discord_messages SET owner_pid=0, owner_started_at=0 "
+            "WHERE message_id=?",
+            (str(message_id),),
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_configured_bot_sender_is_left_for_shared_ingress_policy(adapter, monkeypatch):
     bot_user = adapter._client.user
@@ -789,7 +799,12 @@ def test_recovery_ledger_migrates_claim_fencing_columns(tmp_path):
         }
     )
 
-    assert {"claim_owner", "claim_epoch"} <= columns
+    assert {
+        "claim_owner",
+        "claim_epoch",
+        "owner_pid",
+        "owner_started_at",
+    } <= columns
 
 
 def test_empty_successful_turn_is_persistently_complete(adapter):
@@ -1045,6 +1060,7 @@ async def test_voice_delivery_is_fenced_nonce_addressed_and_evidenced(
 
 def test_fresh_processing_claim_suppresses_duplicate_recovery(adapter):
     message = make_message(message_id=99)
+    assert adapter._claim_live_discord_message(message) == "claimed"
     event = MessageEvent(
         text=message.content,
         message_type=MessageType.TEXT,
@@ -1065,7 +1081,7 @@ async def test_scan_preserves_active_claim_and_blocks_later_cursor(
     active = make_message(message_id=first_id, channel=channel)
     later = make_message(message_id=second_id, channel=channel)
     adapter.config.extra["free_response_channels"] = "123"
-    adapter._record_discord_message_seen(active, status="processing")
+    assert adapter._claim_live_discord_message(active) == "claimed"
 
     async def candidates(_channels):
         yield active
@@ -1107,7 +1123,7 @@ async def test_scan_preserves_active_claim_and_blocks_later_cursor(
     assert adapter._discord_recovery_cursor("123") == str(first_id)
 
 
-def test_stale_processing_claim_is_recoverable(adapter):
+def test_unowned_processing_row_is_recoverable(adapter):
     message = make_message(message_id=100)
     event = MessageEvent(
         text=message.content,
@@ -1116,32 +1132,16 @@ def test_stale_processing_claim_is_recoverable(adapter):
         message_id=str(message.id),
     )
     adapter._record_discord_processing_start(event, emoji_ack=False)
-    stale = (datetime.now(timezone.utc) - dt.timedelta(minutes=11)).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id='100'",
-            (stale,),
-        )
-    )
-
     assert adapter._discord_message_has_active_claim("100") is False
 
 
-def test_stale_live_claim_is_reclaimed_by_same_adapter(adapter):
+def test_dead_live_claim_is_reclaimed_by_same_adapter(adapter):
     message_id = _recent_snowflakes(1)[0]
     message = make_message(message_id=message_id)
 
     assert adapter._claim_live_discord_message(message) == "claimed"
     first_epoch = adapter._discord_recovery_claim_epochs[str(message_id)]
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, str(message_id)),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     assert adapter._claim_live_discord_message(message) == "claimed"
     assert (
@@ -1150,19 +1150,17 @@ def test_stale_live_claim_is_reclaimed_by_same_adapter(adapter):
     )
 
 
-def test_record_seen_does_not_refresh_foreign_stale_claim(adapter):
+def test_record_seen_does_not_revive_dead_foreign_claim(adapter):
     message_id = _recent_snowflakes(1)[0]
     message = make_message(message_id=message_id)
 
     assert adapter._claim_live_discord_message(message) == "claimed"
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
+    mark_claim_owner_dead(adapter, message_id)
+    original = adapter._with_discord_recovery_db(
         lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, str(message_id)),
-        )
+            "SELECT status, updated_at FROM discord_messages WHERE message_id=?",
+            (str(message_id),),
+        ).fetchone()
     )
 
     replacement = DiscordAdapter(
@@ -1179,23 +1177,15 @@ def test_record_seen_does_not_refresh_foreign_stale_claim(adapter):
             (str(message_id),),
         ).fetchone()
     )
-    assert row == ("queued", stale)
+    assert row == original
     assert replacement._claim_live_discord_message(message) == "claimed"
 
 
-def test_ignore_outcome_terminally_resolves_expired_foreign_claim(adapter):
+def test_ignore_outcome_terminally_resolves_dead_foreign_claim(adapter):
     message_id = str(_recent_snowflakes(1)[0])
     message = make_message(message_id=int(message_id))
     assert adapter._claim_live_discord_message(message) == "claimed"
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, message_id),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     replacement = DiscordAdapter(
         PlatformConfig(enabled=True, token="replacement")
@@ -1215,7 +1205,7 @@ def test_ignore_outcome_terminally_resolves_expired_foreign_claim(adapter):
 
 
 @pytest.mark.asyncio
-async def test_processing_claim_heartbeat_renews_long_running_turn(
+async def test_processing_claim_uses_process_liveness_for_long_running_turn(
     adapter,
 ):
     message_id = str(_recent_snowflakes(1)[0])
@@ -1228,6 +1218,7 @@ async def test_processing_claim_heartbeat_renews_long_running_turn(
         metadata={"_gateway_receipt_ids": [message_id]},
     )
     adapter._register_discord_recovery_receipt("123", message_id)
+    assert adapter._claim_live_discord_message(message) == "claimed"
 
     await adapter.on_processing_start(event)
     stale = (datetime.now(timezone.utc) - dt.timedelta(minutes=11)).isoformat()
@@ -1237,18 +1228,12 @@ async def test_processing_claim_heartbeat_renews_long_running_turn(
             (stale, message_id),
         )
     )
-    assert adapter._discord_message_has_active_claim(message_id) is False
-
-    adapter._refresh_discord_processing_claims([message_id])
-
     assert adapter._discord_message_has_active_claim(message_id) is True
-    assert message_id in adapter._discord_recovery_claim_heartbeats
 
     await adapter.on_processing_complete(
         event,
         ProcessingOutcome.SUCCESS,
     )
-    assert adapter._discord_recovery_claim_heartbeats == {}
 
 
 @pytest.mark.asyncio
@@ -1854,21 +1839,13 @@ def test_recovery_message_lock_timeout_keeps_only_active_entry(adapter):
 
 
 @pytest.mark.asyncio
-async def test_reclaimed_lease_fences_stale_owner_and_cursor(adapter):
+async def test_reclaimed_process_claim_fences_stale_owner_and_cursor(adapter):
     message_id = str(_recent_snowflakes(1)[0])
     message = make_message(message_id=int(message_id))
     adapter._register_discord_recovery_receipt("123", message_id)
     assert adapter._claim_live_discord_message(message) == "claimed"
     first_epoch = adapter._discord_recovery_claim_epochs[message_id]
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, message_id),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     replacement = DiscordAdapter(
         PlatformConfig(enabled=True, token="fake-token")
@@ -1891,7 +1868,6 @@ async def test_reclaimed_lease_fences_stale_owner_and_cursor(adapter):
         ).fetchone()
 
     before = replacement._with_discord_recovery_db(claim_row)
-    adapter._refresh_discord_processing_claims([message_id])
     adapter._record_discord_claim_outcome(
         [message_id],
         ProcessingOutcome.SUCCESS,
@@ -1923,20 +1899,12 @@ async def test_reclaimed_lease_fences_stale_owner_and_cursor(adapter):
 
 @pytest.mark.parametrize("forum", [False, True])
 @pytest.mark.asyncio
-async def test_reclaimed_lease_fences_actual_outbound_send(adapter, forum):
+async def test_reclaimed_process_claim_fences_actual_outbound_send(adapter, forum):
     message_id = str(_recent_snowflakes(1)[0])
     message = make_message(message_id=int(message_id))
     adapter._register_discord_recovery_receipt("123", message_id)
     assert adapter._claim_live_discord_message(message) == "claimed"
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, message_id),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     replacement = DiscordAdapter(
         PlatformConfig(enabled=True, token="fake-token")
@@ -2240,20 +2208,12 @@ async def test_forum_recovery_delivery_uses_enforced_chunk_nonces(
 
 
 @pytest.mark.asyncio
-async def test_reclaimed_lease_fences_streamed_edit(adapter):
+async def test_reclaimed_process_claim_fences_streamed_edit(adapter):
     message_id = str(_recent_snowflakes(1)[0])
     message = make_message(message_id=int(message_id))
     adapter._register_discord_recovery_receipt("123", message_id)
     assert adapter._claim_live_discord_message(message) == "claimed"
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, message_id),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     replacement = DiscordAdapter(
         PlatformConfig(enabled=True, token="fake-token")
@@ -2324,7 +2284,7 @@ async def test_final_overflow_edit_records_recovery_completion(adapter):
 
 
 @pytest.mark.asyncio
-async def test_reclaimed_lease_fences_processing_reactions(adapter):
+async def test_reclaimed_process_claim_fences_processing_reactions(adapter):
     message_id = str(_recent_snowflakes(1)[0])
     message = make_message(message_id=int(message_id))
     message.add_reaction = AsyncMock()
@@ -2337,15 +2297,7 @@ async def test_reclaimed_lease_fences_processing_reactions(adapter):
     )
     adapter._register_discord_recovery_receipt("123", message_id)
     assert adapter._claim_live_discord_message(message) == "claimed"
-    stale = (
-        datetime.now(timezone.utc) - dt.timedelta(minutes=11)
-    ).isoformat()
-    adapter._with_discord_recovery_db(
-        lambda conn: conn.execute(
-            "UPDATE discord_messages SET updated_at=? WHERE message_id=?",
-            (stale, message_id),
-        )
-    )
+    mark_claim_owner_dead(adapter, message_id)
 
     replacement = DiscordAdapter(
         PlatformConfig(enabled=True, token="fake-token")
@@ -2772,7 +2724,6 @@ async def test_auto_thread_starter_is_rejected_before_durable_claim(adapter):
     starter = make_message(message_id=int(starter_id))
 
     assert await adapter._dispatch_discord_message(starter) is False
-    assert starter_id not in adapter._discord_recovery_claim_heartbeats
     assert starter_id not in adapter._discord_recovery_message_channels
     assert adapter._with_discord_recovery_db(
         lambda conn: conn.execute(
@@ -2783,7 +2734,7 @@ async def test_auto_thread_starter_is_rejected_before_durable_claim(adapter):
 
 
 @pytest.mark.asyncio
-async def test_active_foreign_lease_processes_older_work_and_schedules_rescan(
+async def test_active_foreign_process_claim_allows_older_work_and_rescan(
     adapter,
     monkeypatch,
 ):
@@ -2978,7 +2929,6 @@ async def test_failed_inline_clarification_does_not_advance_cursor(adapter):
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._register_discord_recovery_receipt("123", message_id)
     assert adapter._claim_live_discord_message(raw_message) == "claimed"
-    adapter._start_discord_processing_claim_heartbeats([message_id])
     adapter._message_handler = AsyncMock(
         side_effect=RuntimeError("clarification resolver failed")
     )
