@@ -7023,17 +7023,8 @@ def _run_one_job_body(
             set_secret_scope,
         )
 
-        _scope_home = _get_hermes_home()
-        _scope_profile = (
-            _scope_home.name
-            if _scope_home.parent.name == "profiles"
-            else "default"
-        )
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(
-                _scope_home,
-                profile_name=_scope_profile,
-            )
+            build_profile_secret_scope(_get_hermes_home())
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in

@@ -286,81 +286,25 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-def _profile_name_from_home(hermes_home: Path) -> str:
-    home = Path(hermes_home)
-    if home.parent.name == "profiles":
-        return home.name
-    return "default"
-
-
-def _profile_env_prefix(profile_name: str) -> str:
-    normalized = "".join(
-        ch if ch.isalnum() else "_" for ch in str(profile_name).upper()
-    )
-    return f"HERMES_PROFILE_{normalized}__"
-
-
-def build_profile_secret_scope(
-    hermes_home: Path,
-    *,
-    profile_name: Optional[str] = None,
-) -> Dict[str, str]:
+def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     """Build a profile's secret mapping from its ``<home>/.env``.
 
-    When callers explicitly identify the default profile, it owns the
-    deployment's ordinary process credentials. Omitting ``profile_name``
-    preserves the helper contract of reading only profile-owned credentials:
-    its local ``.env`` and configured external secret sources. Named profiles
-    additionally receive
-    explicitly namespaced host credentials using
-    ``HERMES_PROFILE_<PROFILE>__<SECRET_NAME>``. For example,
-    ``HERMES_PROFILE_VEGAPUNK__DISCORD_BOT_TOKEN`` becomes
-    ``DISCORD_BOT_TOKEN`` inside the Vegapunk scope. Shared vault credentials
-    cover common services such as Browserbase; namespaced values keep platform
-    identities and provider accounts isolated without plaintext profile
-    ``.env`` files. A profile's external-secret snapshot is populated by
-    ``hydrate_profile_secret_sources`` before this helper is called.
-
-    A profile-local ``.env`` remains supported as the baseline. Hydrated
-    external-secret values override matching placeholders from that file, and
-    an explicitly namespaced profile credential is the most specific source.
-    Genuinely global vars need not be copied because ``get_secret`` reads them
-    directly from ``os.environ``.
+    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
+    global vars are intentionally NOT copied in — ``get_secret`` reads those
+    from ``os.environ`` directly, so the scope holds only profile secrets.
     """
     home = Path(hermes_home)
-    explicit_profile = profile_name is not None
-    name = str(profile_name or _profile_name_from_home(home))
-    secrets: Dict[str, str] = load_env_file(home / ".env")
-    if name == "default" and explicit_profile:
-        secrets.update(
-            {
-                key: value
-                for key, value in os.environ.items()
-                if not _is_global_env(key)
-                and not key.startswith("HERMES_PROFILE_")
-            }
-        )
-    else:
-        try:
-            from hermes_cli.env_loader import get_secret_source_values
+    secrets = load_env_file(home / ".env")
 
-            secrets.update(
-                {
-                    key: value
-                    for key, value in get_secret_source_values(home).items()
-                    if not _is_global_env(key)
-                }
-            )
-        except Exception:
-            pass
+    try:
+        from hermes_cli.env_loader import get_secret_source_values
+        external_secrets = get_secret_source_values(home)
+    except Exception:
+        external_secrets = {}
 
-    if name != "default":
-        prefix = _profile_env_prefix(name)
-        secrets.update(
-            {
-                key[len(prefix):]: value
-                for key, value in os.environ.items()
-                if key.startswith(prefix) and len(key) > len(prefix)
-            }
-        )
+    for key, value in external_secrets.items():
+        if _is_global_env(key):
+            continue
+        secrets[key] = value
+
     return secrets

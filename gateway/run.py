@@ -2326,16 +2326,7 @@ def _profile_runtime_scope(profile_home: "Path"):
 
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
-    _scope_home = Path(profile_home)
-    _scope_profile = (
-        _scope_home.name if _scope_home.parent.name == "profiles" else "default"
-    )
-    secret_token = set_secret_scope(
-        build_profile_secret_scope(
-            _scope_home,
-            profile_name=_scope_profile,
-        )
-    )
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
         yield
     finally:

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
+from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
@@ -43,15 +43,6 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
-
-# One live pool per profile/provider inside a Hermes process. Runtime
-# resolution, cron, auxiliaries, and concurrently spawned children used to
-# construct independent objects from the same auth.json rows. Each object then
-# believed it owned the same "current" first account, defeating the existing
-# lease counters and allowing one process to stampede a single subscription.
-_PROCESS_POOLS_LOCK = threading.Lock()
-_PROCESS_POOLS: Dict[Tuple[str, str], "CredentialPool"] = {}
-
 
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
@@ -742,26 +733,6 @@ class CredentialPool:
     def entries(self) -> List[PooledCredential]:
         with self._lock:
             return list(self._entries)
-
-    def _reload_entries(self, entries: List[PooledCredential]) -> None:
-        """Adopt refreshed rows without replacing this process-wide pool."""
-        refreshed = sorted(entries, key=lambda entry: entry.priority)
-        refreshed_ids = {entry.id for entry in refreshed}
-        with self._lock:
-            self._entries = refreshed
-            self._strategy = get_pool_strategy(self.provider)
-            if self._current_id not in refreshed_ids:
-                self._current_id = None
-            self._active_leases = {
-                entry_id: count
-                for entry_id, count in self._active_leases.items()
-                if entry_id in refreshed_ids and count > 0
-            }
-            self._recent_refresh_aliases = {
-                token: entry_id
-                for token, entry_id in self._recent_refresh_aliases.items()
-                if entry_id in refreshed_ids
-            }
 
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
@@ -3179,8 +3150,6 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    process_key = (str(get_hermes_home().resolve(strict=False)), provider)
-
     raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
@@ -3242,22 +3211,4 @@ def load_pool(provider: str) -> CredentialPool:
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
-    candidate = CredentialPool(provider, entries)
-    with _PROCESS_POOLS_LOCK:
-        existing = _PROCESS_POOLS.get(process_key)
-        if existing is None:
-            _PROCESS_POOLS[process_key] = candidate
-            return candidate
-
-    # Preserve the one-process identity so all agents share the same lease
-    # counters, but keep load_pool's historical role as a source/disk refresh.
-    # Do this outside _PROCESS_POOLS_LOCK to avoid nesting the global registry
-    # lock with the per-pool lock.
-    existing._reload_entries(entries)
-    return existing
-
-
-def clear_process_pool_cache() -> None:
-    """Drop process-local pool identities (tests and explicit auth reloads)."""
-    with _PROCESS_POOLS_LOCK:
-        _PROCESS_POOLS.clear()
+    return CredentialPool(provider, entries)
