@@ -1237,6 +1237,21 @@ async def test_processing_claim_uses_process_liveness_for_long_running_turn(
 
 
 @pytest.mark.asyncio
+async def test_receipt_finalization_prunes_cached_claim_epoch(adapter):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    adapter._register_discord_recovery_receipt("123", message_id)
+    assert adapter._claim_live_discord_message(message) == "claimed"
+
+    await adapter._finalize_discord_receipts(
+        [message_id],
+        ProcessingOutcome.FAILURE,
+    )
+
+    assert message_id not in adapter._discord_recovery_claim_epochs
+
+
+@pytest.mark.asyncio
 async def test_processing_hook_offloads_contended_ledger(adapter, monkeypatch):
     message = make_message(message_id=101)
     event = MessageEvent(

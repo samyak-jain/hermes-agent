@@ -1832,12 +1832,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             try:
                 if cursor is not None and int(message_id) <= int(cursor):
-                    await asyncio.to_thread(
-                        self._record_discord_claim_outcome,
-                        [message_id],
-                        ProcessingOutcome.SUCCESS,
-                    )
-                    await self._set_discord_recovery_receipts(
+                    await self._finalize_discord_receipts(
                         [message_id],
                         ProcessingOutcome.SUCCESS,
                     )
@@ -1854,12 +1849,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # it through its real lifecycle.
                     return False
                 await self._discord_recovery_barrier.wait()
-                await asyncio.to_thread(
-                    self._record_discord_claim_outcome,
-                    [message_id],
-                    ProcessingOutcome.SUCCESS,
-                )
-                await self._set_discord_recovery_receipts(
+                await self._finalize_discord_receipts(
                     [message_id],
                     ProcessingOutcome.SUCCESS,
                 )
@@ -1870,12 +1860,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     role_authorized=role_authorized,
                 )
             except BaseException:
-                await asyncio.to_thread(
-                    self._record_discord_claim_outcome,
-                    [message_id],
-                    ProcessingOutcome.FAILURE,
-                )
-                await self._set_discord_recovery_receipts(
+                await self._finalize_discord_receipts(
                     [message_id],
                     ProcessingOutcome.FAILURE,
                 )
@@ -1889,12 +1874,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # registered older receipts, so hold only the cursor commit
                 # behind the recovery barrier.
                 await self._discord_recovery_barrier.wait()
-                await asyncio.to_thread(
-                    self._record_discord_claim_outcome,
-                    [message_id],
-                    ProcessingOutcome.SUCCESS,
-                )
-                await self._set_discord_recovery_receipts(
+                await self._finalize_discord_receipts(
                     [message_id],
                     ProcessingOutcome.SUCCESS,
                 )
@@ -2288,6 +2268,45 @@ class DiscordAdapter(BasePlatformAdapter):
                         None,
                     )
 
+    async def _finalize_discord_receipts(
+        self,
+        message_ids: list[str],
+        outcome: ProcessingOutcome,
+        *,
+        boundary_reason: Optional[str] = None,
+        resolve_waiters: bool = False,
+    ) -> None:
+        message_ids = list(
+            dict.fromkeys(str(value) for value in message_ids if str(value))
+        )
+        if not message_ids:
+            return
+        try:
+            await asyncio.to_thread(
+                self._record_discord_claim_outcome,
+                message_ids,
+                outcome,
+            )
+        finally:
+            try:
+                await self._set_discord_recovery_receipts(
+                    message_ids,
+                    outcome,
+                    boundary_reason=boundary_reason,
+                )
+            finally:
+                for message_id in message_ids:
+                    self._discord_recovery_claim_epochs.pop(
+                        message_id,
+                        None,
+                    )
+                    if resolve_waiters:
+                        waiter = self._discord_recovery_waiters.get(
+                            message_id
+                        )
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(outcome)
+
     def _discord_event_bypasses_recovery_barrier(
         self,
         event: MessageEvent,
@@ -2394,19 +2413,11 @@ class DiscordAdapter(BasePlatformAdapter):
         outcome: ProcessingOutcome = ProcessingOutcome.SUCCESS,
     ) -> None:
         message_ids = self._discord_event_receipt_ids(event)
-        await asyncio.to_thread(
-            self._record_discord_claim_outcome,
+        await self._finalize_discord_receipts(
             message_ids,
             outcome,
+            resolve_waiters=True,
         )
-        await self._set_discord_recovery_receipts(
-            message_ids,
-            outcome,
-        )
-        for message_id in message_ids:
-            waiter = self._discord_recovery_waiters.get(message_id)
-            if waiter is not None and not waiter.done():
-                waiter.set_result(outcome)
 
     def _attach_inline_discord_receipts_to_active_turn(
         self,
@@ -2443,17 +2454,17 @@ class DiscordAdapter(BasePlatformAdapter):
             for receipt_id in self._discord_event_receipt_ids(event):
                 self._discord_recovery_session_keys[receipt_id] = session_key
         was_active = session_key in self._active_sessions
+        bypasses_barrier = (
+            was_active
+            and self._discord_event_bypasses_recovery_barrier(event)
+        )
         inline_control = (
             not recovered
-            and was_active
-            and self._discord_event_bypasses_recovery_barrier(event)
+            and bypasses_barrier
         )
         inline_command = (
             event.get_command()
-            if (
-                was_active
-                and self._discord_event_bypasses_recovery_barrier(event)
-            )
+            if bypasses_barrier
             else None
         )
         if inline_command in {"stop", "new", "reset"}:
@@ -2557,38 +2568,24 @@ class DiscordAdapter(BasePlatformAdapter):
             if started is not None:
                 started.set()
             if not admitted:
-                await asyncio.to_thread(
-                    self._record_discord_claim_outcome,
-                    [message_id],
-                    ProcessingOutcome.SUCCESS,
-                )
-                await self._set_discord_recovery_receipts(
+                await self._finalize_discord_receipts(
                     [message_id],
                     ProcessingOutcome.SUCCESS,
                 )
                 return None
             outcome = await waiter
-            await asyncio.to_thread(
-                self._record_discord_claim_outcome,
-                [message_id],
-                outcome,
-            )
-            await self._set_discord_recovery_receipts(
-                [message_id],
-                outcome,
-            )
+            if message_id in self._discord_recovery_claim_epochs:
+                await self._finalize_discord_receipts(
+                    [message_id],
+                    outcome,
+                )
             if outcome != ProcessingOutcome.SUCCESS:
                 self._dedup.discard(message_id)
             return outcome
         except asyncio.CancelledError:
             if started is not None:
                 started.set()
-            await asyncio.to_thread(
-                self._record_discord_claim_outcome,
-                [message_id],
-                ProcessingOutcome.CANCELLED,
-            )
-            await self._set_discord_recovery_receipts(
+            await self._finalize_discord_receipts(
                 [message_id],
                 ProcessingOutcome.CANCELLED,
             )
@@ -2597,12 +2594,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             if started is not None:
                 started.set()
-            await asyncio.to_thread(
-                self._record_discord_claim_outcome,
-                [message_id],
-                ProcessingOutcome.FAILURE,
-            )
-            await self._set_discord_recovery_receipts(
+            await self._finalize_discord_receipts(
                 [message_id],
                 ProcessingOutcome.FAILURE,
             )
@@ -3532,10 +3524,6 @@ class DiscordAdapter(BasePlatformAdapter):
                         # A replacement adapter may observe work claimed by the
                         # old instance. Keep it pending so a newer live success
                         # cannot commit past that in-flight turn.
-                        self._register_discord_recovery_receipt(
-                            channel_id,
-                            message_id,
-                        )
                         retry_delays.append(
                             await asyncio.to_thread(
                                 self._discord_active_claim_retry_delay,
@@ -3603,12 +3591,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         str(getattr(message, "id", "") or "")
                         for message in ignored
                     ]
-                    await asyncio.to_thread(
-                        self._record_discord_claim_outcome,
-                        ignored_ids,
-                        ProcessingOutcome.SUCCESS,
-                    )
-                    await self._set_discord_recovery_receipts(
+                    await self._finalize_discord_receipts(
                         ignored_ids,
                         ProcessingOutcome.SUCCESS,
                     )
@@ -3630,12 +3613,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         str(getattr(message, "id", "") or "")
                         for message in skipped
                     ]
-                    await asyncio.to_thread(
-                        self._record_discord_claim_outcome,
-                        skipped_ids,
-                        ProcessingOutcome.SUCCESS,
-                    )
-                    await self._set_discord_recovery_receipts(
+                    await self._finalize_discord_receipts(
                         skipped_ids,
                         ProcessingOutcome.SUCCESS,
                         boundary_reason="dispatch_count_bound",
@@ -3953,12 +3931,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not admitted:
             message_id = str(getattr(message, "id", "") or "")
             if not self._dedup.contains(message_id):
-                await asyncio.to_thread(
-                    self._record_discord_claim_outcome,
-                    [message_id],
-                    ProcessingOutcome.SUCCESS,
-                )
-                await self._set_discord_recovery_receipts(
+                await self._finalize_discord_receipts(
                     [message_id],
                     ProcessingOutcome.SUCCESS,
                 )
@@ -5641,23 +5614,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     reaction_guard
                 )
 
-        try:
-            await asyncio.to_thread(
-                self._record_discord_processing_complete,
-                event,
-                outcome,
-            )
-        finally:
-            try:
-                await self._set_discord_recovery_receipts(
-                    message_ids,
-                    outcome,
-                )
-            finally:
-                for message_id in message_ids:
-                    waiter = self._discord_recovery_waiters.get(message_id)
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(outcome)
+        await self._finalize_discord_receipts(
+            message_ids,
+            outcome,
+            resolve_waiters=True,
+        )
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
         """ids-built reply reference — no fetch_message round trip.
