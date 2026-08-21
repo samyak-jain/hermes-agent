@@ -346,6 +346,7 @@ class GatewayStreamConsumer:
         self._recovery_text_chunk_index = 0
         self._active_recovery_text_chunk_index: int | None = None
         self._pending_recovery_send_metadata: dict | None = None
+        self._pending_recovery_send_content: str | None = None
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
@@ -399,6 +400,7 @@ class GatewayStreamConsumer:
     def _metadata_for_new_send(
         self,
         *,
+        content: str | None = None,
         final: bool = False,
         expect_edits: bool = False,
     ) -> dict | None:
@@ -408,12 +410,18 @@ class GatewayStreamConsumer:
         index advances once per logical new message, while transport retries
         reuse the same metadata (and therefore the same nonce).
         """
-        if self._pending_recovery_send_metadata is not None:
+        if (
+            self._pending_recovery_send_metadata is not None
+            and content == self._pending_recovery_send_content
+        ):
             pending = dict(self._pending_recovery_send_metadata)
             self._active_recovery_text_chunk_index = pending.get(
                 _GATEWAY_RECOVERY_TEXT_CHUNK_INDEX_KEY
             )
             return pending
+        if self._pending_recovery_send_metadata is not None:
+            self._pending_recovery_send_metadata = None
+            self._pending_recovery_send_content = None
         meta = dict(
             self._metadata_for_send(
                 final=final,
@@ -430,6 +438,7 @@ class GatewayStreamConsumer:
             )
             self._recovery_text_chunk_index += 1
             self._pending_recovery_send_metadata = dict(meta)
+            self._pending_recovery_send_content = content
         return meta or None
 
     def _mark_new_send_delivered(
@@ -451,6 +460,7 @@ class GatewayStreamConsumer:
             )
         ):
             self._pending_recovery_send_metadata = None
+            self._pending_recovery_send_content = None
 
     @property
     def already_sent(self) -> bool:
@@ -1532,6 +1542,7 @@ class GatewayStreamConsumer:
             return reply_to_id
         try:
             send_metadata = self._metadata_for_new_send(
+                content=text,
                 final=final,
                 expect_edits=not final,
             )
@@ -1748,7 +1759,10 @@ class GatewayStreamConsumer:
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
             result = None
-            chunk_metadata = self._metadata_for_new_send(final=True)
+            chunk_metadata = self._metadata_for_new_send(
+                content=chunk,
+                final=True,
+            )
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
@@ -1854,7 +1868,10 @@ class GatewayStreamConsumer:
             stale_ids.add(str(self._message_id))
 
         result = None
-        fallback_metadata = self._metadata_for_new_send(final=True)
+        fallback_metadata = self._metadata_for_new_send(
+            content=final_text,
+            final=True,
+        )
         for attempt in range(2):
             try:
                 result = await self.adapter.send(
@@ -2117,7 +2134,9 @@ class GatewayStreamConsumer:
             # Interim declaration: this tail is pre-boundary text, not the
             # turn-final — never let it seal a native stream (see
             # _send_commentary).
-            tail_metadata = dict(self._metadata_for_new_send() or {})
+            tail_metadata = dict(
+                self._metadata_for_new_send(content=tail) or {}
+            )
             tail_metadata["_interim_send"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -2166,7 +2185,9 @@ class GatewayStreamConsumer:
             # draft(final=true) — that would seal the live stream with
             # interim text and orphan the true final into a plain-send
             # duplicate (live finding, 2026-08-16 canary).
-            commentary_metadata = dict(self._metadata_for_new_send() or {})
+            commentary_metadata = dict(
+                self._metadata_for_new_send(content=text) or {}
+            )
             commentary_metadata["_interim_send"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -2327,7 +2348,10 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            fresh_metadata = self._metadata_for_new_send(final=True)
+            fresh_metadata = self._metadata_for_new_send(
+                content=text,
+                final=True,
+            )
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
@@ -2764,6 +2788,7 @@ class GatewayStreamConsumer:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
                 first_send_metadata = self._metadata_for_new_send(
+                    content=text,
                     final=finalize,
                     expect_edits=not finalize,
                 )
