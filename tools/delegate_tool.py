@@ -3616,7 +3616,11 @@ def resolve_async_delivery_route(
             or origin_ui_session_id
         )
         if source == "tui":
-            session_key = str(getattr(parent_agent, "session_id", "") or "")
+            agent_session_id = str(
+                getattr(parent_agent, "session_id", "") or ""
+            )
+            if agent_session_id:
+                session_key = agent_session_id
     except Exception:
         pass
     parent_session_id = getattr(parent_agent, "session_id", None)

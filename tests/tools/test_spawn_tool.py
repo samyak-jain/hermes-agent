@@ -14,7 +14,7 @@ import pytest
 from tools import async_delegation as ad
 from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS
 from tools.process_registry import ProcessRegistry, format_process_notification, process_registry
-from tools.spawn_tool import SPAWN_AGENT_SCHEMA, spawn_agent
+from tools.spawn_tool import SPAWN_AGENT_SCHEMA, _delivery_route, spawn_agent
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +75,26 @@ def test_schema_supports_spawn_and_cancel_without_duplicating_tools():
 
 def test_children_cannot_spawn_recursively():
     assert "spawn_agent" in DELEGATE_BLOCKED_TOOLS
+
+
+def test_tui_delivery_route_keeps_bound_key_without_parent_session(monkeypatch):
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "bound-route",
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {
+            "HERMES_SESSION_SOURCE": "tui",
+            "HERMES_UI_SESSION_ID": "tab-1",
+        }.get(name, default),
+    )
+
+    assert _delivery_route(SimpleNamespace(session_id="")) == (
+        "bound-route",
+        "tab-1",
+        "",
+    )
 
 
 def test_spawn_toolset_can_replace_delegation_toolset():
