@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from dataclasses import fields
 
 import pytest
 import yaml
@@ -82,6 +83,34 @@ class TestMissingModelSection:
 
 
 class TestExactToolPolicyValidation:
+    def test_typed_gateway_fields_are_derived_from_dataclasses(self):
+        from gateway.config import ChannelOverride, SessionResetPolicy, StreamingConfig
+
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "123": {
+                                field.name: None for field in fields(ChannelOverride)
+                            }
+                        }
+                    }
+                },
+                "session_reset": {
+                    field.name: None for field in fields(SessionResetPolicy)
+                },
+                "streaming": {
+                    **{field.name: None for field in fields(StreamingConfig)},
+                    "mode": "auto",
+                },
+            },
+            source="managed:/etc/hermes/config.yaml",
+            unknown_severity="error",
+        )
+
+        assert not [issue for issue in issues if "Unknown typed config key" in issue.message]
+
     def test_valid_global_and_channel_policies(self):
         issues = validate_config_structure({
             "agent": {"tool_policy": {

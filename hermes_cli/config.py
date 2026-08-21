@@ -2044,124 +2044,7 @@ class ConfigIssue:
     path: str = ""
 
 
-_CHANNEL_OVERRIDE_FIELDS = frozenset(
-    {
-        "model",
-        "provider",
-        "system_prompt",
-        "tool_policy",
-        "profile_tool_policies",
-    }
-)
 _TOOL_POLICY_FIELDS = frozenset({"mode", "tools", "gateway_override_authority"})
-_SESSION_RESET_FIELDS = frozenset(
-    {
-        "mode",
-        "at_hour",
-        "idle_minutes",
-        "notify",
-        "notify_exclude_platforms",
-        "bg_process_max_age_hours",
-    }
-)
-_STREAMING_FIELDS = frozenset(
-    {
-        "enabled",
-        "transport",
-        "mode",
-        "edit_interval",
-        "buffer_threshold",
-        "cursor",
-        "fresh_final_after_seconds",
-    }
-)
-
-
-def _typed_unknown_key_issues(
-    config: Dict[str, Any],
-    *,
-    source: str,
-    severity: str,
-) -> List["ConfigIssue"]:
-    """Find unknown keys in closed-world dataclass-backed config blocks."""
-    issues: List[ConfigIssue] = []
-
-    def add(path: str) -> None:
-        issues.append(
-            ConfigIssue(
-                severity,
-                f"Unknown typed config key from {source}: {path}",
-                "Move the key to its documented dotted path or remove it; "
-                "this Hermes version would otherwise ignore it.",
-                source=source,
-                path=path,
-            )
-        )
-
-    def check_mapping(value: Any, prefix: str, allowed: frozenset[str]) -> None:
-        if not isinstance(value, dict):
-            return
-        for key in value:
-            if str(key) not in allowed:
-                add(f"{prefix}.{key}")
-
-    def check_channel_overrides(platform_block: Any, prefix: str) -> None:
-        if not isinstance(platform_block, dict):
-            return
-        overrides = platform_block.get("channel_overrides")
-        if not isinstance(overrides, dict):
-            return
-        for channel_id, override in overrides.items():
-            override_path = f"{prefix}.channel_overrides.{channel_id}"
-            if not isinstance(override, dict):
-                continue
-            check_mapping(override, override_path, _CHANNEL_OVERRIDE_FIELDS)
-            check_mapping(
-                override.get("tool_policy"),
-                f"{override_path}.tool_policy",
-                _TOOL_POLICY_FIELDS,
-            )
-            profile_policies = override.get("profile_tool_policies")
-            if isinstance(profile_policies, dict):
-                for profile, policy in profile_policies.items():
-                    check_mapping(
-                        policy,
-                        f"{override_path}.profile_tool_policies.{profile}",
-                        _TOOL_POLICY_FIELDS,
-                    )
-
-    platforms = config.get("platforms")
-    if isinstance(platforms, dict):
-        for platform, block in platforms.items():
-            check_channel_overrides(block, f"platforms.{platform}")
-    gateway = config.get("gateway")
-    gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
-    if isinstance(gateway_platforms, dict):
-        for platform, block in gateway_platforms.items():
-            check_channel_overrides(block, f"gateway.platforms.{platform}")
-    # Legacy root platform blocks remain supported. Only inspect a root mapping
-    # that actually declares channel_overrides so arbitrary skill config is not
-    # mistaken for a gateway platform.
-    for root_key, block in config.items():
-        if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
-            continue
-        if "channel_overrides" in block:
-            check_channel_overrides(block, str(root_key))
-
-    check_mapping(config.get("session_reset"), "session_reset", _SESSION_RESET_FIELDS)
-    check_mapping(config.get("streaming"), "streaming", _STREAMING_FIELDS)
-    if isinstance(gateway, dict):
-        check_mapping(
-            gateway.get("session_reset"),
-            "gateway.session_reset",
-            _SESSION_RESET_FIELDS,
-        )
-        check_mapping(
-            gateway.get("streaming"),
-            "gateway.streaming",
-            _STREAMING_FIELDS,
-        )
-    return issues
 
 
 def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
@@ -2186,6 +2069,144 @@ def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
             )
 
 
+def _fork_validation_issues(
+    config: Dict[str, Any],
+    *,
+    source: str,
+    unknown_severity: str,
+) -> List["ConfigIssue"]:
+    from dataclasses import fields
+
+    from agent.tool_policy import parse_tool_policy
+    from gateway.config import ChannelOverride, SessionResetPolicy, StreamingConfig
+
+    issues: List[ConfigIssue] = []
+    channel_override_fields = frozenset(
+        field.name for field in fields(ChannelOverride)
+    )
+    session_reset_fields = frozenset(
+        field.name for field in fields(SessionResetPolicy)
+    )
+    streaming_fields = frozenset(
+        {field.name for field in fields(StreamingConfig)} | {"mode"}
+    )
+
+    def add_unknown(path: str) -> None:
+        issues.append(
+            ConfigIssue(
+                unknown_severity,
+                f"Unknown typed config key from {source}: {path}",
+                "Move the key to its documented dotted path or remove it; "
+                "this Hermes version would otherwise ignore it.",
+                source=source,
+                path=path,
+            )
+        )
+
+    def check_mapping(value: Any, prefix: str, allowed: frozenset[str]) -> None:
+        if not isinstance(value, dict):
+            return
+        for key in value:
+            if str(key) not in allowed:
+                add_unknown(f"{prefix}.{key}")
+
+    def check_channel_overrides(platform_block: Any, prefix: str) -> None:
+        if not isinstance(platform_block, dict):
+            return
+        overrides = platform_block.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            return
+        for channel_id, override in overrides.items():
+            override_path = f"{prefix}.channel_overrides.{channel_id}"
+            if not isinstance(override, dict):
+                continue
+            check_mapping(override, override_path, channel_override_fields)
+            check_mapping(
+                override.get("tool_policy"),
+                f"{override_path}.tool_policy",
+                _TOOL_POLICY_FIELDS,
+            )
+            profile_policies = override.get("profile_tool_policies")
+            if isinstance(profile_policies, dict):
+                for profile, policy in profile_policies.items():
+                    check_mapping(
+                        policy,
+                        f"{override_path}.profile_tool_policies.{profile}",
+                        _TOOL_POLICY_FIELDS,
+                    )
+
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        for platform, block in platforms.items():
+            check_channel_overrides(block, f"platforms.{platform}")
+    gateway = config.get("gateway")
+    gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    if isinstance(gateway_platforms, dict):
+        for platform, block in gateway_platforms.items():
+            check_channel_overrides(block, f"gateway.platforms.{platform}")
+    for root_key, block in config.items():
+        if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
+            continue
+        if "channel_overrides" in block:
+            check_channel_overrides(block, str(root_key))
+
+    check_mapping(config.get("session_reset"), "session_reset", session_reset_fields)
+    check_mapping(config.get("streaming"), "streaming", streaming_fields)
+    if isinstance(gateway, dict):
+        check_mapping(
+            gateway.get("session_reset"),
+            "gateway.session_reset",
+            session_reset_fields,
+        )
+        check_mapping(
+            gateway.get("streaming"),
+            "gateway.streaming",
+            streaming_fields,
+        )
+
+    policies = []
+    agent_config = config.get("agent")
+    if isinstance(agent_config, dict) and agent_config.get("tool_policy") is not None:
+        policies.append(("agent.tool_policy", agent_config["tool_policy"]))
+    cron_config = config.get("cron")
+    if isinstance(cron_config, dict) and cron_config.get("tool_policy") is not None:
+        policies.append(("cron.tool_policy", cron_config["tool_policy"]))
+    policies.extend(_iter_discord_channel_tool_policies(config))
+    for policy_source, raw_policy in policies:
+        parsed_policy = parse_tool_policy(raw_policy, source=policy_source)
+        if not parsed_policy.valid:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    parsed_policy.error,
+                    "Use mode: allowlist with a YAML list of individual tool "
+                    "names, or mode: unrestricted/legacy",
+                )
+            )
+
+    delegation = config.get("delegation")
+    child_policy = (
+        delegation.get("child_tool_policy")
+        if isinstance(delegation, dict)
+        else None
+    )
+    if child_policy is not None:
+        child_mode = (
+            child_policy.get("mode")
+            if isinstance(child_policy, dict)
+            else child_policy
+        )
+        if str(child_mode or "").strip().lower() not in {"legacy", "all_configured"}:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"delegation.child_tool_policy has invalid mode {child_mode!r}",
+                    "Use mode: legacy or mode: all_configured",
+                )
+            )
+    return issues
+
+
 def validate_config_structure(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -2207,10 +2228,10 @@ def validate_config_structure(
 
     issues: List[ConfigIssue] = []
     issues.extend(
-        _typed_unknown_key_issues(
+        _fork_validation_issues(
             config,
             source=source,
-            severity=unknown_severity,
+            unknown_severity=unknown_severity,
         )
     )
 
@@ -2226,55 +2247,6 @@ def validate_config_structure(
                 "error",
                 f"voice.submit_mode must be 'direct' or 'draft', got {submit_mode!r}",
                 "Set voice.submit_mode to direct (submit immediately) or draft (edit before sending)",
-            ))
-
-    # Exact-name tool policy. Invalid explicit policy is a security error: the
-    # runtime denies all tools rather than silently reverting to legacy scope.
-    from agent.tool_policy import parse_tool_policy
-
-    _agent_policy = (config.get("agent") or {}).get("tool_policy") if isinstance(config.get("agent"), dict) else None
-    if _agent_policy is not None:
-        _parsed_policy = parse_tool_policy(_agent_policy, source="agent.tool_policy")
-        if not _parsed_policy.valid:
-            issues.append(ConfigIssue(
-                "error", _parsed_policy.error,
-                "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
-            ))
-    _cron_policy = (
-        (config.get("cron") or {}).get("tool_policy")
-        if isinstance(config.get("cron"), dict)
-        else None
-    )
-    if _cron_policy is not None:
-        _parsed_cron_policy = parse_tool_policy(
-            _cron_policy,
-            source="cron.tool_policy",
-        )
-        if not _parsed_cron_policy.valid:
-            issues.append(ConfigIssue(
-                "error", _parsed_cron_policy.error,
-                "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
-            ))
-    # Discord channel exceptions use the same parser. Validate both the
-    # canonical nested layout and the legacy top-level platform layout.
-    for _source, _raw_channel_policy in _iter_discord_channel_tool_policies(config):
-        _parsed_channel_policy = parse_tool_policy(
-            _raw_channel_policy,
-            source=_source,
-        )
-        if not _parsed_channel_policy.valid:
-            issues.append(ConfigIssue(
-                "error", _parsed_channel_policy.error,
-                "Use mode: unrestricted or an exact individual-name allowlist; invalid channel policies fall back to the global policy",
-            ))
-    _child_policy = (config.get("delegation") or {}).get("child_tool_policy") if isinstance(config.get("delegation"), dict) else None
-    if _child_policy is not None:
-        _child_mode = _child_policy.get("mode") if isinstance(_child_policy, dict) else _child_policy
-        if str(_child_mode or "").strip().lower() not in {"legacy", "all_configured"}:
-            issues.append(ConfigIssue(
-                "error",
-                f"delegation.child_tool_policy has invalid mode {_child_mode!r}",
-                "Use mode: legacy or mode: all_configured",
             ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
@@ -6084,6 +6056,68 @@ def unset_config_value(key: str, *, _config_lock_held: bool = False):
 # Command handler
 # =============================================================================
 
+def _config_validate_command(args) -> None:
+    managed_path = getattr(args, "managed", None)
+    config_path = Path(managed_path).expanduser() if managed_path else get_config_path()
+    source = f"managed:{config_path}" if managed_path else f"user:{config_path}"
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            candidate = yaml.safe_load(handle) or {}
+        if not isinstance(candidate, dict):
+            issues = [
+                ConfigIssue(
+                    "error",
+                    f"{source} must contain a YAML mapping",
+                    "Replace the document root with a mapping of dotted config sections.",
+                    source=source,
+                    path="",
+                )
+            ]
+        else:
+            issues = validate_config_structure(
+                candidate,
+                source=source,
+                unknown_severity="error" if managed_path else "warning",
+            )
+    except (OSError, yaml.YAMLError) as exc:
+        issues = [
+            ConfigIssue(
+                "error",
+                f"Could not validate {source}: {exc}",
+                "Fix the path, permissions, or YAML syntax and retry.",
+                source=source,
+                path="",
+            )
+        ]
+
+    result = {
+        "success": not any(issue.severity == "error" for issue in issues),
+        "source": source,
+        "issues": [
+            {
+                "severity": issue.severity,
+                "source": issue.source,
+                "path": issue.path,
+                "message": issue.message,
+                "hint": issue.hint,
+            }
+            for issue in issues
+        ],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif not issues:
+        print(color(f"✓ Configuration is valid: {source}", Colors.GREEN))
+    else:
+        for issue in issues:
+            marker = "✗" if issue.severity == "error" else "⚠"
+            print(f"{marker} [{issue.severity}] {issue.message}")
+            if issue.hint:
+                print(f"  {issue.hint}")
+    if not result["success"]:
+        sys.exit(1)
+
+
 def config_command(args):
     """Handle config subcommands."""
     subcmd = getattr(args, 'config_command', None)
@@ -6236,65 +6270,7 @@ def config_command(args):
         print()
 
     elif subcmd == "validate":
-        managed_path = getattr(args, "managed", None)
-        config_path = Path(managed_path).expanduser() if managed_path else get_config_path()
-        source = f"managed:{config_path}" if managed_path else f"user:{config_path}"
-        try:
-            with open(config_path, encoding="utf-8") as handle:
-                candidate = yaml.safe_load(handle) or {}
-            if not isinstance(candidate, dict):
-                issues = [
-                    ConfigIssue(
-                        "error",
-                        f"{source} must contain a YAML mapping",
-                        "Replace the document root with a mapping of dotted config sections.",
-                        source=source,
-                        path="",
-                    )
-                ]
-            else:
-                issues = validate_config_structure(
-                    candidate,
-                    source=source,
-                    unknown_severity="error" if managed_path else "warning",
-                )
-        except (OSError, yaml.YAMLError) as exc:
-            issues = [
-                ConfigIssue(
-                    "error",
-                    f"Could not validate {source}: {exc}",
-                    "Fix the path, permissions, or YAML syntax and retry.",
-                    source=source,
-                    path="",
-                )
-            ]
-
-        result = {
-            "success": not any(issue.severity == "error" for issue in issues),
-            "source": source,
-            "issues": [
-                {
-                    "severity": issue.severity,
-                    "source": issue.source,
-                    "path": issue.path,
-                    "message": issue.message,
-                    "hint": issue.hint,
-                }
-                for issue in issues
-            ],
-        }
-        if getattr(args, "json", False):
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        elif not issues:
-            print(color(f"✓ Configuration is valid: {source}", Colors.GREEN))
-        else:
-            for issue in issues:
-                marker = "✗" if issue.severity == "error" else "⚠"
-                print(f"{marker} [{issue.severity}] {issue.message}")
-                if issue.hint:
-                    print(f"  {issue.hint}")
-        if not result["success"]:
-            sys.exit(1)
+        _config_validate_command(args)
     
     else:
         print(f"Unknown config command: {subcmd}")
