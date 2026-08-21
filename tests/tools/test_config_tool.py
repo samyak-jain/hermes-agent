@@ -996,6 +996,46 @@ def test_shared_config_lock_is_reentrant_for_one_profile(broker_home: Path):
     assert oct((broker_home / ".config.yaml.write.lock").stat().st_mode & 0o777) == "0o600"
 
 
+def test_reader_is_not_blocked_while_writer_waits_for_process_lock(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import fcntl
+    import threading
+
+    from hermes_cli.config import config_write_lock, read_raw_config
+
+    waiting = threading.Event()
+    release = threading.Event()
+
+    def blocking_flock(_fd, operation):
+        if operation == fcntl.LOCK_EX:
+            waiting.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(fcntl, "flock", blocking_flock)
+    errors = []
+
+    def writer():
+        try:
+            with config_write_lock(broker_home / "config.yaml"):
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert waiting.wait(timeout=5)
+    try:
+        assert read_raw_config()["display"]["skin"] == "default"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
 def test_rollback_only_applies_to_current_revision(
     broker_home: Path, monkeypatch: pytest.MonkeyPatch
 ):

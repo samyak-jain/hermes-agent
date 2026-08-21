@@ -261,6 +261,7 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_TRANSACTION_LOCK = threading.Lock()
 _CONFIG_FILE_LOCK_STATE = threading.local()
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
@@ -3604,22 +3605,22 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
 def config_write_lock(config_path: Optional[Path] = None):
     """Serialize config transactions across threads and POSIX processes."""
     path = config_path or get_config_path()
-    with _CONFIG_LOCK:
-        depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0))
-        if depth:
-            active_path = getattr(_CONFIG_FILE_LOCK_STATE, "path", None)
-            if active_path != str(path):
-                raise RuntimeError(
-                    "Cannot nest Hermes configuration transactions for "
-                    "different profiles."
-                )
-            _CONFIG_FILE_LOCK_STATE.depth = depth + 1
-            try:
-                yield
-            finally:
-                _CONFIG_FILE_LOCK_STATE.depth -= 1
-            return
+    depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0))
+    if depth:
+        active_path = getattr(_CONFIG_FILE_LOCK_STATE, "path", None)
+        if active_path != str(path):
+            raise RuntimeError(
+                "Cannot nest Hermes configuration transactions for "
+                "different config files."
+            )
+        _CONFIG_FILE_LOCK_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth -= 1
+        return
 
+    with _CONFIG_TRANSACTION_LOCK:
         lock_path = path.with_name(f".{path.name}.write.lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(lock_path, "a+", encoding="utf-8")
@@ -3770,7 +3771,6 @@ def invalidate_config_caches(config_path: Optional[Path] = None) -> None:
     with _CONFIG_LOCK:
         _LOAD_CONFIG_CACHE.pop(path_key, None)
         _RAW_CONFIG_CACHE.pop(path_key, None)
-        _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
 
 
 def write_platform_config_field(

@@ -305,6 +305,30 @@ def test_managed_config_validate_command_is_ci_strict_and_value_free(
     )
     assert "private-value-must-not-print" not in output
 
+
+def test_cache_invalidation_preserves_last_known_good_policy(tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "approvals:\n  deny:\n    - 'curl*evil.example*'\n",
+        encoding="utf-8",
+    )
+    config_module.invalidate_config_caches(config_path)
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
+
+    config_path.write_text("approvals:\n  deny: [unclosed\n", encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
