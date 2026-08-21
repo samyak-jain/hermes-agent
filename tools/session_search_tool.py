@@ -897,9 +897,12 @@ def _discover(
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+    shaped_message_count = (
+        17 * limit if detail == "full" else 17 + max(0, limit - 1)
+    )
     content_limit = max(
         96,
-        min(1_200, _DISCOVERY_TEXT_BUDGET // max(1, 17 * limit)),
+        min(1_200, _DISCOVERY_TEXT_BUDGET // max(1, shaped_message_count)),
     )
     title_result = _title_match_result(
         db,

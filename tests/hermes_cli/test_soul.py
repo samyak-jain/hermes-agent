@@ -410,3 +410,36 @@ def test_rollback_audit_failure_restores_pre_rollback_bytes(
     assert (soul_home / "SOUL.md").read_bytes() == before
     history = history_soul(home=soul_home)
     assert [item["operation"] for item in history["changes"]] == ["update"]
+
+
+def test_rollback_mutation_failure_is_not_mislabeled_as_audit_failure(
+    soul_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    changed = _update(soul_home, "# Current before failed rollback\n")
+    before = (soul_home / "SOUL.md").read_bytes()
+    real_atomic_write = soul_module._atomic_write
+    calls = 0
+
+    def mutate_then_fail(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        real_atomic_write(*args, **kwargs)
+        if calls == 1:
+            raise OSError("simulated post-mutation durability failure")
+
+    monkeypatch.setattr(soul_module, "_atomic_write", mutate_then_fail)
+
+    with pytest.raises(SoulError, match="mutation failure") as error:
+        rollback_soul(
+            home=soul_home,
+            config=POLICY,
+            revision=changed["revision"],
+            expected_version=changed["version"],
+            reason="simulate rollback mutation failure",
+        )
+
+    assert "audit" not in str(error.value).lower()
+    assert (soul_home / "SOUL.md").read_bytes() == before
+    assert [
+        item["operation"] for item in history_soul(home=soul_home)["changes"]
+    ] == ["update"]

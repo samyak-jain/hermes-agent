@@ -2338,6 +2338,25 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
+def _cleanup_untracked_cloud_session(provider: Any, session_info: object) -> None:
+    if not isinstance(session_info, dict):
+        return
+    session_id = session_info.get("bb_session_id")
+    if not session_id:
+        return
+    try:
+        closed = provider.close_session(str(session_id))
+    except Exception as exc:
+        closed = False
+        logger.warning("Could not close untracked cloud browser session: %s", exc)
+    if closed:
+        return
+    try:
+        provider.emergency_cleanup(str(session_id))
+    except Exception as exc:
+        logger.warning("Could not emergency-clean untracked cloud browser session: %s", exc)
+
+
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Get or create session info for the given session key.
@@ -2399,6 +2418,8 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
+    session_provider = None
+    created_cloud_session = None
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -2408,8 +2429,10 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
+            session_provider = provider
             try:
                 session_info = provider.create_session(task_id)
+                created_cloud_session = session_info
                 # Validate cloud provider returned a usable session
                 if not session_info or not isinstance(session_info, dict):
                     raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
@@ -2419,6 +2442,9 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info = dict(session_info)
                     session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
+                _cleanup_untracked_cloud_session(provider, created_cloud_session)
+                if getattr(e, "allow_local_fallback", True) is False:
+                    raise
                 provider_name = type(provider).__name__
                 logger.warning(
                     "Cloud provider %s failed (%s); attempting fallback to local "
@@ -2440,16 +2466,24 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info["fallback_reason"] = str(e)
                     session_info["fallback_provider"] = provider_name
 
+    duplicate_session = None
     with _cleanup_lock:
         # Double-check: another thread may have created a session while we
         # were doing the network call. Use the existing one to avoid leaking
         # orphan cloud sessions.
         if task_id in _active_sessions:
-            return _active_sessions[task_id]
-        session_info = dict(session_info)
-        session_info.setdefault("session_key", task_id)
-        session_info.setdefault("owner_task_id", _bare_task_id_for_session_key(task_id))
-        _active_sessions[task_id] = session_info
+            existing_session = _active_sessions[task_id]
+            duplicate_session = session_info
+        else:
+            session_info = dict(session_info)
+            session_info.setdefault("session_key", task_id)
+            session_info.setdefault("owner_task_id", _bare_task_id_for_session_key(task_id))
+            _active_sessions[task_id] = session_info
+
+    if duplicate_session is not None:
+        if session_provider is not None:
+            _cleanup_untracked_cloud_session(session_provider, duplicate_session)
+        return existing_session
 
     # Lazy-start the CDP supervisor now that the session exists (if the
     # backend surfaces a CDP URL via override or session_info["cdp_url"]).
@@ -3140,16 +3174,9 @@ def _is_expired_cloud_session_error(
     session_info: Dict[str, Any], error_text: str
 ) -> bool:
     """True only for terminal HTTP 410s from tracked cloud sessions."""
-    text = str(error_text or "").lower()
-    return bool(
-        session_info.get("bb_session_id")
-        and (
-            "http 410" in text
-            or "status code 410" in text
-            or "unexpected server response: 410" in text
-            or "410 gone" in text
-        )
-    )
+    from tools.browser_supervisor import is_http_410_gone
+
+    return bool(session_info.get("bb_session_id") and is_http_410_gone(error_text))
 
 
 def _store_full_snapshot(snapshot_text: str) -> Optional[str]:

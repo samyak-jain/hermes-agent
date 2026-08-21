@@ -417,7 +417,8 @@ class MemoryStore:
             # Refresh under the same lock used by mutations so a tool-only
             # agent (cron, background maintenance) does not audit a stale
             # construction-time snapshot.
-            self._reload_target(target, skip_drift=True)
+            if self._reload_target(target, skip_drift=True) is _READ_FAILED:
+                return _read_failed_error(self._path_for(target))
             entries = list(self._entries_for(target))
             current = self._char_count(target)
             limit = self._char_limit(target)
@@ -1418,4 +1419,3 @@ registry.register(
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
 )
-

@@ -58,6 +58,11 @@ _CONTEXT_CACHE_LOCKS: Dict[str, threading.Lock] = {}
 _CONTEXT_CACHE_FILENAME = "browserbase_contexts.json"
 _CONTEXT_SESSION_LOCKS: Dict[str, threading.Lock] = {}
 _SESSION_CONTEXT_LEASES: Dict[str, tuple[str, threading.Lock]] = {}
+_CONTEXT_LEASE_TIMEOUT_SECONDS = 5
+
+
+class BrowserbaseContextBusyError(RuntimeError):
+    allow_local_fallback = False
 
 
 class BrowserbaseBrowserProvider(BrowserProvider):
@@ -337,15 +342,18 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         if isinstance(context_cfg, dict) and context_cfg.get("id"):
             leased_context_id = str(context_cfg["id"])
             context_lease = self._context_session_lock(leased_context_id)
-            # A shared persistent browser profile is mutable state. Concurrent
-            # Sessions can race cookie/storage synchronization and corrupt the
-            # login identity, so serialize them for at most the provider's
-            # maximum Session lifetime.
-            if not context_lease.acquire(timeout=21630):
-                raise RuntimeError(
-                    "Timed out waiting for the active Browserbase Session "
-                    f"using context {leased_context_id} to release"
+            if not context_lease.acquire(blocking=False):
+                logger.warning(
+                    "Browserbase context %s is active; waiting up to %s seconds",
+                    leased_context_id,
+                    _CONTEXT_LEASE_TIMEOUT_SECONDS,
                 )
+                if not context_lease.acquire(timeout=_CONTEXT_LEASE_TIMEOUT_SECONDS):
+                    raise BrowserbaseContextBusyError(
+                        f"Browserbase context {leased_context_id} is busy in another "
+                        "session. Close that browser task or configure a separate "
+                        "BROWSERBASE_CONTEXT_ID, then retry."
+                    )
 
         # --- Create session via API ---
 
@@ -471,16 +479,36 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             "features": features_enabled,
         }
 
+    @staticmethod
+    def _release_context_lease(session_id: str) -> None:
+        with _CONTEXT_CACHE_LOCKS_GUARD:
+            lease = _SESSION_CONTEXT_LEASES.pop(str(session_id), None)
+        if lease is None:
+            return
+        context_id, context_lock = lease
+        try:
+            context_lock.release()
+            logger.debug(
+                "Released Browserbase context lease %s after session %s",
+                context_id,
+                session_id,
+            )
+        except RuntimeError:
+            logger.warning(
+                "Browserbase context lease %s was already released",
+                context_id,
+            )
+
     def close_session(self, session_id: str) -> bool:
         try:
-            config = self._get_config()
-        except ValueError:
-            logger.warning(
-                "Cannot close Browserbase session %s — missing credentials", session_id
-            )
-            return False
-
-        try:
+            try:
+                config = self._get_config()
+            except ValueError:
+                logger.warning(
+                    "Cannot close Browserbase session %s — missing credentials",
+                    session_id,
+                )
+                return False
             response = requests.post(
                 f"{config['base_url']}/v1/sessions/{session_id}",
                 headers={
@@ -508,32 +536,17 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             logger.error("Exception closing Browserbase session %s: %s", session_id, e)
             return False
         finally:
-            with _CONTEXT_CACHE_LOCKS_GUARD:
-                lease = _SESSION_CONTEXT_LEASES.pop(str(session_id), None)
-            if lease is not None:
-                context_id, context_lock = lease
-                try:
-                    context_lock.release()
-                    logger.debug(
-                        "Released Browserbase context lease %s after session %s",
-                        context_id,
-                        session_id,
-                    )
-                except RuntimeError:
-                    logger.warning(
-                        "Browserbase context lease %s was already released",
-                        context_id,
-                    )
+            self._release_context_lease(session_id)
 
     def emergency_cleanup(self, session_id: str) -> None:
-        config = self._get_config_or_none()
-        if config is None:
-            logger.warning(
-                "Cannot emergency-cleanup Browserbase session %s — missing credentials",
-                session_id,
-            )
-            return
         try:
+            config = self._get_config_or_none()
+            if config is None:
+                logger.warning(
+                    "Cannot emergency-cleanup Browserbase session %s — missing credentials",
+                    session_id,
+                )
+                return
             requests.post(
                 f"{config['base_url']}/v1/sessions/{session_id}",
                 headers={
@@ -551,13 +564,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Browserbase session %s: %s", session_id, e
             )
         finally:
-            with _CONTEXT_CACHE_LOCKS_GUARD:
-                lease = _SESSION_CONTEXT_LEASES.pop(str(session_id), None)
-            if lease is not None:
-                try:
-                    lease[1].release()
-                except RuntimeError:
-                    pass
+            self._release_context_lease(session_id)
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {

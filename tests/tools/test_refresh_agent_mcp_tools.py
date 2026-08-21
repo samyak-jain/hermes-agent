@@ -106,8 +106,8 @@ def test_refresh_cannot_add_mcp_tool_to_exact_allowlist(monkeypatch):
 
 
 def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypatch):
-    """A transient service gate cannot erase a valid exact tool surface."""
     from agent.tool_policy import ToolAccessPolicy
+    from tools.registry import registry
 
     allowed = {"discord", "memory"}
     agent = _agent(allowed, enabled=["hermes-discord", "mcp-demo"])
@@ -128,10 +128,10 @@ def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypat
     assert added == set()
     assert agent.tools is original_tools
     assert agent.valid_tool_names == allowed
+    assert agent._tool_snapshot_generation == registry._generation
 
 
-def test_incomplete_exact_refresh_denies_invalid_existing_snapshot(monkeypatch):
-    """Retention never preserves a partial or over-broad current surface."""
+def test_incomplete_exact_refresh_replaces_invalid_existing_snapshot(monkeypatch):
     from agent.tool_policy import ToolAccessPolicy
 
     allowed = {"discord", "memory"}
@@ -150,8 +150,31 @@ def test_incomplete_exact_refresh_denies_invalid_existing_snapshot(monkeypatch):
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert added == set()
-    assert agent.tools == []
-    assert agent.valid_tool_names == set()
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
+
+
+def test_incomplete_exact_refresh_never_empties_successfully_filtered_subset(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"discord", "memory"}
+    agent = _agent([], enabled=["hermes-discord"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("memory"), _tool("unexpected")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == {"memory"}
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
 
 
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):

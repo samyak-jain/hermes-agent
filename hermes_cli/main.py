@@ -12695,6 +12695,27 @@ def main():
         help="Skip the timestamped backup of config.yaml when applying",
     )
     migrate_xai.set_defaults(func=cmd_migrate_xai)
+
+    from hermes_cli.sqlite_migrate import cmd_sqlite_migrate
+
+    migrate_sqlite = migrate_subparsers.add_parser(
+        "sqlite-journal",
+        help="Migrate SQLite databases from WAL to rollback journals offline",
+        description=(
+            "Checkpoint, back up, and migrate every SQLite database under the "
+            "Hermes home to DELETE or TRUNCATE journal mode. Stop every Hermes "
+            "process before running this command."
+        ),
+    )
+    migrate_sqlite.add_argument("--home", type=Path, default=get_hermes_home())
+    migrate_sqlite.add_argument(
+        "--journal-mode",
+        choices=("delete", "truncate"),
+        default="truncate",
+    )
+    migrate_sqlite.add_argument("--backup-root", type=Path)
+    migrate_sqlite.add_argument("--dry-run", action="store_true")
+    migrate_sqlite.set_defaults(func=cmd_sqlite_migrate)
     migrate_parser.set_defaults(func=cmd_migrate)
 
     # =========================================================================

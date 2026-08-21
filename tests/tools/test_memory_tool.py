@@ -561,6 +561,19 @@ class TestUnreadableFileDoesNotWipeMemory:
         assert "dark mode" in path.read_text(encoding="utf-8")
         assert "Ubuntu 24.04" in path.read_text(encoding="utf-8")
 
+    def test_read_reports_failure_instead_of_stale_inventory(
+        self, store, monkeypatch,
+    ):
+        store.add("memory", "Visible before the read failure.")
+        path = store._path_for("memory")
+        self._fail_read_once(monkeypatch, path)
+
+        result = store.read("memory")
+
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert "entries" not in result
+
 
     def test_invalid_utf8_file_refuses_write_instead_of_crashing(self, store):
         """Undecodable bytes are 'unreadable', not a crash and not an empty store.

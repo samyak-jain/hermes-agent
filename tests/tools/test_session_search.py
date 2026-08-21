@@ -189,6 +189,24 @@ class TestBrowseShape:
         )
         assert "alternator nerfed" in newest["ending_preview"]
 
+    def test_long_ending_preview_with_trailing_spaces_keeps_marker(self, db):
+        db.create_session("trailing_spaces", source="cli")
+        db.append_message(
+            "trailing_spaces",
+            role="assistant",
+            content=("x" * 300) + "   ",
+        )
+
+        result = json.loads(session_search(db=db))
+
+        preview = next(
+            item["ending_preview"]
+            for item in result["results"]
+            if item["session_id"] == "trailing_spaces"
+        )
+        assert preview.startswith("...")
+        assert preview == "..." + ("x" * 240)
+
     def test_previous_session_uses_conversation_affinity_not_keyword_guess(self, db):
         now = time.time()
         dm_key = "agent:main:discord:dm:42"
@@ -397,7 +415,13 @@ class TestDiscoveryShape:
         assert [r["match_message_id"] for r in adaptive["results"]] == [
             r["match_message_id"] for r in full["results"]
         ]
-        assert len(adaptive_json.encode("utf-8")) < len(full_json.encode("utf-8")) * 0.6
+        top_contents = [
+            message.get("content") or ""
+            for key in ("bookend_start", "messages", "bookend_end")
+            for message in adaptive["results"][0][key]
+        ]
+        assert max(map(len, top_contents)) > 900
+        assert len(adaptive_json.encode("utf-8")) < len(full_json.encode("utf-8")) * 0.9
 
 
     def test_current_session_filtered_out(self, db):

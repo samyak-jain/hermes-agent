@@ -36,74 +36,76 @@ def test_database_journal_mode_has_a_canonical_default():
 
 
 def test_resolve_journal_mode_uses_real_database_config(monkeypatch, tmp_path):
-    from hermes_state import resolve_journal_mode
+    from hermes_state import _sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "DELETE")
-    assert resolve_journal_mode() == "delete"
+    assert _sqlite_storage_policy()[0] == "delete"
 
 
 def test_resolve_journal_mode_accepts_truncate(monkeypatch, tmp_path):
-    from hermes_state import resolve_journal_mode
+    from hermes_state import _sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "TRUNCATE")
-    assert resolve_journal_mode() == "truncate"
+    assert _sqlite_storage_policy()[0] == "truncate"
 
 
 def test_new_nonsecret_hermes_env_override_is_not_exposed(monkeypatch, tmp_path):
-    from hermes_state import resolve_journal_mode
+    from hermes_state import _sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "wal")
     monkeypatch.setenv("HERMES_JOURNAL_MODE", "delete")
-    assert resolve_journal_mode() == "wal"
+    assert _sqlite_storage_policy()[0] == "wal"
 
 
 @pytest.mark.parametrize("value", ["bogus", None, 42, {"bad": "shape"}])
-def test_invalid_config_value_falls_back_to_wal(monkeypatch, tmp_path, value):
-    from hermes_state import resolve_journal_mode
+def test_invalid_config_value_falls_back_to_auto(monkeypatch, tmp_path, value):
+    from hermes_state import _sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, value)
-    assert resolve_journal_mode() == "wal"
+    assert _sqlite_storage_policy()[0] == "auto"
 
 
-@pytest.mark.parametrize("database", [[], "delete", 42, None])
-def test_malformed_database_section_falls_back_to_wal(
-    monkeypatch, tmp_path, database
+@pytest.mark.parametrize(
+    ("database", "expected"),
+    [([], "auto"), ("delete", "auto"), (42, "auto"), (None, "wal")],
+)
+def test_malformed_database_section_falls_back_to_auto(
+    monkeypatch, tmp_path, database, expected
 ):
-    from hermes_state import resolve_journal_mode
+    from hermes_state import _sqlite_storage_policy
 
     _write_config(monkeypatch, tmp_path, {"database": database})
-    assert resolve_journal_mode() == "wal"
+    assert _sqlite_storage_policy()[0] == expected
 
 
 def test_apply_wal_with_fallback_honors_delete_config(monkeypatch, tmp_path):
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "delete")
     _disable_vulnerable_gate(monkeypatch)
     conn = sqlite3.connect(tmp_path / "configured.db")
     try:
-        assert apply_wal_with_fallback(conn, db_label="configured.db") == "delete"
+        assert apply_sqlite_storage_policy(conn, db_label="configured.db") == "delete"
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     finally:
         conn.close()
 
 
 def test_apply_wal_with_fallback_defaults_to_wal(monkeypatch, tmp_path):
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "wal")
     _disable_vulnerable_gate(monkeypatch)
     conn = sqlite3.connect(tmp_path / "default.db")
     try:
-        assert apply_wal_with_fallback(conn, db_label="default.db") == "wal"
+        assert apply_sqlite_storage_policy(conn, db_label="default.db") == "wal"
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     finally:
         conn.close()
 
 
-def test_configured_delete_validates_vulnerable_sqlite_result(monkeypatch, tmp_path):
-    """The safety gate must not report DELETE when SQLite returns MEMORY."""
-    from hermes_state import apply_wal_with_fallback
+def test_configured_delete_keeps_memory_mode(monkeypatch, tmp_path):
+    from hermes_state import apply_sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "delete")
     monkeypatch.setattr(
@@ -112,15 +114,16 @@ def test_configured_delete_validates_vulnerable_sqlite_result(monkeypatch, tmp_p
     )
     conn = sqlite3.connect(":memory:")
     try:
-        with pytest.raises(sqlite3.OperationalError, match="configured.*delete"):
-            apply_wal_with_fallback(conn, db_label="memory-configured.db")
+        assert apply_sqlite_storage_policy(
+            conn, db_label="memory-configured.db"
+        ) == "memory"
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "memory"
     finally:
         conn.close()
 
 
 def test_configured_delete_never_live_downgrades_existing_wal(monkeypatch, tmp_path):
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_sqlite_storage_policy
 
     _configure_mode(monkeypatch, tmp_path, "delete")
     db_path = tmp_path / "existing-wal.db"
@@ -131,8 +134,26 @@ def test_configured_delete_never_live_downgrades_existing_wal(monkeypatch, tmp_p
             "hermes_state.is_sqlite_wal_reset_vulnerable",
             lambda **kwargs: True,
         )
-        assert apply_wal_with_fallback(conn, db_label="existing-wal.db") == "wal"
+        assert apply_sqlite_storage_policy(conn, db_label="existing-wal.db") == "wal"
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        conn.close()
+
+
+def test_cron_notepad_honors_configured_synchronous(monkeypatch, tmp_path):
+    _write_config(
+        monkeypatch,
+        tmp_path,
+        {"database": {"journal_mode": "delete", "synchronous": "normal"}},
+    )
+    from cron import notepad
+
+    monkeypatch.setattr(notepad, "NOTEPAD_FILE", tmp_path / "cron" / "notepad.db")
+    conn = notepad._connect()
+    try:
+        notepad._initialize_schema(conn)
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
     finally:
         conn.close()
 

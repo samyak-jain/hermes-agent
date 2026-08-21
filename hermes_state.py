@@ -695,7 +695,7 @@ _SQLITE_JOURNAL_MODES = frozenset({"auto", "wal", "delete", "truncate"})
 _SQLITE_SYNCHRONOUS_MODES = frozenset({"auto", "normal", "full", "extra"})
 
 
-class SQLiteJournalMigrationRequired(sqlite3.OperationalError):
+class SQLiteJournalMigrationRequired(RuntimeError):
     """A live connection found a persistent WAL database under rollback policy."""
 
 
@@ -783,8 +783,9 @@ def apply_sqlite_storage_policy(
     connection-local, so every writable connection must pass through this
     function. A persistent WAL database is never downgraded while the
     application is live: doing so can race another process that still has the
-    ``-wal``/``-shm`` files open. Deployments must use the offline migration
-    command before enabling rollback mode.
+    ``-wal``/``-shm`` files open. DELETE preserves the historical lenient
+    behavior and keeps an existing WAL database active; TRUNCATE requires the
+    offline migration command first.
 
     In-memory databases keep MEMORY mode because they have no network
     filesystem durability concern.
@@ -800,19 +801,38 @@ def apply_sqlite_storage_policy(
     if target_sync not in _SQLITE_SYNCHRONOUS_MODES:
         raise ValueError(f"unsupported SQLite synchronous mode: {target_sync}")
 
-    current_row = conn.execute("PRAGMA journal_mode").fetchone()
-    current = str(current_row[0]).lower() if current_row else ""
+    current = _on_disk_journal_mode(conn)
+    if current is None:
+        raise sqlite3.OperationalError(
+            f"{db_label}: could not verify journal mode before applying "
+            f"configured journal_mode={target_journal}; refusing a live "
+            "journal transition"
+        )
     if current in {"memory", "off"}:
         return current
 
     if target_journal in {"auto", "wal"}:
         actual = apply_wal_with_fallback(conn, db_label=db_label)
+    elif target_journal == "delete" and current == "wal":
+        _warn_sqlite_policy_once(
+            f"delete-kept-wal:{db_label}",
+            "%s is persistently in WAL mode while database.journal_mode=delete; "
+            "keeping WAL active to avoid a live journal transition. Stop every "
+            "Hermes process and run `hermes migrate sqlite-journal "
+            "--journal-mode delete` to migrate it offline.",
+            db_label,
+        )
+        _apply_wal_size_limit(conn)
+        _apply_macos_checkpoint_barrier(conn)
+        _enforce_macos_synchronous_full(conn)
+        actual = "wal"
     else:
-        if current == "wal":
+        if target_journal == "truncate" and current == "wal":
             raise SQLiteJournalMigrationRequired(
                 f"{db_label} is persistently in WAL mode but "
                 f"database.journal_mode={target_journal}. Stop every Hermes "
-                "process and run the offline SQLite journal migration before restart."
+                "process and run `hermes migrate sqlite-journal "
+                "--journal-mode truncate` before restart."
             )
         actual = _set_journal_mode_no_wait(conn, target_journal.upper())
         if actual != target_journal:
@@ -1161,32 +1181,6 @@ def sqlite_source_id() -> str:
     return str(row[0])
 
 
-def resolve_journal_mode() -> str:
-    """Return the configured journal mode (WAL or a rollback mode).
-
-    ``database.journal_mode`` in config.yaml is the canonical operator
-    setting. ``wal`` remains the default; use ``delete`` when the backing
-    filesystem does not provide WAL-safe durability (for example macOS
-    virtiofs, NFS, or SMB). Invalid or malformed values fail safely to the
-    existing default.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly() or {}
-        database = config.get("database", {})
-        if not isinstance(database, dict):
-            return "wal"
-        raw = database.get("journal_mode", "wal")
-    except Exception:
-        return "wal"
-
-    if not isinstance(raw, str):
-        return "wal"
-    mode = raw.strip().lower()
-    return mode if mode in ("wal", "delete", "truncate") else "wal"
-
-
 class WalUnsupportedError(sqlite3.OperationalError):
     """Raised by :func:`apply_wal_with_fallback` when ``require_wal=True`` and
     the filesystem cannot provide WAL journal mode.
@@ -1255,41 +1249,14 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
-    configured = resolve_journal_mode()
-
-    # TRUNCATE is connection-local, so every writable opener must apply it.
-    # Never switch a persistent WAL database live; the offline migration owns
-    # the required checkpoint and backup boundary.
-    if configured == "truncate":
-        current_mode = _on_disk_journal_mode(conn)
-        if current_mode == "wal":
-            raise SQLiteJournalMigrationRequired(
-                f"{db_label} is persistently in WAL mode but "
-                "database.journal_mode=truncate. Stop every Hermes process "
-                "and run the offline SQLite journal migration before restart."
-            )
-        if current_mode is None:
-            raise sqlite3.OperationalError(
-                "could not verify journal mode before applying configured "
-                "journal_mode=truncate; refusing a live journal transition"
-            )
-        actual = _set_journal_mode_no_wait(conn, "TRUNCATE")
-        if actual != "truncate":
-            raise sqlite3.OperationalError(
-                f"could not set configured journal_mode=truncate "
-                f"(got {actual or 'no result'})"
-            )
-        return actual
-
     # Vulnerable SQLite: do not enable WAL on new/non-WAL files. Resolve the
-    # operator setting first so an explicit DELETE request still verifies that
-    # SQLite actually accepted DELETE rather than silently returning MEMORY or
-    # another connection-specific mode.
+    # operator setting in apply_sqlite_storage_policy before entering this
+    # WAL-only helper.
     if is_sqlite_wal_reset_vulnerable():
         return _apply_delete_for_wal_reset_bug(
             conn,
             db_label=db_label,
-            require_delete=configured == "delete",
+            require_delete=False,
         )
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
@@ -1300,29 +1267,6 @@ def apply_wal_with_fallback(
         _apply_macos_checkpoint_barrier(conn)
         _enforce_macos_synchronous_full(conn)
         return "wal"
-
-    # #68545: honor the canonical database.journal_mode setting. Existing
-    # on-disk WAL databases were returned above and are never live-downgraded.
-    if configured == "delete":
-        if current_mode is None:
-            # The mode probe failed (database locked / busy): another
-            # process may hold this DB open in WAL. Ownership is not
-            # provably exclusive, so flipping journal modes here could
-            # destroy committed-but-uncheckpointed WAL transactions of a
-            # concurrent writer. Fail loudly instead of downgrading — the
-            # operator explicitly requested DELETE and we cannot verify it.
-            raise sqlite3.OperationalError(
-                "could not verify journal mode before applying configured "
-                "journal_mode=delete (database is locked — possible "
-                "concurrent openers); refusing to downgrade a database "
-                "this process does not exclusively own"
-            )
-        actual = _set_journal_mode_no_wait(conn, "DELETE")
-        if actual != "delete":
-            raise sqlite3.OperationalError(
-                f"could not set configured journal_mode=delete (got {actual or 'no result'})"
-            )
-        return actual
 
     try:
         # ``PRAGMA journal_mode=WAL`` is a query-that-sets: it RETURNS the
@@ -1617,9 +1561,9 @@ def apply_database_pragmas(
 
     Reads the ``database:`` section and applies configurable PRAGMAs when set
     to integer values.  The journal mode itself is NOT handled here —
-    ``database.journal_mode`` is owned by :func:`resolve_journal_mode` inside
-    :func:`apply_wal_with_fallback`, which layers the operator setting under
-    all the safety guards (never live-downgrading an on-disk WAL DB,
+    ``database.journal_mode`` is owned by
+    :func:`apply_sqlite_storage_policy`, which layers the operator setting
+    under all the safety guards (never live-downgrading an on-disk WAL DB,
     filesystem fallback, WAL-reset-bug gating).
 
     Supported keys under ``database:`` in config.yaml:
@@ -4339,7 +4283,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # operate on self._conn, not on the local variable.
                 self._conn = new_conn
                 self._wal_active = (
-                    apply_wal_with_fallback(new_conn, db_label="state.db")
+                    apply_sqlite_storage_policy(new_conn, db_label="state.db")
                     == "wal"
                 )
                 apply_database_pragmas(new_conn, db_label="state.db")

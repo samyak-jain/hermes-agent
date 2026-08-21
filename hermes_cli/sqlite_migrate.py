@@ -199,6 +199,17 @@ def migrate_home(
     }
 
 
+def cmd_sqlite_migrate(args: argparse.Namespace) -> int:
+    report = migrate_home(
+        args.home,
+        target_mode=args.journal_mode,
+        backup_root=args.backup_root,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Offline WAL-to-rollback migration for Hermes SQLite databases"
@@ -212,14 +223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--backup-root", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    report = migrate_home(
-        args.home,
-        target_mode=args.journal_mode,
-        backup_root=args.backup_root,
-        dry_run=args.dry_run,
-    )
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return cmd_sqlite_migrate(args)
 
 
 if __name__ == "__main__":

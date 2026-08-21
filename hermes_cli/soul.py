@@ -604,6 +604,121 @@ def _assert_writable(home: Path, config: Optional[dict] = None) -> tuple[str, st
     return _profile_name(home), ownership
 
 
+def _commit(
+    home: Path,
+    home_fd: int | None,
+    *,
+    revision: str,
+    before: bytes,
+    before_exists: bool,
+    before_info: os.stat_result | None,
+    before_version: str,
+    after: bytes,
+    after_exists: bool,
+    after_version: str,
+    record: dict[str, Any],
+) -> None:
+    operation = str(record.get("operation") or "update")
+
+    def write_state(
+        data: bytes,
+        exists: bool,
+        *,
+        previous: os.stat_result | None,
+        expected_version: str,
+    ) -> None:
+        if exists:
+            _atomic_write(
+                home,
+                home_fd,
+                data,
+                previous=previous,
+                expected_version=expected_version,
+            )
+        else:
+            _atomic_remove(home, home_fd, expected_version=expected_version)
+
+    def restore_before() -> None:
+        write_state(
+            before,
+            before_exists,
+            previous=before_info,
+            expected_version=after_version,
+        )
+        _remove_backup(home, revision)
+
+    try:
+        write_state(
+            after,
+            after_exists,
+            previous=before_info,
+            expected_version=before_version,
+        )
+    except Exception as mutation_exc:
+        latest, latest_exists, _latest_info = _read_target(home, home_fd)
+        latest_version = _version(latest, exists=latest_exists)
+        if latest_version == before_version:
+            _remove_backup(home, revision)
+            raise
+        if latest_version == after_version:
+            try:
+                restore_before()
+            except Exception as restore_exc:
+                if operation == "rollback":
+                    raise SoulError(
+                        "SOUL.md rollback reported a mutation failure after changing "
+                        "the file, and exact restoration also failed. "
+                        f"Rollback: {mutation_exc}; restore: {restore_exc}"
+                    ) from restore_exc
+                raise SoulError(
+                    "SOUL.md replacement reported a durability failure after "
+                    "changing the file, and exact restoration also failed. "
+                    f"Replacement: {mutation_exc}; restore: {restore_exc}"
+                ) from restore_exc
+            if operation == "rollback":
+                raise SoulError(
+                    "SOUL.md rollback reported a mutation failure, so the "
+                    "pre-rollback state was restored."
+                ) from mutation_exc
+            raise SoulError(
+                "SOUL.md replacement reported a durability failure, so the "
+                "original content was restored."
+            ) from mutation_exc
+        if operation == "rollback":
+            raise SoulError(
+                "SOUL.md changed unexpectedly during a failed rollback. The "
+                "pre-rollback snapshot was retained for manual reconciliation."
+            ) from mutation_exc
+        raise SoulError(
+            "SOUL.md changed unexpectedly during a failed replacement. The "
+            "pre-change snapshot was retained for manual reconciliation."
+        ) from mutation_exc
+
+    try:
+        _append_audit(home, record)
+    except Exception as audit_exc:
+        try:
+            restore_before()
+        except Exception as restore_exc:
+            if operation == "rollback":
+                raise SoulError(
+                    "SOUL rollback audit failed, and restoration of the pre-rollback "
+                    f"state also failed. Audit: {audit_exc}; restore: {restore_exc}"
+                ) from restore_exc
+            raise SoulError(
+                "SOUL.md was written but audit persistence failed, and exact "
+                f"restoration also failed. Reconcile it manually. Audit: {audit_exc}; "
+                f"restore: {restore_exc}"
+            ) from restore_exc
+        if operation == "rollback":
+            raise SoulError(
+                "SOUL rollback audit persistence failed, so the rollback was undone."
+            ) from audit_exc
+        raise SoulError(
+            "SOUL audit persistence failed, so the update was automatically restored."
+        ) from audit_exc
+
+
 def read_soul(
     *, home: Optional[Path] = None, config: Optional[dict] = None
 ) -> dict[str, Any]:
@@ -667,51 +782,6 @@ def update_soul(
         revision = _new_revision()
         _write_backup(home, revision, before)
         after_version = _version(encoded, exists=True)
-        try:
-            _atomic_write(
-                home,
-                home_fd,
-                encoded,
-                previous=before_info,
-                expected_version=before_version,
-            )
-        except Exception as mutation_exc:
-            latest, latest_exists, _latest_info = _read_target(home, home_fd)
-            latest_version = _version(latest, exists=latest_exists)
-            if latest_version == before_version:
-                _remove_backup(home, revision)
-                raise
-            if latest_version == after_version:
-                try:
-                    if before_exists:
-                        _atomic_write(
-                            home,
-                            home_fd,
-                            before,
-                            previous=before_info,
-                            expected_version=after_version,
-                        )
-                    else:
-                        _atomic_remove(
-                            home,
-                            home_fd,
-                            expected_version=after_version,
-                        )
-                    _remove_backup(home, revision)
-                except Exception as restore_exc:
-                    raise SoulError(
-                        "SOUL.md replacement reported a durability failure after "
-                        "changing the file, and exact restoration also failed. "
-                        f"Replacement: {mutation_exc}; restore: {restore_exc}"
-                    ) from restore_exc
-                raise SoulError(
-                    "SOUL.md replacement reported a durability failure, so the "
-                    "original content was restored."
-                ) from mutation_exc
-            raise SoulError(
-                "SOUL.md changed unexpectedly during a failed replacement. The "
-                "pre-change snapshot was retained for manual reconciliation."
-            ) from mutation_exc
         record = {
             "revision": revision,
             "timestamp": _now(),
@@ -728,30 +798,19 @@ def update_soul(
             "bytes_after": len(encoded),
             "apply": "next_new_session",
         }
-        try:
-            _append_audit(home, record)
-        except Exception as audit_exc:
-            try:
-                if before_exists:
-                    _atomic_write(
-                        home,
-                        home_fd,
-                        before,
-                        previous=before_info,
-                        expected_version=after_version,
-                    )
-                else:
-                    _atomic_remove(home, home_fd, expected_version=after_version)
-                _remove_backup(home, revision)
-            except Exception as restore_exc:
-                raise SoulError(
-                    "SOUL.md was written but audit persistence failed, and exact "
-                    f"restoration also failed. Reconcile it manually. Audit: {audit_exc}; "
-                    f"restore: {restore_exc}"
-                ) from restore_exc
-            raise SoulError(
-                "SOUL audit persistence failed, so the update was automatically restored."
-            ) from audit_exc
+        _commit(
+            home,
+            home_fd,
+            revision=revision,
+            before=before,
+            before_exists=before_exists,
+            before_info=before_info,
+            before_version=before_version,
+            after=encoded,
+            after_exists=True,
+            after_version=after_version,
+            record=record,
+        )
 
         records = _read_audit(home)
         prune_warning = _prune_revisions(home, records)
@@ -867,64 +926,36 @@ def rollback_soul(
         rollback_revision = _new_revision()
         _write_backup(home, rollback_revision, current)
         after_version = _version(restore, exists=restore_exists)
-        try:
-            if restore_exists:
-                _atomic_write(
-                    home,
-                    home_fd,
-                    restore,
-                    previous=current_info,
-                    expected_version=current_version,
-                )
-            else:
-                _atomic_remove(home, home_fd, expected_version=current_version)
-            record = {
-                "revision": rollback_revision,
-                "timestamp": _now(),
-                "operation": "rollback",
-                "profile": profile,
-                "ownership": ownership,
-                "reason": reason,
-                "actor": str(actor or "")[:200],
-                "rolled_back_revision": revision,
-                "before_version": current_version,
-                "after_version": after_version,
-                "before_exists": current_exists,
-                "after_exists": restore_exists,
-                "bytes_before": len(current),
-                "bytes_after": len(restore),
-                "apply": "next_new_session",
-            }
-            _append_audit(home, record)
-        except Exception as audit_exc:
-            # If the target mutation itself failed, disk still has the original
-            # version. Remove the uncommitted snapshot without attempting a
-            # second replacement.
-            latest, latest_exists, _latest_info = _read_target(home, home_fd)
-            latest_version = _version(latest, exists=latest_exists)
-            if latest_version == current_version:
-                _remove_backup(home, rollback_revision)
-                raise
-            try:
-                if current_exists:
-                    _atomic_write(
-                        home,
-                        home_fd,
-                        current,
-                        previous=current_info,
-                        expected_version=after_version,
-                    )
-                else:
-                    _atomic_remove(home, home_fd, expected_version=after_version)
-                _remove_backup(home, rollback_revision)
-            except Exception as restore_exc:
-                raise SoulError(
-                    "SOUL rollback audit failed, and restoration of the pre-rollback "
-                    f"state also failed. Audit: {audit_exc}; restore: {restore_exc}"
-                ) from restore_exc
-            raise SoulError(
-                "SOUL rollback audit persistence failed, so the rollback was undone."
-            ) from audit_exc
+        record = {
+            "revision": rollback_revision,
+            "timestamp": _now(),
+            "operation": "rollback",
+            "profile": profile,
+            "ownership": ownership,
+            "reason": reason,
+            "actor": str(actor or "")[:200],
+            "rolled_back_revision": revision,
+            "before_version": current_version,
+            "after_version": after_version,
+            "before_exists": current_exists,
+            "after_exists": restore_exists,
+            "bytes_before": len(current),
+            "bytes_after": len(restore),
+            "apply": "next_new_session",
+        }
+        _commit(
+            home,
+            home_fd,
+            revision=rollback_revision,
+            before=current,
+            before_exists=current_exists,
+            before_info=current_info,
+            before_version=current_version,
+            after=restore,
+            after_exists=restore_exists,
+            after_version=after_version,
+            record=record,
+        )
 
         records = _read_audit(home)
         prune_warning = _prune_revisions(home, records)
