@@ -64,13 +64,16 @@ def test_truncate_policy_is_applied_to_every_connection(tmp_path):
         second.close()
 
 
-def test_rollback_policy_refuses_live_wal_downgrade(tmp_path):
+def test_truncate_policy_refuses_live_wal_downgrade(tmp_path):
     path = tmp_path / "state.db"
     _create_wal_database(path, "preserved")
 
     conn = sqlite3.connect(path, isolation_level=None)
     try:
-        with pytest.raises(SQLiteJournalMigrationRequired, match="offline"):
+        with pytest.raises(
+            SQLiteJournalMigrationRequired,
+            match=r"hermes migrate sqlite-journal --journal-mode truncate",
+        ):
             apply_sqlite_storage_policy(
                 conn,
                 db_label="state.db",
@@ -81,6 +84,30 @@ def test_rollback_policy_refuses_live_wal_downgrade(tmp_path):
         assert conn.execute("SELECT value FROM entries").fetchone()[0] == "preserved"
     finally:
         conn.close()
+
+
+def test_delete_policy_keeps_existing_wal_and_warns(tmp_path, caplog):
+    path = tmp_path / "state.db"
+    _create_wal_database(path, "preserved")
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        mode = apply_sqlite_storage_policy(
+            conn,
+            db_label="state.db",
+            journal_mode="delete",
+            synchronous="full",
+        )
+        assert mode == "wal"
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("SELECT value FROM entries").fetchone()[0] == "preserved"
+        assert "hermes migrate sqlite-journal --journal-mode delete" in caplog.text
+    finally:
+        conn.close()
+
+
+def test_migration_required_is_not_a_sqlite_operational_error():
+    assert not issubclass(SQLiteJournalMigrationRequired, sqlite3.OperationalError)
 
 
 def test_memory_database_keeps_memory_journal():
