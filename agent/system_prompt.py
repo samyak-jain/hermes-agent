@@ -57,6 +57,7 @@ from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+_SOUL_UNSET = object()
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -340,6 +341,8 @@ def _profile_name_for_home(home: Path) -> str:
 def build_system_prompt_parts(
     agent: Any,
     system_message: Optional[str] = None,
+    *,
+    _soul_content: Any = _SOUL_UNSET,
 ) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -385,9 +388,13 @@ def build_system_prompt_parts(
         # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
         # ambient resolution on a thread that lost the HERMES_HOME ContextVar
         # reads the launch profile's SOUL.md instead (#50233).
-        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
-        if _soul_content:
-            stable_parts.append(_soul_content)
+        soul_content = (
+            _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
+            if _soul_content is _SOUL_UNSET
+            else _soul_content
+        )
+        if soul_content:
+            stable_parts.append(soul_content)
             _soul_loaded = True
 
     if not _soul_loaded:
@@ -911,11 +918,20 @@ def _app_server_context_length(agent: Any) -> Optional[int]:
     return candidate if isinstance(candidate, int) and candidate > 0 else None
 
 
-def build_app_server_identity_prompt(agent: Any) -> str:
+def build_app_server_identity_prompt(
+    agent: Any, *, _soul_content: Any = _SOUL_UNSET
+) -> str:
     """Return the authoritative user-owned identity for an app-server prompt."""
     if not (agent.load_soul_identity or not agent.skip_context_files):
         return ""
-    soul = _ra().load_soul_md(_app_server_context_length(agent)) or ""
+    soul = (
+        _ra().load_soul_md(
+            _app_server_context_length(agent),
+            home_override=_agent_home(agent),
+        )
+        if _soul_content is _SOUL_UNSET
+        else _soul_content
+    ) or ""
     if not soul.strip():
         return ""
     return "# Operator-defined persona\n\n" + soul.strip()
@@ -966,12 +982,43 @@ def build_app_server_system_prompt_parts(
     # the harness while making custom subscription requests large enough to be
     # routed to extra usage. Keep only SOUL/persona in the globally cached
     # prefix; all important Hermes context remains system-level below.
+    should_load_soul = agent.load_soul_identity or not agent.skip_context_files
+    soul = (
+        _ra().load_soul_md(
+            _app_server_context_length(agent),
+            home_override=_agent_home(agent),
+        )
+        if should_load_soul
+        else None
+    )
     parts = build_system_prompt_parts(
         agent,
         system_message=system_message,
+        _soul_content=soul,
     )
-    identity = build_app_server_identity_prompt(agent)
+    identity = build_app_server_identity_prompt(agent, _soul_content=soul)
     parts["stable"] = identity or DEFAULT_AGENT_IDENTITY
+
+    behavior_guidance: List[str] = []
+    valid_tool_names = set(agent.valid_tool_names)
+    if "memory" in valid_tool_names:
+        if getattr(agent, "_memory_enabled", True):
+            behavior_guidance.append(MEMORY_GUIDANCE)
+        elif getattr(agent, "_user_profile_enabled", True):
+            behavior_guidance.append(USER_PROFILE_GUIDANCE)
+    if "session_search" in valid_tool_names:
+        behavior_guidance.append(SESSION_SEARCH_GUIDANCE)
+    if valid_tool_names:
+        behavior_guidance.append(STEER_CHANNEL_NOTE)
+    environment_hints = _ra().build_environment_hints()
+    if environment_hints:
+        behavior_guidance.append(environment_hints)
+    if behavior_guidance:
+        parts["context"] = "\n\n".join(
+            part
+            for part in (parts["context"], *behavior_guidance)
+            if part
+        )
 
     # Native transports append this API-only block after their cached system
     # prompt. App-server system prompts are immutable for the resumed Claude

@@ -77,6 +77,7 @@ class TurnResult:
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_turn: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -641,6 +642,11 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                if not self._server_request_belongs_to_turn(
+                    sreq, result.turn_id
+                ):
+                    self._abort_server_request(sreq)
+                    continue
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -818,6 +824,7 @@ class CodexAppServerSession:
 
         with self._active_turn_lock:
             self._active_turn_id = None
+        self._drain_aborted_server_requests()
         self._interrupt_event.clear()
         return result
 
@@ -899,6 +906,11 @@ class CodexAppServerSession:
 
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                if not self._server_request_belongs_to_turn(
+                    sreq, result.turn_id
+                ):
+                    self._abort_server_request(sreq)
+                    continue
                 self._handle_server_request(sreq)
                 continue
 
@@ -1011,6 +1023,7 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        self._drain_aborted_server_requests()
         return result
 
     # ---------- internals ----------
@@ -1113,6 +1126,45 @@ class CodexAppServerSession:
             self._client.respond_error(
                 rid, code=-32601, message=f"Unsupported method: {method}"
             )
+
+    def _server_request_belongs_to_turn(
+        self, req: dict, turn_id: Optional[str]
+    ) -> bool:
+        params = req.get("params") or {}
+        if not isinstance(params, dict):
+            return True
+        observed_thread_id = params.get("threadId") or params.get("thread_id")
+        observed_turn_id = params.get("turnId") or params.get("turn_id")
+        if (
+            observed_thread_id is not None
+            and self._thread_id is not None
+            and str(observed_thread_id) != str(self._thread_id)
+        ):
+            return False
+        if observed_turn_id is not None:
+            return turn_id is not None and str(observed_turn_id) == str(turn_id)
+        return True
+
+    def _abort_server_request(self, req: dict) -> None:
+        if self._client is None:
+            return
+        rid = req.get("id")
+        if req.get("method") == "agent/tool/call":
+            self._client.respond(
+                rid,
+                {"content": "turn aborted", "isError": True},
+            )
+            return
+        self._client.respond_error(rid, code=-32800, message="turn aborted")
+
+    def _drain_aborted_server_requests(self) -> None:
+        if self._client is None:
+            return
+        while True:
+            req = self._client.take_server_request(timeout=0)
+            if req is None:
+                return
+            self._abort_server_request(req)
 
     def _decide_exec_approval(self, params: dict) -> str:
         """Decide a Codex exec approval request.
@@ -1260,9 +1312,12 @@ def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
     if not isinstance(token_usage, dict):
         return
     last = token_usage.get("last")
+    turn = token_usage.get("turn")
     total = token_usage.get("total")
     if isinstance(last, dict):
         result.token_usage_last = dict(last)
+    if isinstance(turn, dict):
+        result.token_usage_turn = dict(turn)
     if isinstance(total, dict):
         result.token_usage_total = dict(total)
     window = token_usage.get("modelContextWindow")

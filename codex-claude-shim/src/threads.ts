@@ -39,6 +39,7 @@ export interface ThreadState {
 export interface Usage {
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
   reasoningOutputTokens: number;
   totalTokens: number;
@@ -57,6 +58,7 @@ interface PersistedThread {
 const emptyUsage = (): Usage => ({
   inputTokens: 0,
   cachedInputTokens: 0,
+  cacheCreationInputTokens: 0,
   outputTokens: 0,
   reasoningOutputTokens: 0,
   totalTokens: 0,

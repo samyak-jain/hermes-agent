@@ -111,6 +111,10 @@ class FakeClient:
         self._notifications.append({"method": method, "params": params})
 
     def queue_server_request(self, method: str, request_id: Any = "srv-1", **params):
+        if params.get("threadId") in {"t", "th"}:
+            params["threadId"] = "thread-fake-001"
+        if params.get("turnId") == "tu1":
+            params["turnId"] = "turn-fake-001"
         self._server_requests.append({"id": request_id, "method": method, "params": params})
 
     def set_stderr_tail(self, lines):
@@ -147,6 +151,73 @@ class TestTurnInputCoercion:
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
         ])
         assert text == "caption\n\n[image attached]"
+
+
+class TestServerRequestTurnScoping:
+    def test_stale_host_tool_call_is_rejected_without_execution(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "agent/tool/call",
+            request_id="stale-tool",
+            threadId="thread-fake-001",
+            turnId="turn-old",
+            toolCallId="call-old",
+            name="dangerous_tool",
+            arguments={},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed"},
+        )
+        calls = []
+        result = make_session(
+            client,
+            tool_callback=lambda *args: calls.append(args) or "executed",
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is False
+        assert calls == []
+        assert client.responses == [
+            ("stale-tool", {"content": "turn aborted", "isError": True})
+        ]
+
+    def test_host_tool_call_queued_at_teardown_is_drained(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed"},
+        )
+        queued = {
+            "id": "late-tool",
+            "method": "agent/tool/call",
+            "params": {
+                "threadId": "thread-fake-001",
+                "turnId": "turn-fake-001",
+                "toolCallId": "call-late",
+                "name": "dangerous_tool",
+                "arguments": {},
+            },
+        }
+        polls = 0
+
+        def take_server_request(timeout=0):
+            nonlocal polls
+            polls += 1
+            return queued if polls == 2 else None
+
+        client.take_server_request = take_server_request
+        calls = []
+        make_session(
+            client,
+            tool_callback=lambda *args: calls.append(args) or "executed",
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert calls == []
+        assert client.responses == [
+            ("late-tool", {"content": "turn aborted", "isError": True})
+        ]
 
 
 # ---- lifecycle ----
@@ -443,6 +514,7 @@ class TestCompactThread:
             turnId="compact-turn-1",
             tokenUsage={
                 "last": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+                "turn": {"inputTokens": 30, "outputTokens": 4, "totalTokens": 34},
                 "total": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120},
                 "modelContextWindow": 200000,
             },
@@ -462,6 +534,7 @@ class TestCompactThread:
         assert r.compacted is True
         assert r.final_text == "compacted"
         assert r.token_usage_last["totalTokens"] == 12
+        assert r.token_usage_turn["totalTokens"] == 34
         assert r.model_context_window == 200000
 
     def test_compact_thread_ignores_foreign_child_completion(self):

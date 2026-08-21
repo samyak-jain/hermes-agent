@@ -8,7 +8,11 @@ export class RpcConnection {
   private notificationHandlers = new Map<string, NotificationHandler>();
   private pendingOutbound = new Map<
     number,
-    { resolve: (value: any) => void; reject: (error: Error) => void }
+    {
+      resolve: (value: any) => void;
+      reject: (error: Error) => void;
+      turnId?: string;
+    }
   >();
   private nextOutboundId = 1;
 
@@ -23,9 +27,21 @@ export class RpcConnection {
   request<T = any>(method: string, params: unknown): Promise<T> {
     const id = this.nextOutboundId++;
     return new Promise<T>((resolve, reject) => {
-      this.pendingOutbound.set(id, { resolve, reject });
+      const turnId =
+        params && typeof params === "object" && "turnId" in params
+          ? String((params as { turnId?: unknown }).turnId ?? "") || undefined
+          : undefined;
+      this.pendingOutbound.set(id, { resolve, reject, turnId });
       this.write({ id, method, params });
     });
+  }
+
+  rejectPendingOutboundForTurn(turnId: string, message: string): void {
+    for (const [id, pending] of this.pendingOutbound) {
+      if (pending.turnId !== turnId) continue;
+      this.pendingOutbound.delete(id);
+      pending.reject(new Error(message));
+    }
   }
 
   notify(method: string, params?: unknown): void {
