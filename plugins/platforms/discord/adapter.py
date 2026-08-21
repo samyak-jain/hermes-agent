@@ -1176,6 +1176,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._discord_recovery_barrier = asyncio.Event()
         self._discord_recovery_barrier.set()
         self._discord_recovery_channel_locks: Dict[str, asyncio.Lock] = {}
+        self._discord_recovery_ingress_locks: Dict[str, asyncio.Lock] = {}
         self._discord_recovery_waiters: Dict[str, asyncio.Future] = {}
         self._discord_recovery_started_events: Dict[str, asyncio.Event] = {}
         self._discord_recovery_session_keys: Dict[str, str] = {}
@@ -1764,10 +1765,25 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_id,
                 message_id,
             )
-            if not self._record_discord_message_seen(
-                message,
-                status="discovered",
-            ):
+            ingress_lock = self._discord_recovery_ingress_locks.setdefault(
+                channel_id,
+                asyncio.Lock(),
+            )
+            async with ingress_lock:
+                recorded = await asyncio.to_thread(
+                    self._record_discord_message_seen,
+                    message,
+                    status="discovered",
+                )
+                durable_claim = (
+                    await asyncio.to_thread(
+                        self._claim_live_discord_message,
+                        message,
+                    )
+                    if recorded
+                    else None
+                )
+            if not recorded:
                 logger.error(
                     "[%s] Refusing untracked Discord receipt %s in channel %s; "
                     "durable pending registration unavailable",
@@ -1777,7 +1793,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 self._schedule_discord_recovery_retry(0.1)
                 return False
-            durable_claim = self._claim_live_discord_message(message)
             if durable_claim is None:
                 logger.error(
                     "[%s] Refusing untracked Discord receipt %s in channel %s; "
@@ -3489,12 +3504,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 durably_completed: List[Any] = []
                 ignored: List[Any] = []
                 channel_has_active_claim = False
+                cursor = await asyncio.to_thread(
+                    self._discord_recovery_cursor,
+                    channel_id,
+                )
                 for message in candidates:
                     message_id = str(getattr(message, "id", ""))
-                    cursor = await asyncio.to_thread(
-                        self._discord_recovery_cursor,
-                        channel_id,
-                    )
                     try:
                         if cursor is not None and int(message_id) <= int(cursor):
                             continue
@@ -3504,12 +3519,16 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel_id,
                         message_id,
                     )
-                    if self._discord_message_is_persistently_complete(
-                        message_id
+                    if await asyncio.to_thread(
+                        self._discord_message_is_persistently_complete,
+                        message_id,
                     ):
                         durably_completed.append(message)
                         continue
-                    if self._discord_message_has_active_claim(message_id):
+                    if await asyncio.to_thread(
+                        self._discord_message_has_active_claim,
+                        message_id,
+                    ):
                         # A replacement adapter may observe work claimed by the
                         # old instance. Keep it pending so a newer live success
                         # cannot commit past that in-flight turn.
@@ -3518,12 +3537,17 @@ class DiscordAdapter(BasePlatformAdapter):
                             message_id,
                         )
                         retry_delays.append(
-                            self._discord_active_claim_retry_delay(message_id)
+                            await asyncio.to_thread(
+                                self._discord_active_claim_retry_delay,
+                                message_id,
+                            )
                         )
                         channel_has_active_claim = True
                         break
-                    if not self._record_discord_message_seen(
-                        message, status="discovered"
+                    if not await asyncio.to_thread(
+                        self._record_discord_message_seen,
+                        message,
+                        status="discovered",
                     ):
                         logger.warning(
                             "[%s] Discord recovery stopped at message %s in "
@@ -3537,10 +3561,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel_has_active_claim = True
                         break
                     if not await self._should_backfill_discord_message(message):
-                        if self._discord_message_has_active_claim(message_id):
+                        if await asyncio.to_thread(
+                            self._discord_message_has_active_claim,
+                            message_id,
+                        ):
                             retry_delays.append(
-                                self._discord_active_claim_retry_delay(
-                                    message_id
+                                await asyncio.to_thread(
+                                    self._discord_active_claim_retry_delay,
+                                    message_id,
                                 )
                             )
                             retry_delays.append(
@@ -3693,7 +3721,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     message_id,
                     channel_id,
                 )
-                durable_claim = self._claim_live_discord_message(message)
+                durable_claim = await asyncio.to_thread(
+                    self._claim_live_discord_message,
+                    message,
+                )
                 if durable_claim is None:
                     logger.warning(
                         "[%s] Discord recovery stopped at message %s in "
@@ -3707,7 +3738,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     break
                 if durable_claim == "active":
                     retry_delays.append(
-                        self._discord_active_claim_retry_delay(message_id)
+                        await asyncio.to_thread(
+                            self._discord_active_claim_retry_delay,
+                            message_id,
+                        )
                     )
                     logger.info(
                         "[%s] Discord recovery stopped at message %s in "
@@ -3723,7 +3757,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         ProcessingOutcome.SUCCESS,
                     )
                     continue
-                self._record_recovery_attempt(message, status="queued")
+                await asyncio.to_thread(
+                    self._record_recovery_attempt,
+                    message,
+                    status="queued",
+                )
                 started = asyncio.Event()
                 self._discord_recovery_started_events[message_id] = started
                 task = asyncio.create_task(
@@ -4352,9 +4390,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
             return False
-        if self._discord_message_is_persistently_complete(str(getattr(message, "id", ""))):
+        if await asyncio.to_thread(
+            self._discord_message_is_persistently_complete,
+            str(getattr(message, "id", "")),
+        ):
             return False
-        if self._discord_message_has_active_claim(str(getattr(message, "id", ""))):
+        if await asyncio.to_thread(
+            self._discord_message_has_active_claim,
+            str(getattr(message, "id", "")),
+        ):
             return False
         # A success reaction alone is only an acknowledgement.  It is not
         # enough evidence that the substantive response/action completed.

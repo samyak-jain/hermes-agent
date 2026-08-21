@@ -1259,6 +1259,42 @@ async def test_processing_hook_offloads_contended_ledger(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_ingress_offloads_durable_claim_writes(
+    adapter,
+    monkeypatch,
+):
+    message = make_message(message_id=_recent_snowflakes(1)[0])
+
+    def slow_record(*_args, **_kwargs):
+        import time
+
+        time.sleep(0.1)
+        return True
+
+    monkeypatch.setattr(
+        adapter,
+        "_record_discord_message_seen",
+        slow_record,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_claim_live_discord_message",
+        lambda _message: "active",
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_discord_message_has_active_claim",
+        lambda _message_id: True,
+    )
+
+    ingress = asyncio.create_task(adapter._dispatch_discord_message(message))
+    await asyncio.sleep(0.01)
+
+    assert ingress.done() is False
+    assert await ingress is False
+
+
+@pytest.mark.asyncio
 async def test_recovery_scan_offloads_ledger_writes(adapter, monkeypatch):
     def slow_scan_start(_channels):
         import time
