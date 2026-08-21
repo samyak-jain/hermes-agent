@@ -1945,10 +1945,6 @@ DEFAULT_CONFIG = {
         # Toolsets granted to every child independently of the parent's loaded
         # schemas. The normal subagent security blocklist still applies.
         "subagent_grant_toolsets": [],
-        # Exact blocked-tool exceptions for children of one named profile.
-        # Only tools explicitly supported by the delegation runtime are
-        # accepted; currently this is limited to the config broker.
-        "profile_subagent_tool_grants": {},
         # legacy preserves parent/toolset inheritance. all_configured uses the
         # complete configured universe, then applies the delegated-child
         # disabled_toolsets boundary (plus an exact residual deny for tools
