@@ -1,0 +1,16 @@
+{
+  "name": "listConnectableResources",
+  "description": "List the resource types a gatekeeper vendor offers, so you can construct a resourceUrl for requestConnection. The system prompt lists which vendors exist; call this to learn a specific vendor's resource URL patterns before requesting a connection.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "vendorId"
+    ],
+    "properties": {
+      "vendorId": {
+        "type": "string",
+        "description": "Vendor id, as listed in the system prompt (e.g. 'github')."
+      }
+    }
+  }
+}

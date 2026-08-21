@@ -1,0 +1,25 @@
+{
+  "name": "createGadget",
+  "description": "Create a new Gadget in this workspace. The new gadget immediately becomes available in your `env` under the `bindingName` you choose, which is also how you refer to it in other tools (the `workpiece` parameter of the file tools, etc.).\n\nUse this when the workspace has no gadgets yet, or when the user asks for an additional gadget. Always choose a short, descriptive title — the user will see it.\n\nBy default the new gadget is empty. Pass `blueprintId` (discovered with the `listBlueprints` tool, or given by the user) to instead start the gadget from a blueprint's code; the result then also describes the bindings the blueprint expects you to wire up.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "title",
+      "bindingName"
+    ],
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Short, descriptive, human-readable title for the new gadget. Shown to the user."
+      },
+      "bindingName": {
+        "type": "string",
+        "description": "Name under which the new gadget appears in your env, and how other tools refer to it (e.g. the file tools' `workpiece` parameter). Must be a JavaScript identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES."
+      },
+      "blueprintId": {
+        "type": "string",
+        "description": "If given, initialize the new gadget from this blueprint's code instead of empty. Use the listBlueprints tool to discover available blueprint IDs."
+      }
+    }
+  }
+}

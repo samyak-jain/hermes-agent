@@ -946,8 +946,9 @@ class PluginContext:
         ``check_fn()`` before instantiation to verify dependencies.
 
         Extra keyword arguments are forwarded to ``PlatformEntry`` (e.g.
-        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``).
-        Unknown keys raise TypeError from the dataclass constructor.
+        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``,
+        ``api_route_factory``). Unknown keys raise TypeError from the dataclass
+        constructor.
 
         Example::
 

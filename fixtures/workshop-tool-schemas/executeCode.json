@@ -1,0 +1,16 @@
+{
+  "name": "executeCode",
+  "description": "Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.\n\nThe 'env' object contains this chat's named bindings:\n* An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to `createGadget`): an RPC stub pointing at the Gadget's server-side Durable Object. If the user asks you to interact with a Gadget directly, or asks if you can \"see\" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes).\n* An entry for each external resource available to this chat: those listed in the system prompt, those the user grants in messages (shown as `[Resource Title](env.SOME_NAME)`), and those you obtain with `requestConnection`.\n\nNote that this differs from the `env` a Gadget's own code sees: a Gadget's server.js sees only that Gadget's own bindings (listed in the system prompt's gadget list), which are wired up separately with `setGadgetBinding`. Your bindings and a Gadget's bindings may point at the same resource under the same or different names.\n\nWhen the user asks you to just do a task that can be done with these bindings, you should use executeCode to perform the task, instead of adding code to a gadget to do it.\n\nThe function also receives a `self` parameter which is a magic object that points back to this chat thread. Calling any method on `self`, like `self.foo(123)`, delivers a callback message to this chat and activates you to respond. `self` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When an agent callback is received, it appears in your env under a name like `PARAMS_1`, with `.args` (the callback arguments), `.resolve(value)` (to return a value to the caller), and `.reject(error)` (to reject with an error).",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "code"
+    ],
+    "properties": {
+      "code": {
+        "type": "string",
+        "description": "Code to execute. This must be a complete self-contained JavaScript module which exports a single async function, like so:\n\n```\nexport default async function(self, env, ctx) {\n  // ... code to execute ...\n}\n```\n\n`env` and `ctx` are the usual objects passed to Cloudflare Workers event handlers. `env` contains the bindings, and `ctx` contains various functions and information related to the execution context. `self` is a magic object that points back to this chat thread."
+      }
+    }
+  }
+}

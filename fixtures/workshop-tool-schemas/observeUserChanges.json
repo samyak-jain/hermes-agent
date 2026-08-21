@@ -1,0 +1,8 @@
+{
+  "name": "observeUserChanges",
+  "description": "Returns information about changes which the user has made to the code.\n\nThis tool is called automatically whenever the user makes changes, by inserting a synthetic message into the chat history as if the assistant had called the tool. Hence, you never need to generate a call to this tool, but the chat history will automatically contain such calls when you need them.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

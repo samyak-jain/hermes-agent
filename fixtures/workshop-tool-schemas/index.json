@@ -1,0 +1,72 @@
+{
+  "algorithm": "sha256",
+  "digest": "f466b2e194cd16ffc91ba39cadb2947217ce8a9c0548edff45ccfae516f8b1a4",
+  "canonicalization": "JSON object keys sorted recursively; tools sorted by name",
+  "tools": [
+    {
+      "name": "createGadget",
+      "file": "createGadget.json",
+      "sha256": "7295fef3c4436d46afb95087cd59defda22f70464e53322d0c014423a1d36c96"
+    },
+    {
+      "name": "describeBinding",
+      "file": "describeBinding.json",
+      "sha256": "ab9e985096e2c9f65cf6a70f9050b973210b6b776ea3e4c51f4d81f5d251a886"
+    },
+    {
+      "name": "editFile",
+      "file": "editFile.json",
+      "sha256": "3f548ddb55e591a28727b0a6c50422e97c9c409c215ef33ec496b81da4493c1b"
+    },
+    {
+      "name": "executeCode",
+      "file": "executeCode.json",
+      "sha256": "1cc924a9551cb3e01323120eaca1a55f39f1dfb14a4ef81daeb8061ec4bb92a5"
+    },
+    {
+      "name": "giveUp",
+      "file": "giveUp.json",
+      "sha256": "b0634d07ec114f9d35e0b25a55cd7ed33bedfc2bfdd3085848b0daa453a5c2b2"
+    },
+    {
+      "name": "listBlueprints",
+      "file": "listBlueprints.json",
+      "sha256": "08ae2a6fe33f413908bc43a4781c8a6f15bf8cf32f86549ed25d064a17291995"
+    },
+    {
+      "name": "listConnectableResources",
+      "file": "listConnectableResources.json",
+      "sha256": "38635e319dbbe3ab879d3f35f18382614cb0b93a81eed9489775cf2b08d8966c"
+    },
+    {
+      "name": "observeUserChanges",
+      "file": "observeUserChanges.json",
+      "sha256": "7615efb04053173ec0508c3152c681692e46fcf9c6e43d8d909b02d32ea1b798"
+    },
+    {
+      "name": "readFile",
+      "file": "readFile.json",
+      "sha256": "fbfac7371fe64bf0c66d035de776e63dd16077d3ea41abbf81de836e0b39364d"
+    },
+    {
+      "name": "requestConnection",
+      "file": "requestConnection.json",
+      "sha256": "8700722ec97fe1cf4e2a187cfadf813b33e0342c03bc8161ec746f058b987492"
+    },
+    {
+      "name": "setGadgetBinding",
+      "file": "setGadgetBinding.json",
+      "sha256": "6c4d8a06d98d43d8ca83d74b7d88d42ecd45e732b8a4c86a2360ba4da3460314"
+    },
+    {
+      "name": "webFetch",
+      "file": "webFetch.json",
+      "sha256": "7e1640db3cb5fb63e82875ab34195281dd609985e070242e614a5f76504c92ba"
+    },
+    {
+      "name": "writeFile",
+      "file": "writeFile.json",
+      "sha256": "065003fc6fb159fc9ca60769dfb138a328d7ceb3d5f594deba426518a5196cbb"
+    }
+  ]
+}
