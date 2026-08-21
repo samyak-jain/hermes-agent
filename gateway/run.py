@@ -5767,13 +5767,8 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        if getattr(ctx.source, "_ambient_room_event", False):
-            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = (
-            ctx.interim_assistant_messages_enabled
-            and not getattr(ctx.source, "_ambient_room_event", False)
-        )
+        _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -14794,126 +14789,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
-    async def _admit_ambient_room_turn(self, event: MessageEvent) -> bool:
-        """Return whether this profile should run a visible shared-room turn."""
-        metadata = event.metadata
-        source = event.source
-        profile = str(source.profile or self._active_profile_name() or "default")
-        if (
-            bool(getattr(source, "is_bot", False))
-            and int(metadata.get("ambient_hop", 0))
-            >= int(metadata.get("ambient_max_hops", 3))
-        ):
-            logger.info(
-                "Ambient cascade stopped at hop limit: room=%s message=%s hop=%s",
-                metadata.get("ambient_room_id"),
-                event.message_id,
-                metadata.get("ambient_hop"),
-            )
-            return False
-        if metadata.get("ambient_direct"):
-            selected = True
-        elif metadata.get("ambient_other_bot_mentioned"):
-            return False
-        else:
-            try:
-                user_config = _load_gateway_config()
-                model, runtime = self._resolve_session_agent_runtime(
-                    source=source,
-                    user_config=user_config,
-                )
-                main_runtime = dict(runtime or {})
-                main_runtime["model"] = model
-                from gateway.ambient_rooms import decide_ambient_participation
-
-                decision = await decide_ambient_participation(
-                    profile=profile,
-                    role=str(metadata.get("ambient_profile_role") or ""),
-                    trigger_text=event.text or "",
-                    channel_context=event.channel_context or "",
-                    author_is_bot=bool(getattr(source, "is_bot", False)),
-                    main_runtime=main_runtime,
-                )
-                logger.info(
-                    "Ambient profile decision: profile=%s action=%s "
-                    "confidence=%.3f room=%s message=%s",
-                    profile,
-                    decision.action,
-                    decision.confidence,
-                    metadata.get("ambient_room_id"),
-                    event.message_id or "",
-                )
-                if decision.action == "silent":
-                    return False
-                if decision.action == "react":
-                    raw_message = getattr(event, "raw_message", None)
-                    add_reaction = getattr(raw_message, "add_reaction", None)
-                    if not callable(add_reaction):
-                        logger.warning(
-                            "Ambient profile %s selected reaction %s but "
-                            "the platform event cannot add reactions",
-                            profile,
-                            decision.reaction,
-                        )
-                        return False
-                    try:
-                        await add_reaction(decision.reaction)
-                    except Exception:
-                        logger.warning(
-                            "Ambient reaction failed for profile=%s room=%s "
-                            "message=%s reaction=%s",
-                            profile,
-                            metadata.get("ambient_room_id"),
-                            event.message_id or "",
-                            decision.reaction,
-                            exc_info=True,
-                        )
-                    return False
-                selected = True
-            except Exception:
-                logger.warning(
-                    "Ambient profile decision failed for profile=%s room=%s",
-                    profile,
-                    metadata.get("ambient_room_id"),
-                    exc_info=True,
-                )
-                return False
-        if not selected:
-            return False
-        # All ambient participants suppress typing while deciding. Once this
-        # profile wins admission, explicitly start its bounded typing state.
-        try:
-            adapter = self._adapter_for_source(source)
-            if adapter is not None:
-                await adapter.send_typing(
-                    source.chat_id,
-                    metadata=self._thread_metadata_for_source(
-                        source, event.message_id
-                    ),
-                )
-        except Exception:
-            logger.debug(
-                "Could not start typing for admitted ambient profile=%s room=%s",
-                profile,
-                metadata.get("ambient_room_id"),
-                exc_info=True,
-            )
-        setattr(source, "_ambient_room_event", True)
-        role = str(metadata.get("ambient_profile_role") or "").strip()
-        room_note = (
-            "You are speaking in a shared Discord room with a human and other "
-            "independent agent profiles. Your private participation decision "
-            "selected a text reply. Reply naturally as yourself. Do not repeat "
-            "room history, narrate your participation decision, or address "
-            "every participant unless useful."
-        )
-        if role:
-            room_note += f" Your role in this room is: {role}"
-        event.channel_prompt = "\n\n".join(
-            part for part in (event.channel_prompt, room_note) if part
-        )
-        return True
-
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -17540,16 +17415,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return _paused_notice
 
-        # Shared Discord room events are observed by every configured profile.
-        # Direct mentions are deterministic; unaddressed chatter goes through
-        # the shared attention arbiter so at most one profile responds.
-        if (
-            isinstance(event.metadata, dict)
-            and event.metadata.get("ambient_room_id")
-        ):
-            if not await self._admit_ambient_room_turn(event):
-                return None
-
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -18968,15 +18833,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # happens after sender-prefix so the prefix only applies to the
         # trigger message, not the backfill block.
         if getattr(event, "channel_context", None):
-            if (
-                isinstance(event.metadata, dict)
-                and event.metadata.get("ambient_room_id")
-            ):
-                # Discord remains the shared-room source of truth. Feed the
-                # current window to this turn, but persist only the triggering
-                # message so every later turn does not duplicate the same room
-                # transcript and destroy prefix-cache efficiency.
-                setattr(event, "_ambient_persist_user_text", message_text)
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
@@ -20932,15 +20788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if message_text and isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
-                _ambient_persist_text = getattr(
-                    event, "_ambient_persist_user_text", None
-                )
-                if isinstance(_ambient_persist_text, str):
-                    persist_user_message, _ = _strip_msg_ts(
-                        _ambient_persist_text, tz=_evt_tz
-                    )
-                else:
-                    persist_user_message = _clean_message_text
+                persist_user_message = _clean_message_text
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
                     _event_epoch if _event_epoch is not None else _embedded_ts

@@ -1353,7 +1353,7 @@ def load_gateway_config() -> GatewayConfig:
         # A named profile may intentionally have no agent-owned config yet.
         # The host-managed overlay is still authoritative for that profile:
         # skipping this block merely because ``config.yaml`` is absent drops
-        # platform policy (ambient rooms, channel authorization, tool policy)
+        # platform policy (channel authorization and tool policy)
         # while profile-scoped credentials can still enable the adapter. That
         # creates a connected but differently-authorized secondary bot.
         has_user_config = config_yaml_path.exists()
@@ -1625,9 +1625,9 @@ def load_gateway_config() -> GatewayConfig:
                 # Previously, the mere presence of a root ``discord:`` block
                 # discarded every distinct key under ``platforms.discord``.
                 # That made a normal root block (require_mention, history,
-                # etc.) silently disable managed nested keys such as
-                # ambient_rooms. Nested-only configs were covered, but the
-                # mixed shape used in production was not.
+                # etc.) silently disable distinct managed nested keys. Nested-
+                # only configs were covered, but the mixed shape used in
+                # production was not.
                 platform_cfg, _cfg_toplevel = _effective_platform_block(
                     plat.value
                 )
@@ -1693,14 +1693,6 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
-                if plat == Platform.DISCORD and "ambient_rooms" in platform_cfg:
-                    ambient_rooms = platform_cfg["ambient_rooms"]
-                    if isinstance(ambient_rooms, dict):
-                        bridged["ambient_rooms"] = {
-                            str(k): v for k, v in ambient_rooms.items()
-                        }
-                    else:
-                        bridged["ambient_rooms"] = ambient_rooms
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if "typing_indicator" in platform_cfg:

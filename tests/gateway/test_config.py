@@ -1129,11 +1129,8 @@ class TestLoadGatewayConfig:
             "platforms:\n"
             "  discord:\n"
             "    require_mention: true\n"
-            "    ambient_rooms:\n"
-            '      "1531228453901439109":\n'
-            "        participants:\n"
-            "          - default\n"
-            "          - vegapunk\n"
+            "    channel_prompts:\n"
+            '      "1531228453901439109": nested prompt\n'
             "gateway:\n"
             "  platforms:\n"
             "    discord:\n"
@@ -1146,10 +1143,8 @@ class TestLoadGatewayConfig:
         discord = config.platforms[Platform.DISCORD]
 
         assert discord.extra["require_mention"] is False
-        assert discord.extra["ambient_rooms"] == {
-            "1531228453901439109": {
-                "participants": ["default", "vegapunk"],
-            }
+        assert discord.extra["channel_prompts"] == {
+            "1531228453901439109": "nested prompt",
         }
 
     def test_managed_platform_policy_applies_without_user_config(
@@ -1163,11 +1158,8 @@ class TestLoadGatewayConfig:
         (managed_dir / "config.yaml").write_text(
             "platforms:\n"
             "  discord:\n"
-            "    ambient_rooms:\n"
-            '      "1531228453901439109":\n'
-            "        participants:\n"
-            "          - default\n"
-            "          - vegapunk\n",
+            "    allow_from:\n"
+            '      - "1531228453901439109"\n',
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -1177,11 +1169,7 @@ class TestLoadGatewayConfig:
         discord = config.platforms[Platform.DISCORD]
 
         assert not (hermes_home / "config.yaml").exists()
-        assert discord.extra["ambient_rooms"] == {
-            "1531228453901439109": {
-                "participants": ["default", "vegapunk"],
-            }
-        }
+        assert discord.extra["allow_from"] == ["1531228453901439109"]
 
 
 class TestWebhookPortBridging:
