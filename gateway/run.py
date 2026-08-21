@@ -3999,45 +3999,8 @@ def _resolve_tool_policy_for_source(
             authority,
         )
         return global_policy
-    profile = str(getattr(source, "profile", None) or "default")
-    base_policy = global_policy
-    raw_profile_policies = (
-        agent_cfg.get("profile_tool_policies")
-        if isinstance(agent_cfg, dict)
-        else None
-    )
-    raw_profile_policy = (
-        raw_profile_policies.get(profile)
-        if isinstance(raw_profile_policies, dict)
-        else None
-    )
-    if isinstance(raw_profile_policy, dict):
-        profile_authorized = authority == "any"
-        if not profile_authorized:
-            try:
-                from hermes_cli import managed_scope
-
-                profile_authorized = any(
-                    managed_scope.is_key_managed(path)
-                    for path in (
-                        f"agent.profile_tool_policies.{profile}",
-                        f"agent.profile_tool_policies.{profile}.mode",
-                    )
-                )
-            except Exception:
-                profile_authorized = False
-        if profile_authorized:
-            resolved_profile = parse_tool_policy(
-                raw_profile_policy,
-                source=f"agent.profile_tool_policies.{profile}",
-                fallback=global_policy,
-            )
-            if resolved_profile.valid:
-                base_policy = resolved_profile
-        else:
-            logger.warning("Ignoring unmanaged profile tool policy for %s", profile)
     if source.platform != Platform.DISCORD:
-        return base_policy
+        return global_policy
 
     if gateway_config is None:
         platforms = user_config.get("platforms")
@@ -4055,26 +4018,14 @@ def _resolve_tool_policy_for_source(
         thread_id=getattr(source, "thread_id", None),
         parent_id=getattr(source, "parent_chat_id", None),
     )
-    if key is None or channel_override is None:
-        return base_policy
+    if (
+        key is None
+        or channel_override is None
+        or channel_override.tool_policy is None
+    ):
+        return global_policy
 
-    raw_channel_policy = channel_override.tool_policy
-    raw_channel_profile_policies = channel_override.profile_tool_policies
-    raw_channel_profile_policy = (
-        raw_channel_profile_policies.get(profile)
-        if isinstance(raw_channel_profile_policies, dict)
-        else None
-    )
     policy_path = f"platforms.discord.channel_overrides.{key}.tool_policy"
-    if isinstance(raw_channel_profile_policy, dict):
-        raw_channel_policy = raw_channel_profile_policy
-        policy_path = (
-            f"platforms.discord.channel_overrides.{key}."
-            f"profile_tool_policies.{profile}"
-        )
-    if raw_channel_policy is None:
-        return base_policy
-
     if authority == "managed_only":
         try:
             from hermes_cli import managed_scope
@@ -4083,19 +4034,18 @@ def _resolve_tool_policy_for_source(
                      legacy_policy_path, f"{legacy_policy_path}.mode")
             if not any(managed_scope.is_key_managed(path) for path in paths):
                 logger.warning(
-                    "Ignoring unmanaged Discord tool policy override for "
-                    "channel %s profile %s",
-                    key, profile,
+                    "Ignoring unmanaged Discord tool policy override for channel %s",
+                    key,
                 )
                 return base_policy
         except Exception:
             return base_policy
     resolved = parse_tool_policy(
-        raw_channel_policy,
+        channel_override.tool_policy,
         source=policy_path,
-        fallback=base_policy,
+        fallback=global_policy,
     )
-    return resolved if resolved.valid else base_policy
+    return resolved if resolved.valid else global_policy
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:

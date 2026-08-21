@@ -592,16 +592,12 @@ class ChannelOverride:
 
     Used in config under platforms.<name>.channel_overrides[channel_id].
     Enables different channels (e.g. Discord #daily vs #dev) to use different
-    models and personas without running separate gateway instances. A
-    multiplexed gateway may preserve a named profile's established tool policy
-    with ``profile_tool_policies`` while applying the channel's ordinary
-    ``tool_policy`` to the default profile.
+    models and personas without running separate gateway instances.
     """
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
     tool_policy: Optional[Dict[str, Any]] = None
-    profile_tool_policies: Optional[Dict[str, Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -613,8 +609,6 @@ class ChannelOverride:
             out["system_prompt"] = self.system_prompt
         if self.tool_policy is not None:
             out["tool_policy"] = self.tool_policy
-        if self.profile_tool_policies is not None:
-            out["profile_tool_policies"] = self.profile_tool_policies
         return out
 
     @classmethod
@@ -626,7 +620,6 @@ class ChannelOverride:
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
             tool_policy=data.get("tool_policy"),
-            profile_tool_policies=data.get("profile_tool_policies"),
         )
 
 
