@@ -5744,6 +5744,11 @@ def _typed_unknown_key_issues(
     def check_channel_overrides(platform_block: Any, prefix: str) -> None:
         if not isinstance(platform_block, dict):
             return
+        check_mapping(
+            platform_block.get("tool_policy"),
+            f"{prefix}.tool_policy",
+            _TOOL_POLICY_FIELDS,
+        )
         overrides = platform_block.get("channel_overrides")
         if not isinstance(overrides, dict):
             return
@@ -5822,6 +5827,35 @@ def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
             )
 
 
+def _iter_platform_tool_policies(config: Dict[str, Any]):
+    """Yield platform-wide exact policies across supported config layouts."""
+    seen: set[str] = set()
+
+    def collect(container: Any, prefix: str):
+        if not isinstance(container, dict):
+            return
+        for platform, block in container.items():
+            if not isinstance(block, dict) or "tool_policy" not in block:
+                continue
+            path = f"{prefix}.{platform}.tool_policy"
+            if path not in seen:
+                seen.add(path)
+                yield path, block.get("tool_policy")
+
+    yield from collect(config.get("platforms"), "platforms")
+    gateway = config.get("gateway")
+    if isinstance(gateway, dict):
+        yield from collect(gateway.get("platforms"), "gateway.platforms")
+    for root_key, block in config.items():
+        if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
+            continue
+        if "tool_policy" in block:
+            path = f"{root_key}.tool_policy"
+            if path not in seen:
+                seen.add(path)
+                yield path, block.get("tool_policy")
+
+
 def validate_config_structure(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -5876,6 +5910,16 @@ def validate_config_structure(
             issues.append(ConfigIssue(
                 "error", _parsed_cron_policy.error,
                 "Use mode: allowlist with a YAML list of individual tool names, or mode: unrestricted/legacy",
+            ))
+    for _source, _raw_platform_policy in _iter_platform_tool_policies(config):
+        _parsed_platform_policy = parse_tool_policy(
+            _raw_platform_policy,
+            source=_source,
+        )
+        if not _parsed_platform_policy.valid:
+            issues.append(ConfigIssue(
+                "error", _parsed_platform_policy.error,
+                "Use mode: unrestricted or an exact individual-name allowlist; invalid platform policies fall back to the global policy",
             ))
     # Discord channel exceptions use the same parser. Validate both the
     # canonical nested layout and the legacy top-level platform layout.

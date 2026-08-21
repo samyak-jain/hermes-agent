@@ -228,6 +228,33 @@ class TestExactToolPolicyValidation:
 
         assert not [issue for issue in issues if "cron.tool_policy" in issue.message]
 
+    def test_valid_workshop_platform_policy(self):
+        issues = validate_config_structure({
+            "platforms": {"workshop": {"tool_policy": {
+                "mode": "allowlist",
+                "tools": ["clarify", "spawn_agent", "memory"],
+            }}},
+        })
+
+        assert not [
+            issue for issue in issues
+            if "platforms.workshop.tool_policy" in issue.message
+        ]
+
+    def test_malformed_workshop_platform_policy_is_an_error(self):
+        issues = validate_config_structure({
+            "platforms": {"workshop": {"tool_policy": {
+                "mode": "unrestricted",
+                "tools": ["terminal"],
+            }}},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "platforms.workshop.tool_policy" in issue.message
+            for issue in issues
+        )
+
     def test_malformed_cron_policy_is_an_error(self):
         issues = validate_config_structure({
             "cron": {"tool_policy": {

@@ -32,13 +32,26 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | Recon/design | Complete | Architecture and approved design are recorded below. |
 | 1. Protocol, ledger, auth, route seam | Complete | Strict fixture-backed protocol, shared-state ledger/recovery, separate bearer auth, plugin skeleton, and collision-fatal `api_route_factory` seam implemented. Focused suite: 53 passed. |
 | B6 provider tool-use-ID spike | Complete | Claude Agent SDK 0.3.207 passes the provider ID as `extra._meta["claudecode/toolUseId"]`; the shim forwards it exactly. No FIFO/name correlation. Shim suite: 18 passed. |
-| 2. Stateful adapter and text stream | Pending | Draft PR opens only after this phase works. |
+| 2. Stateful adapter and text stream | Complete | Deterministic workspace/chat lanes, execution-epoch session pinning, independent turn tasks, durable ordered SSE text/usage/end events, replay/reattach, disconnect survival, same-lane serialization, cross-lane concurrency, atomic capacity admission, and managed platform-wide tool policy are implemented. Focused phase suite: 262 passed. |
 | 3-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
 
 Phase-1 verification notes:
 
 - The supplied 13-tool Cloudflare fixture catalog is accepted without schema weakening, and its canonical digest matches `fixtures/workshop-tool-schemas/index.json` exactly.
 - The repository-wide runner completed all 2,137 files: 43,216 tests passed. Its initial shared virtualenv was stale (`mcp==2.0.0`, missing ACP/defusedxml, pytest skew), producing 55 unrelated failures. After creating a worktree-local lockfile-synchronized environment, the affected dependency failures cleared; 1,082 of 1,086 targeted baseline tests passed. The four remaining failures are unchanged unrelated baseline behavior in `tests/hermes_cli/test_models.py` (two catalog expectations) and `tests/tools/test_ssh_environment.py` (two Nix restricted-PATH expectations); running those exact four tests from a clean archive of starting commit `db5281cade17b6292f22768ce26123cec7956093` reproduces all four. Workshop, API-route, plugin-interface, and shim suites are fully green.
+
+Phase-2 implementation notes:
+
+- A workshop chat maps to `agent:main:workshop:thread:<workspace_id>:<chat_id>`. Admission creates the durable turn, but the adapter re-resolves and pins its Hermes `session_id` only after acquiring the per-chat lane and before `turn.started`; this prevents a queued turn from resurrecting a parent session rotated by an earlier compression.
+- `POST /api/workshop/v1/turns` owns an independent background task and returns an observer SSE stream. Closing that stream cannot cancel the task. `GET .../events?after_seq=N` replays persisted semantic events and tails an in-process active turn.
+- Event order is `turn.started`, `message.start`, text deltas, `usage`, then `turn.end`. The gateway's existing model text callback is composed with an awaited durable workshop sink, and the terminal boundary is emitted only after `GatewayRunner._handle_message()` returns from transcript persistence.
+- Active admission is transactionally capped, including queued turns; same-chat turns serialize while distinct chats can run concurrently. Platform-wide exact `tool_policy` is now typed, config-validated, managed-authority checked, and participates in the existing agent-cache signature via its fingerprint.
+
+Phase-2 verification notes:
+
+- The focused phase suite is green: 262 tests passed across workshop protocol/storage/auth/HTTP/turn coordination, API route registration, platform configuration, and managed tool-policy resolution. The Claude shim suite is also green at 18 tests, including exact provider tool-use-ID propagation. Ruff and `git diff --check` pass on every changed Python surface.
+- The repository-wide runner completed all 2,138 files with 43,589 passing tests. It encountered a host `/tmp` quota during the run; all 238 affected tests pass when rerun with a worktree-local temp directory. Two unrelated long-running `run_agent` files exceeded the runner's 300-second per-file timeout under the loaded host; an isolated retry of `test_provider_fallback.py` reproduced the pre-existing hang after its first 12 tests and was stopped after confirming it was outside workshop execution.
+- Five genuine assertions remain, and all five reproduce from a clean archive of production starting commit `db5281cade17b6292f22768ce26123cec7956093`: one AWS-region default assertion in `tests/agent/test_bedrock_integration.py`, two model-catalog assertions in `tests/hermes_cli/test_models.py`, and two restricted-PATH SSH fixture assertions in `tests/tools/test_ssh_environment.py`. Phase 2 introduces no new full-suite assertion failure.
 
 Implementation branch: `workshop-platform`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 

@@ -2552,6 +2552,22 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _compose_external_text_event_sink(
+    native_callback: Optional[Callable[[str], None]],
+    external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> Optional[Callable[[str], None]]:
+    """Fan model text deltas into the platform stream without replacing UI delivery."""
+    if external_event_sink is None:
+        return native_callback
+
+    def combined(delta: str) -> None:
+        if native_callback is not None:
+            native_callback(delta)
+        external_event_sink("text.delta", {"delta": delta})
+
+    return combined
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -2815,6 +2831,58 @@ def _resolve_tool_policy_for_source(
             logger.warning(
                 "Ignoring unmanaged profile tool policy for %s",
                 profile,
+            )
+
+    platform_name = _platform_config_key(source.platform)
+    raw_platform_policy = None
+    if gateway_config is not None:
+        typed_platform = gateway_config.platforms.get(source.platform)
+        if typed_platform is not None:
+            raw_platform_policy = typed_platform.tool_policy
+    else:
+        raw_platforms = user_config.get("platforms")
+        raw_platform = (
+            raw_platforms.get(platform_name)
+            if isinstance(raw_platforms, dict)
+            else None
+        )
+        if not isinstance(raw_platform, dict):
+            legacy_platform = user_config.get(platform_name)
+            raw_platform = legacy_platform if isinstance(legacy_platform, dict) else None
+        if isinstance(raw_platform, dict):
+            raw_platform_policy = raw_platform.get("tool_policy")
+
+    if raw_platform_policy is not None:
+        platform_policy_path = f"platforms.{platform_name}.tool_policy"
+        platform_authorized = authority == "any"
+        if not platform_authorized:
+            try:
+                from hermes_cli import managed_scope
+
+                legacy_path = platform_policy_path.removeprefix("platforms.")
+                platform_authorized = any(
+                    managed_scope.is_key_managed(path)
+                    for path in (
+                        platform_policy_path,
+                        f"{platform_policy_path}.mode",
+                        legacy_path,
+                        f"{legacy_path}.mode",
+                    )
+                )
+            except Exception:
+                platform_authorized = False
+        if platform_authorized:
+            resolved_platform = parse_tool_policy(
+                raw_platform_policy,
+                source=platform_policy_path,
+                fallback=base_policy,
+            )
+            if resolved_platform.valid:
+                base_policy = resolved_platform
+        else:
+            logger.warning(
+                "Ignoring unmanaged %s platform tool policy override",
+                platform_name,
             )
 
     if source.platform != Platform.DISCORD:
@@ -13617,6 +13685,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 automated_trigger=str(
                     (event.metadata or {}).get("automated_trigger") or ""
                 ),
+                external_event_sink=(event.metadata or {}).get(
+                    "_gateway_event_sink"
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -19493,6 +19564,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
+        external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19512,6 +19584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
+                external_event_sink=external_event_sink,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19524,6 +19597,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
+                external_event_sink=external_event_sink,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19646,6 +19720,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
+        external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21187,7 +21262,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            agent.stream_delta_callback = _compose_external_text_event_sink(
+                _stream_delta_cb,
+                external_event_sink,
+            )
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).

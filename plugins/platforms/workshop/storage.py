@@ -45,6 +45,10 @@ class WorkshopConflictError(WorkshopStorageError):
     pass
 
 
+class WorkshopCapacityError(WorkshopStorageError):
+    pass
+
+
 class WorkshopBacklogExceeded(WorkshopStorageError):
     pass
 
@@ -167,7 +171,9 @@ class WorkshopLedger:
         completed_retention_seconds: int = COMPLETED_EVENT_RETENTION_SECONDS,
         max_pending_calls: int = MAX_PENDING_REMOTE_CALLS,
     ):
-        self.db_path = Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
+        self.db_path = (
+            Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
+        )
         self.max_event_backlog_bytes = int(max_event_backlog_bytes)
         self.completed_retention_seconds = int(completed_retention_seconds)
         self.max_pending_calls = int(max_pending_calls)
@@ -224,6 +230,7 @@ class WorkshopLedger:
         request_digest: str,
         turn_id: str | None = None,
         state: str = "queued",
+        max_active_turns: int | None = None,
     ) -> tuple[WorkshopTurnRecord, bool]:
         if state not in ACTIVE_TURN_STATES:
             raise ValueError(f"invalid initial workshop turn state: {state}")
@@ -242,6 +249,19 @@ class WorkshopLedger:
                         "client_turn_id was already used with a different request"
                     )
                 return WorkshopTurnRecord.from_row(existing), False
+            if max_active_turns is not None:
+                placeholders = ",".join("?" for _ in ACTIVE_TURN_STATES)
+                active = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM workshop_turns "
+                        f"WHERE state IN ({placeholders})",
+                        tuple(ACTIVE_TURN_STATES),
+                    ).fetchone()[0]
+                )
+                if active >= max_active_turns:
+                    raise WorkshopCapacityError(
+                        f"workshop already has {max_active_turns} active turns"
+                    )
             conn.execute(
                 """INSERT INTO workshop_turns
                    (turn_id, client_turn_id, workspace_id, chat_id,
@@ -267,6 +287,48 @@ class WorkshopLedger:
             ).fetchone()
             assert row is not None
             return WorkshopTurnRecord.from_row(row), True
+
+        return self._write(write)
+
+    def bind_queued_turn_session(
+        self,
+        *,
+        turn_id: str,
+        session_key: str,
+        session_id: str,
+    ) -> WorkshopTurnRecord:
+        """Pin a queued turn to the session epoch it will actually execute.
+
+        A preceding serialized turn may rotate the chat's active session while
+        compressing.  Rebinding is therefore allowed only before the first
+        event has been allocated; once ``turn.started`` exists the public epoch
+        is immutable.
+        """
+
+        now = time.time()
+
+        def write(conn: sqlite3.Connection) -> WorkshopTurnRecord:
+            row = conn.execute(
+                "SELECT state, next_seq FROM workshop_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
+            if row["state"] != "queued" or int(row["next_seq"]) != 1:
+                raise WorkshopConflictError(
+                    "workshop turn session can only be bound before turn.started"
+                )
+            conn.execute(
+                """UPDATE workshop_turns
+                   SET session_key=?, session_id=?, updated_at=?
+                   WHERE turn_id=?""",
+                (session_key, session_id, now, turn_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM workshop_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+            assert updated is not None
+            return WorkshopTurnRecord.from_row(updated)
 
         return self._write(write)
 
@@ -340,7 +402,9 @@ class WorkshopLedger:
             if row is None:
                 raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
             if row["state"] in TERMINAL_TURN_STATES and row["state"] != state:
-                raise WorkshopConflictError("terminal workshop turn cannot change state")
+                raise WorkshopConflictError(
+                    "terminal workshop turn cannot change state"
+                )
             completed_at = now if state in TERMINAL_TURN_STATES else None
             conn.execute(
                 """UPDATE workshop_turns
@@ -420,7 +484,11 @@ class WorkshopLedger:
         if state not in TERMINAL_TURN_STATES:
             raise ValueError(f"invalid terminal workshop turn state: {state}")
         now = time.time() if timestamp is None else float(timestamp)
-        terminal_payload = {"status": state, "stop_reason": stop_reason, **(payload or {})}
+        terminal_payload = {
+            "status": state,
+            "stop_reason": stop_reason,
+            **(payload or {}),
+        }
 
         def write(conn: sqlite3.Connection) -> WorkshopEvent:
             row = conn.execute(
@@ -439,7 +507,9 @@ class WorkshopLedger:
                     recorded = self._event_from_json(events["event_json"])
                     if recorded.payload == terminal_payload:
                         return recorded
-                raise WorkshopConflictError("workshop turn already finished differently")
+                raise WorkshopConflictError(
+                    "workshop turn already finished differently"
+                )
             item = WorkshopEvent.create(
                 turn_id=turn_id,
                 session_id=row["session_id"],
@@ -488,7 +558,9 @@ class WorkshopLedger:
             seq=int(value["seq"]),
             event=value["event"],
             timestamp=float(value["timestamp"]),
-            payload={key: item for key, item in value.items() if key not in base_fields},
+            payload={
+                key: item for key, item in value.items() if key not in base_fields
+            },
         )
 
     def list_events(self, turn_id: str, *, after_seq: int = 0) -> list[WorkshopEvent]:
@@ -528,14 +600,21 @@ class WorkshopLedger:
             if turn is None:
                 raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
             if turn["state"] in TERMINAL_TURN_STATES:
-                raise WorkshopConflictError("cannot register a tool call on a terminal turn")
+                raise WorkshopConflictError(
+                    "cannot register a tool call on a terminal turn"
+                )
             existing = conn.execute(
                 "SELECT name, arguments_json FROM workshop_tool_calls WHERE turn_id=? AND call_id=?",
                 (turn_id, call_id),
             ).fetchone()
             if existing is not None:
-                if existing["name"] != name or existing["arguments_json"] != arguments_json:
-                    raise WorkshopConflictError("call_id was reused with different arguments")
+                if (
+                    existing["name"] != name
+                    or existing["arguments_json"] != arguments_json
+                ):
+                    raise WorkshopConflictError(
+                        "call_id was reused with different arguments"
+                    )
                 return False
             pending = int(
                 conn.execute(
@@ -578,9 +657,14 @@ class WorkshopLedger:
             if row is None:
                 raise WorkshopNotFoundError(f"unknown workshop tool call: {call_id}")
             if row["state"] == "resolved":
-                if row["result_json"] == result_json and bool(row["is_error"]) is is_error:
+                if (
+                    row["result_json"] == result_json
+                    and bool(row["is_error"]) is is_error
+                ):
                     return False
-                raise WorkshopConflictError("tool result conflicts with the recorded result")
+                raise WorkshopConflictError(
+                    "tool result conflicts with the recorded result"
+                )
             if row["state"] != "pending":
                 raise WorkshopConflictError(f"tool call is not pending: {row['state']}")
             conn.execute(
@@ -656,7 +740,9 @@ class WorkshopLedger:
             ).fetchone()
             if row is not None:
                 if row["payload_digest"] != payload_digest or row["turn_id"] != turn_id:
-                    raise WorkshopConflictError("delta_id was reused with different content")
+                    raise WorkshopConflictError(
+                        "delta_id was reused with different content"
+                    )
                 return False
             conn.execute(
                 """INSERT INTO workshop_deltas
@@ -669,7 +755,9 @@ class WorkshopLedger:
         return self._write(write)
 
     def prune_completed(self, *, now: float | None = None) -> int:
-        cutoff = (time.time() if now is None else now) - self.completed_retention_seconds
+        cutoff = (
+            time.time() if now is None else now
+        ) - self.completed_retention_seconds
 
         def write(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
