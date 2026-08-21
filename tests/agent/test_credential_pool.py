@@ -1985,6 +1985,45 @@ def test_entry_for_lease_uses_lease_identity(tmp_path, monkeypatch):
     assert pool.entry_for_lease(first_lease).id == "cred-1"
 
 
+def test_recent_refresh_aliases_are_bounded(monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    from agent.credential_pool import (
+        CredentialPool,
+        PooledCredential,
+        RECENT_REFRESH_ALIAS_LIMIT,
+    )
+
+    entry = PooledCredential(
+        provider="openrouter",
+        id="rotating",
+        label="rotating",
+        auth_type="oauth",
+        priority=0,
+        source="manual",
+        access_token="token-0",
+    )
+    pool = CredentialPool("openrouter", [entry])
+
+    def _refresh():
+        current = pool._current_unlocked()
+        generation = int(current.access_token.rsplit("-", 1)[1]) + 1
+        refreshed = dc_replace(current, access_token=f"token-{generation}")
+        pool._replace_entry(current, refreshed)
+        pool._current_id = refreshed.id
+        return refreshed
+
+    monkeypatch.setattr(pool, "_try_refresh_current_unlocked", _refresh)
+
+    for _ in range(RECENT_REFRESH_ALIAS_LIMIT + 10):
+        old_key = pool.entries()[0].runtime_api_key
+        assert pool.try_refresh_matching(api_key_hint=old_key) is not None
+
+    assert len(pool._recent_refresh_aliases) == RECENT_REFRESH_ALIAS_LIMIT
+    assert "token-0" not in pool._recent_refresh_aliases
+    assert f"token-{RECENT_REFRESH_ALIAS_LIMIT + 9}" in pool._recent_refresh_aliases
+
+
 class TestCredentialPoolQueryLocking:
     """Public pool-state methods must run under ``self._lock``.
 

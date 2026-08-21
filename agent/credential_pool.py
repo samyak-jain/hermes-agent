@@ -589,6 +589,7 @@ def credential_pool_matches_provider(
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
+RECENT_REFRESH_ALIAS_LIMIT = 128
 
 
 def _write_through_provider_state_to_global_root(
@@ -2348,6 +2349,9 @@ class CredentialPool:
             refreshed = self._try_refresh_current_unlocked()
             if refreshed is not None and old_runtime_key:
                 self._recent_refresh_aliases[old_runtime_key] = refreshed.id
+                while len(self._recent_refresh_aliases) > RECENT_REFRESH_ALIAS_LIMIT:
+                    oldest_key = next(iter(self._recent_refresh_aliases))
+                    self._recent_refresh_aliases.pop(oldest_key, None)
             return refreshed
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
