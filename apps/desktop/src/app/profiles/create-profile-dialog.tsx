@@ -14,7 +14,7 @@ import { Field, FieldHint } from '@/components/ui/field'
 import { SanitizedInput } from '@/components/ui/sanitized-input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { createProfile, getProfileSoul, updateProfileSoul } from '@/hermes'
+import { createProfile, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
 import { slug } from '@/lib/sanitize'
@@ -80,8 +80,7 @@ export function CreateProfileDialog({
       await createProfile({ name: trimmed, clone_from: cloneFrom })
 
       if (soul.trim()) {
-        const currentSoul = await getProfileSoul(trimmed)
-        await updateProfileSoul(trimmed, soul, currentSoul.version)
+        await updateProfileSoul(trimmed, soul)
       }
 
       await onCreated?.(trimmed)

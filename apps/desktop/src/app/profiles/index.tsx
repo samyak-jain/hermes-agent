@@ -272,9 +272,6 @@ function SoulEditor({ profileName }: { profileName: string }) {
   const p = t.profiles
   const [content, setContent] = useState('')
   const [original, setOriginal] = useState('')
-  const [version, setVersion] = useState('')
-  const [editable, setEditable] = useState(true)
-  const [readOnlyReason, setReadOnlyReason] = useState<null | string>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<null | string>(null)
@@ -287,9 +284,6 @@ function SoulEditor({ profileName }: { profileName: string }) {
     setError(null)
     setContent('')
     setOriginal('')
-    setVersion('')
-    setEditable(true)
-    setReadOnlyReason(null)
 
     void (async () => {
       try {
@@ -298,9 +292,6 @@ function SoulEditor({ profileName }: { profileName: string }) {
         if (requestRef.current === profileName) {
           setContent(soul.content)
           setOriginal(soul.content)
-          setVersion(soul.version)
-          setEditable(soul.editable)
-          setReadOnlyReason(soul.read_only_reason)
         }
       } catch (err) {
         if (requestRef.current === profileName) {
@@ -317,16 +308,12 @@ function SoulEditor({ profileName }: { profileName: string }) {
   const dirty = content !== original
 
   async function handleSave() {
-    if (!editable) {
-      return
-    }
     setSaving(true)
     setError(null)
 
     try {
-      const saved = await updateProfileSoul(profileName, content, version)
+      await updateProfileSoul(profileName, content)
       setOriginal(content)
-      setVersion(saved.version)
       notify({ kind: 'success', title: p.soulSaved, message: profileName })
     } catch (err) {
       setError(err instanceof Error ? err.message : p.failedSaveSoul)
@@ -351,20 +338,12 @@ function SoulEditor({ profileName }: { profileName: string }) {
         <div className="min-h-48">
           <CodeEditor
             filePath="SOUL.md"
-            disabled={!editable || saving}
             framed
             initialValue={content}
             key={profileName}
             onChange={setContent}
             onSave={() => void handleSave()}
           />
-        </div>
-      )}
-
-      {!editable && readOnlyReason && (
-        <div className="flex items-start gap-2 rounded bg-muted px-3 py-2 text-xs text-muted-foreground">
-          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-          <span>{readOnlyReason}</span>
         </div>
       )}
 
