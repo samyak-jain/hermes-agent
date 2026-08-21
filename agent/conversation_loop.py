@@ -1944,11 +1944,25 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # Native transports compose API-only recall, plugin context, and
+        # gateway per-turn notes into the current user message below. The
+        # app-server early return must perform the same composition before
+        # handing the turn to Claude; otherwise Discord voice/reset notes and
+        # external-memory recall silently disappear on this runtime.
+        app_server_user_message = user_message
+        composed_app_server_content = compose_user_api_content(
+            user_message,
+            _ext_prefetch_cache,
+            _plugin_user_context,
+        )
+        if composed_app_server_content is not None:
+            app_server_user_message = composed_app_server_content
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=app_server_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
+            system_message=system_message,
             should_review_memory=_should_review_memory,
         )
 
@@ -4711,6 +4725,23 @@ def run_conversation(
                 )
                 if recovered_with_pool:
                     continue
+
+                # `usage_limit_reached` is an authoritative account-period
+                # exhaustion signal, not a transient 429. If the pool had no
+                # next account, do not spend two more identical requests on
+                # the same exhausted subscription. The normal eager-fallback
+                # block below still gets one chance to activate a configured
+                # provider; otherwise terminal handling runs immediately.
+                _error_reason = str((error_context or {}).get("reason") or "").lower()
+                _error_message = str((error_context or {}).get("message") or "").lower()
+                _definitive_usage_exhaustion = (
+                    "usage_limit_reached" in _error_reason
+                    or "gousagelimit" in _error_reason
+                    or "usage limit reached" in _error_message
+                    or "usage limit has been reached" in _error_message
+                )
+                if _definitive_usage_exhaustion:
+                    retry_count = max_retries
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's

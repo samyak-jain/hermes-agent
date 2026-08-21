@@ -141,12 +141,30 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        if (
+            idempotency_key
+            and await self.async_session_store.reset_idempotency_applied(
+                session_key,
+                idempotency_key,
+            )
+        ):
+            logger.info(
+                "Skipping already-applied receipt-backed reset %s for %s",
+                idempotency_key,
+                session_key,
+            )
+            return EphemeralReply(t("gateway.reset.header_default"))
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -239,7 +257,15 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
+        if idempotency_key:
+            new_entry = await self.async_session_store.reset_session(
+                session_key,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            new_entry = await self.async_session_store.reset_session(
+                session_key
+            )
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)
@@ -1767,8 +1793,6 @@ class GatewaySlashCommandsMixin:
             list_authenticated_providers,
             list_picker_providers,
         )
-        from hermes_cli.providers import get_label
-
         raw_args = event.get_command_args().strip()
         source = event.source
         _command_profile_home = None
@@ -1804,17 +1828,61 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 pass
 
-        # Read current model/provider from config
+        # Normalize the source the same way a normal message turn does
+        # (Telegram DM topic recovery) before deriving either the session key or
+        # the effective provider route.
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        session_key = self._session_key_for_source(source)
+
+        # Read the current route through the exact resolver used immediately
+        # before constructing the provider client. In a multiplexed gateway the
+        # resolver must also run inside the selected profile's config/secret
+        # scope; reading only model.default here previously advertised the
+        # mutable agent layer while managed profile/channel routing won at run
+        # time.
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
+        agent_owned_model = ""
+        agent_owned_provider = ""
         user_provs = None
         custom_provs = None
         excluded_provs = []
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
+
+        def _resolve_current_route():
+            from gateway.run import _profile_runtime_scope
+            from hermes_cli.config import read_raw_config
+
+            def _inside_scope():
+                scoped_cfg = _load_gateway_config() or {}
+                raw_cfg = read_raw_config()
+                try:
+                    effective_model, effective_runtime = (
+                        self._resolve_session_agent_runtime(
+                            source=source,
+                            session_key=session_key,
+                            user_config=scoped_cfg,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to resolve live /model route; using config fallback",
+                        exc_info=True,
+                    )
+                    effective_model, effective_runtime = "", {}
+                return scoped_cfg, raw_cfg, effective_model, effective_runtime
+
+            if _command_profile_home is not None:
+                with _profile_runtime_scope(_command_profile_home):
+                    return _inside_scope()
+            return _inside_scope()
+
         try:
-            cfg = _load_gateway_config(config_path=config_path)
+            cfg, raw_cfg, resolved_model, resolved_runtime = await asyncio.to_thread(
+                _resolve_current_route
+            )
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
@@ -1830,25 +1898,55 @@ class GatewaySlashCommandsMixin:
                 _excl = cfg.get("model_catalog", {}).get("excluded_providers")
                 if isinstance(_excl, list):
                     excluded_provs = _excl
+            current_model = resolved_model or current_model
+            current_provider = (
+                resolved_runtime.get("provider") or current_provider
+            )
+            current_base_url = (
+                resolved_runtime.get("base_url") or current_base_url
+            )
+            current_api_key = resolved_runtime.get("api_key") or ""
+            raw_model_cfg = raw_cfg.get("model") if isinstance(raw_cfg, dict) else None
+            if isinstance(raw_model_cfg, dict):
+                agent_owned_model = str(
+                    raw_model_cfg.get("default")
+                    or raw_model_cfg.get("model")
+                    or raw_model_cfg.get("name")
+                    or ""
+                )
+                agent_owned_provider = str(raw_model_cfg.get("provider") or "")
+            elif isinstance(raw_model_cfg, str):
+                agent_owned_model = raw_model_cfg.strip()
         except Exception:
-            pass
+            logger.debug("Failed to resolve effective /model route", exc_info=True)
 
-        # Check for session override. Normalize the source the same way a normal
-        # message turn does
-        # (Telegram DM topic recovery) before deriving the override key, so
-        # the override is stored under the key the next message turn reads
-        # (#30479).
-        source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
-        session_key = self._session_key_for_source(source)
+        # Keep the mutable layer visible when it differs, but label the resolved
+        # profile/channel/session route as the winner.
+        route_differs = bool(
+            (agent_owned_model and agent_owned_model != current_model)
+            or (
+                agent_owned_provider
+                and agent_owned_provider != current_provider
+            )
+        )
+        effective_route_line = (
+            f"**Effective route (profile/channel winner):** "
+            f"`{current_model or 'unknown'}` via `{current_provider or 'unknown'}`"
+        )
+        agent_owned_route_line = ""
+        if route_differs:
+            agent_owned_route_line = (
+                f"**Agent-owned model config (overridden):** "
+                f"`{agent_owned_model or 'unset'}` via "
+                f"`{agent_owned_provider or 'unset'}`"
+            )
+
+        # Check for session override. The resolver above has already applied it;
+        # retain the raw record only for one-turn restoration.
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
         )
-        if override:
-            current_model = override.get("model", current_model)
-            current_provider = override.get("provider", current_provider)
-            current_base_url = override.get("base_url", current_base_url)
-            current_api_key = override.get("api_key", current_api_key)
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -2164,11 +2262,36 @@ class GatewaySlashCommandsMixin:
                         metadata=metadata,
                     )
                     if result.success:
+                        if route_differs:
+                            # Picker-capable adapters own the command response,
+                            # so preserve the established ``None`` contract.
+                            # Send the layer comparison as a companion status
+                            # message after the picker succeeds.
+                            send_status = getattr(adapter, "send", None)
+                            if callable(send_status):
+                                try:
+                                    await send_status(
+                                        str(source.chat_id),
+                                        "\n".join(
+                                            [
+                                                effective_route_line,
+                                                agent_owned_route_line,
+                                            ]
+                                        ),
+                                        metadata=metadata,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to send /model route comparison",
+                                        exc_info=True,
+                                    )
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+            lines = [effective_route_line]
+            if agent_owned_route_line:
+                lines.append(agent_owned_route_line)
+            lines.append("")
 
             try:
                 # Offload blocking provider-listing off the event loop so the

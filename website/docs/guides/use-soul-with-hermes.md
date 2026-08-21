@@ -221,7 +221,33 @@ or
 vim ~/.hermes/SOUL.md
 ```
 
-Then restart Hermes or start a new session.
+Then start a new/reset session. Existing conversations retain the system
+prompt they started with, so changing the file does not rewrite their cached
+identity. A gateway restart is not required.
+
+### Managed self-editing
+
+An operator can enable the standalone `soul` toolset and its managed policy:
+
+```yaml
+soul_edit:
+  enabled: true
+  require_approval: false
+  max_bytes: 65536
+  read_only_profiles: []
+```
+
+The `soul` tool supports `read`, `update`, `history`, and `rollback`. It has no
+profile or path parameter: Hermes derives the active profile server-side.
+Updates and rollbacks require the opaque `expected_version` returned by
+`read`, take a per-profile lock, validate UTF-8 and content, atomically replace
+the file, and record metadata-only history. At most five restorable snapshots
+are retained.
+
+The policy is disabled by default and is not editable through the agent
+configuration broker. Operators should grant the `soul` toolset only to
+top-level profile agents, not delegated children or unattended cron runs.
+Distribution-owned or operator-marked read-only SOUL files remain immutable.
 
 ## A practical workflow
 

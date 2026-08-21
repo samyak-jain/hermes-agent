@@ -1,0 +1,383 @@
+import { randomUUID } from "node:crypto";
+import {
+  createSdkMcpServer,
+  query,
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+  tool,
+  type Options,
+  type PermissionMode,
+  type SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+import { sdkEnvironment } from "./environment.js";
+import { jsonSchemaShape } from "./schema.js";
+import type { RpcConnection } from "./rpc.js";
+import type { HostToolSchema, ThreadState, ThreadStore, Usage } from "./threads.js";
+
+interface TurnResult {
+  status: "completed" | "interrupted" | "failed";
+  usage?: Usage;
+  contextWindow?: number;
+  error?: string;
+}
+
+interface ToolItem {
+  itemId: string;
+  item: Record<string, unknown>;
+}
+
+export function titleForThread(thread: ThreadState): string | undefined {
+  // Hermes owns its user-visible titles. A fixed local Claude-session title
+  // prevents the SDK from spending a separate model request summarizing the
+  // first user message.
+  return thread.claudeSessionId ? undefined : "Hermes Agent";
+}
+
+export function systemPromptForThread(thread: ThreadState): string | string[] {
+  const stable = thread.systemPromptIdentity?.trim();
+  const dynamic = thread.systemPromptAppend?.trim();
+  if (stable && dynamic) {
+    return [stable, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, dynamic];
+  }
+  return stable || dynamic || "";
+}
+
+export function handleSystemMessage(
+  threads: ThreadStore,
+  thread: ThreadState,
+  message: { subtype: string; session_id?: string },
+): boolean {
+  if (message.subtype === "init" && message.session_id) {
+    threads.bindClaudeSession(thread, message.session_id);
+  }
+  return message.subtype === "compact_boundary";
+}
+
+export function promptForTurn(thread: ThreadState, userText: string): {
+  prompt: string;
+  includesHostContext: boolean;
+} {
+  return { prompt: userText, includesHostContext: false };
+}
+
+function hostToolDefinition(
+  rpc: RpcConnection,
+  thread: ThreadState,
+  turnId: string,
+  definition: HostToolSchema,
+) {
+  return tool(
+    definition.name,
+    definition.description ?? "",
+    jsonSchemaShape(definition.inputSchema ?? {}),
+    async (arguments_: Record<string, unknown>) => {
+      const response = await rpc.request<{ content?: string; isError?: boolean }>(
+        "agent/tool/call",
+        {
+          threadId: thread.threadId,
+          turnId,
+          toolCallId: `tool_${randomUUID()}`,
+          name: definition.name,
+          arguments: arguments_,
+        },
+      );
+      return {
+        content: [{ type: "text", text: response.content ?? "" }],
+        isError: Boolean(response.isError),
+      };
+    },
+    { alwaysLoad: true },
+  );
+}
+
+export function mcpServer(rpc: RpcConnection, thread: ThreadState, turnId: string) {
+  return createSdkMcpServer({
+    name: "agent-runtime",
+    version: "1.0.0",
+    tools: thread.tools.map((definition) =>
+      hostToolDefinition(rpc, thread, turnId, definition),
+    ),
+  });
+}
+
+function parseMcpTool(name: string): { server: string; tool: string } {
+  const match = /^mcp__([^_].*?)__(.+)$/.exec(name);
+  return match ? { server: match[1], tool: match[2] } : { server: "mcp", tool: name };
+}
+
+function toolItem(name: string, input: unknown): Record<string, unknown> {
+  const { server, tool: toolName } = parseMcpTool(name);
+  return {
+    type: "mcpToolCall",
+    server,
+    tool: toolName,
+    arguments: input ?? {},
+  };
+}
+
+function renderToolResult(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((entry: any) => (entry?.type === "text" ? String(entry.text ?? "") : ""))
+      .join("");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
+export function usageFromSdkMessage(raw: any): Usage {
+  const usage: Usage = {
+    inputTokens: Number(raw.input_tokens ?? 0),
+    cachedInputTokens: Number(raw.cache_read_input_tokens ?? 0),
+    cacheCreationInputTokens: Number(raw.cache_creation_input_tokens ?? 0),
+    outputTokens: Number(raw.output_tokens ?? 0),
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+  };
+  usage.totalTokens =
+    usage.inputTokens +
+    usage.cachedInputTokens +
+    usage.cacheCreationInputTokens +
+    usage.outputTokens;
+  return usage;
+}
+
+export function usageFromResult(result: any): { usage: Usage; contextWindow?: number } {
+  const usage = usageFromSdkMessage(result?.usage ?? {});
+  const modelUsage = Object.values(result?.modelUsage ?? {}) as any[];
+  const contextWindow = modelUsage.find((entry) => Number(entry?.contextWindow) > 0)
+    ?.contextWindow;
+  return { usage, contextWindow: contextWindow ? Number(contextWindow) : undefined };
+}
+
+function addUsage(total: Usage, last: Usage): void {
+  total.inputTokens += last.inputTokens;
+  total.cachedInputTokens += last.cachedInputTokens;
+  total.cacheCreationInputTokens += last.cacheCreationInputTokens;
+  total.outputTokens += last.outputTokens;
+  total.reasoningOutputTokens += last.reasoningOutputTokens;
+  total.totalTokens += last.totalTokens;
+}
+
+export function tokenUsageForTurn(
+  aggregate: Usage,
+  lastAssistant: Usage | undefined,
+  total: Usage,
+  modelContextWindow?: number,
+) {
+  return {
+    last: lastAssistant,
+    turn: aggregate,
+    total,
+    modelContextWindow,
+  };
+}
+
+export async function runTurn(options: {
+  rpc: RpcConnection;
+  threads: ThreadStore;
+  thread: ThreadState;
+  turnId: string;
+  userText: string;
+  compaction?: boolean;
+  queryFn?: typeof query;
+}): Promise<TurnResult> {
+  const {
+    rpc,
+    threads,
+    thread,
+    turnId,
+    userText,
+    compaction = false,
+    queryFn = query,
+  } = options;
+  const threadId = thread.threadId;
+  const turnPrompt = promptForTurn(thread, userText);
+  const abort = new AbortController();
+  const toolItems = new Map<string, ToolItem>();
+  let currentMessageItem: string | undefined;
+  let lastAssistantUsage: Usage | undefined;
+  let sawCompactBoundary = false;
+
+  const sdkOptions: Options = {
+    cwd: thread.cwd,
+    resume: thread.claudeSessionId,
+    model: thread.model,
+    permissionMode: (thread.permissionMode ?? "bypassPermissions") as PermissionMode,
+    allowDangerouslySkipPermissions:
+      (thread.permissionMode ?? "bypassPermissions") === "bypassPermissions",
+    includePartialMessages: true,
+    abortController: abort,
+    systemPrompt: systemPromptForThread(thread),
+    ...(titleForThread(thread) ? { title: titleForThread(thread) } : {}),
+    // Hermes supplies its own prompt, context files and skills. Loading Claude
+    // filesystem settings here could also load an env/apiKeyHelper override
+    // and silently move the main turn away from subscription authentication.
+    settingSources: [],
+    managedSettings: {
+      autoMemoryEnabled: false,
+      autoDreamEnabled: false,
+    },
+    tools: [],
+    strictMcpConfig: true,
+    mcpServers: { "agent-runtime": mcpServer(rpc, thread, turnId) },
+    env: sdkEnvironment(),
+    stderr: (data) => process.stderr.write(data),
+  };
+
+  const runningQuery = queryFn({ prompt: turnPrompt.prompt, options: sdkOptions });
+  thread.activeTurn = { turnId, query: runningQuery, abort };
+  rpc.notify("turn/started", { threadId, turn: { id: turnId } });
+
+  let result: TurnResult = { status: "failed", error: "no result received" };
+  try {
+    for await (const message of runningQuery as AsyncIterable<SDKMessage>) {
+      switch (message.type) {
+        case "system":
+          sawCompactBoundary =
+            handleSystemMessage(threads, thread, message) || sawCompactBoundary;
+          break;
+        case "stream_event": {
+          const event: any = (message as any).event;
+          if (
+            event?.type === "content_block_delta" &&
+            event.delta?.type === "text_delta"
+          ) {
+            if (!currentMessageItem) {
+              currentMessageItem = `item_${randomUUID()}`;
+              rpc.notify("item/started", {
+                threadId,
+                turnId,
+                item: { id: currentMessageItem, type: "agentMessage", text: "" },
+              });
+            }
+            rpc.notify("item/agentMessage/delta", {
+              threadId,
+              turnId,
+              itemId: currentMessageItem,
+              delta: event.delta.text,
+            });
+          }
+          break;
+        }
+        case "assistant":
+          if ((message as any).message?.usage) {
+            lastAssistantUsage = usageFromSdkMessage((message as any).message.usage);
+          }
+          for (const block of (message as any).message?.content ?? []) {
+            if (block.type === "text") {
+              const itemId = currentMessageItem ?? `item_${randomUUID()}`;
+              if (!currentMessageItem) {
+                rpc.notify("item/started", {
+                  threadId,
+                  turnId,
+                  item: { id: itemId, type: "agentMessage", text: "" },
+                });
+              }
+              rpc.notify("item/completed", {
+                threadId,
+                turnId,
+                item: { id: itemId, type: "agentMessage", text: block.text },
+              });
+              currentMessageItem = undefined;
+            } else if (block.type === "thinking") {
+              rpc.notify("item/completed", {
+                threadId,
+                turnId,
+                item: {
+                  id: `item_${randomUUID()}`,
+                  type: "reasoning",
+                  summary: [String(block.thinking ?? "")],
+                  content: [],
+                },
+              });
+            } else if (block.type === "tool_use") {
+              const itemId = `item_${randomUUID()}`;
+              const item = toolItem(block.name, block.input);
+              toolItems.set(block.id, { itemId, item });
+              rpc.notify("item/started", {
+                threadId,
+                turnId,
+                item: { id: itemId, status: "inProgress", ...item },
+              });
+            }
+          }
+          break;
+        case "user":
+          for (const block of (message as any).message?.content ?? []) {
+            if (block?.type !== "tool_result") continue;
+            const mapped = toolItems.get(block.tool_use_id);
+            if (!mapped) continue;
+            const output = renderToolResult(block.content);
+            rpc.notify("item/completed", {
+              threadId,
+              turnId,
+              item: {
+                id: mapped.itemId,
+                status: block.is_error ? "failed" : "completed",
+                ...mapped.item,
+                ...(block.is_error
+                  ? { error: { message: output } }
+                  : { result: output }),
+              },
+            });
+            toolItems.delete(block.tool_use_id);
+          }
+          break;
+        case "result": {
+          const sdkResult: any = message;
+          const measured = usageFromResult(sdkResult);
+          result = sdkResult.is_error
+            ? {
+                status: "failed",
+                error: String(sdkResult.result ?? sdkResult.subtype ?? "SDK error"),
+                ...measured,
+              }
+            : { status: "completed", ...measured };
+          break;
+        }
+      }
+    }
+  } catch (error: any) {
+    result = abort.signal.aborted
+      ? { status: "interrupted" }
+      : { status: "failed", error: error?.message ?? String(error) };
+  } finally {
+    thread.activeTurn = undefined;
+    rpc.rejectPendingOutboundForTurn(turnId, "turn aborted");
+  }
+
+  if (result.usage) {
+    addUsage(thread.usageTotal, result.usage);
+    rpc.notify("thread/tokenUsage/updated", {
+      threadId,
+      turnId,
+      tokenUsage: tokenUsageForTurn(
+        result.usage,
+        lastAssistantUsage,
+        thread.usageTotal,
+        result.contextWindow,
+      ),
+    });
+  }
+  if (compaction && result.status === "completed" && sawCompactBoundary) {
+    const item = { id: `item_${randomUUID()}`, type: "contextCompaction" };
+    rpc.notify("item/started", { threadId, turnId, item });
+    rpc.notify("item/completed", { threadId, turnId, item });
+    rpc.notify("thread/compacted", { threadId, turnId });
+  } else if (compaction && result.status === "completed") {
+    result = {
+      ...result,
+      status: "failed",
+      error: "compaction completed without a compact boundary",
+    };
+  }
+  rpc.notify("turn/completed", {
+    threadId,
+    turn: {
+      id: turnId,
+      status: result.status,
+      ...(result.error ? { error: { message: result.error } } : {}),
+    },
+  });
+  return result;
+}

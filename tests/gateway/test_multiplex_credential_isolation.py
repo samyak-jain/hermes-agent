@@ -40,6 +40,7 @@ class TestRuntimeProviderUsesScope:
             ss.reset_secret_scope(tok_b)
 
 
+
 class TestMcpInterpolationUsesScope:
     """MCP config ${VAR} interpolation resolves through the secret scope."""
 
@@ -164,5 +165,3 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert calls["count"] == 1
     assert "TEST_PROVIDER_API_KEY" not in os.environ
     assert "EXPLICIT_API_KEY" not in os.environ
-
-

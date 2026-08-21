@@ -111,6 +111,10 @@ class FakeClient:
         self._notifications.append({"method": method, "params": params})
 
     def queue_server_request(self, method: str, request_id: Any = "srv-1", **params):
+        if params.get("threadId") in {"t", "th"}:
+            params["threadId"] = "thread-fake-001"
+        if params.get("turnId") == "tu1":
+            params["turnId"] = "turn-fake-001"
         self._server_requests.append({"id": request_id, "method": method, "params": params})
 
     def set_stderr_tail(self, lines):
@@ -149,6 +153,73 @@ class TestTurnInputCoercion:
         assert text == "caption\n\n[image attached]"
 
 
+class TestServerRequestTurnScoping:
+    def test_stale_host_tool_call_is_rejected_without_execution(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "agent/tool/call",
+            request_id="stale-tool",
+            threadId="thread-fake-001",
+            turnId="turn-old",
+            toolCallId="call-old",
+            name="dangerous_tool",
+            arguments={},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed"},
+        )
+        calls = []
+        result = make_session(
+            client,
+            tool_callback=lambda *args: calls.append(args) or "executed",
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert result.interrupted is False
+        assert calls == []
+        assert client.responses == [
+            ("stale-tool", {"content": "turn aborted", "isError": True})
+        ]
+
+    def test_host_tool_call_queued_at_teardown_is_drained(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed"},
+        )
+        queued = {
+            "id": "late-tool",
+            "method": "agent/tool/call",
+            "params": {
+                "threadId": "thread-fake-001",
+                "turnId": "turn-fake-001",
+                "toolCallId": "call-late",
+                "name": "dangerous_tool",
+                "arguments": {},
+            },
+        }
+        polls = 0
+
+        def take_server_request(timeout=0):
+            nonlocal polls
+            polls += 1
+            return queued if polls == 2 else None
+
+        client.take_server_request = take_server_request
+        calls = []
+        make_session(
+            client,
+            tool_callback=lambda *args: calls.append(args) or "executed",
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert calls == []
+        assert client.responses == [
+            ("late-tool", {"content": "turn aborted", "isError": True})
+        ]
+
+
 # ---- lifecycle ----
 
 class TestLifecycle:
@@ -173,6 +244,32 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_start_passes_claude_bridge_context(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            model="claude-fable-5",
+            permission_mode="bypassPermissions",
+            host_session_id="gateway-session-1",
+            system_prompt_append="soul and memory",
+            system_prompt_identity="soul only",
+            tool_schemas=[
+                {
+                    "name": "memory",
+                    "description": "Persistent memory",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "claude-fable-5"
+        assert params["permissionMode"] == "bypassPermissions"
+        assert params["hostSessionId"] == "gateway-session-1"
+        assert params["systemPromptAppend"] == "soul and memory"
+        assert params["systemPromptIdentity"] == "soul only"
+        assert params["tools"][0]["name"] == "memory"
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -417,6 +514,7 @@ class TestCompactThread:
             turnId="compact-turn-1",
             tokenUsage={
                 "last": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+                "turn": {"inputTokens": 30, "outputTokens": 4, "totalTokens": 34},
                 "total": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120},
                 "modelContextWindow": 200000,
             },
@@ -436,6 +534,7 @@ class TestCompactThread:
         assert r.compacted is True
         assert r.final_text == "compacted"
         assert r.token_usage_last["totalTokens"] == 12
+        assert r.token_usage_turn["totalTokens"] == 34
         assert r.model_context_window == 200000
 
     def test_compact_thread_ignores_foreign_child_completion(self):
@@ -896,3 +995,38 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
 
+
+def test_host_tool_request_runs_live_callback():
+    client = FakeClient()
+    client.queue_server_request(
+        "agent/tool/call",
+        request_id="tool-request-1",
+        name="memory",
+        arguments={"action": "read"},
+        toolCallId="sdk-tool-1",
+    )
+    original_respond = client.respond
+
+    def respond_then_complete(request_id, response):
+        original_respond(request_id, response)
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+    client.respond = respond_then_complete
+    calls = []
+
+    def invoke(name, arguments, tool_call_id):
+        calls.append((name, arguments, tool_call_id))
+        return '{"success": true}'
+
+    result = make_session(client, tool_callback=invoke).run_turn(
+        "remember this", turn_timeout=2.0
+    )
+    assert result.error is None
+    assert calls == [("memory", {"action": "read"}, "sdk-tool-1")]
+    assert client.responses == [
+        ("tool-request-1", {"content": '{"success": true}', "isError": False})
+    ]

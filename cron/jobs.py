@@ -1833,6 +1833,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    agent_respond: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1900,6 +1901,11 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        agent_respond: When True, route the completed result back through the
+                originating gateway session as an internal turn so the main
+                agent can review it and respond automatically. Requires a live
+                gateway at fire time; delivery falls back to the normal cron
+                message path when the origin session cannot be reached.
 
     Returns:
         The created job dict
@@ -1937,6 +1943,7 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_agent_respond = agent_respond if isinstance(agent_respond, bool) else None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2046,6 +2053,11 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Like attach_to_session, absence preserves the historical job shape and
+    # behaviour.  Persist an explicit False so update/create callers can turn
+    # the feature off without relying on key deletion semantics.
+    if normalized_agent_respond is not None:
+        job["agent_respond"] = normalized_agent_respond
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2647,6 +2659,54 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             "Failed to write wedged-oneshot diagnostic for job %r: %s",
             job.get("id"), e,
         )
+
+
+def mark_job_dispatch_error(
+    job_id: str,
+    error: str,
+    *,
+    expected_run_claim: Optional[dict] = None,
+) -> bool:
+    """Record a terminal executor-dispatch failure without completing the job.
+
+    ``tick()`` advances recurring schedules before handing work to the executor.
+    If ``submit()`` rejects that handoff, the attempt still needs observable
+    ``last_*`` fields, but it must not increment a finite repeat counter,
+    recompute ``next_run_at``, or remove/disable a one-shot job that never
+    reached ``claim_dispatch()``.
+
+    A one-shot is durably claimed by ``get_due_jobs()`` before executor
+    submission. When ``expected_run_claim`` is provided, record the failure and
+    release the claim only if the complete claim generation still matches; if
+    another tick has since replaced it, leave the newer job state untouched and
+    return ``False``. Recurring jobs do not carry ``run_claim`` and retain their
+    already advanced next-run timestamp unchanged.
+
+    Calls that omit ``expected_run_claim`` retain the historical behavior:
+    record the dispatch error without touching any claim.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            claim = job.get("run_claim")
+            if expected_run_claim is not None and claim != expected_run_claim:
+                return False
+            job["last_run_at"] = _hermes_now().isoformat()
+            job["last_status"] = "error"
+            job["last_error"] = error
+            job["last_delivery_error"] = None
+            if expected_run_claim is not None:
+                job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+
+    logger.warning(
+        "mark_job_dispatch_error: job_id %s not found, skipping save",
+        job_id,
+    )
+    return False
 
 
 def claim_dispatch(job_id: str) -> bool:

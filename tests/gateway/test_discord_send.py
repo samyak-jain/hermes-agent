@@ -82,6 +82,35 @@ async def test_send_rejects_whitespace_and_records_failed_final_reply(
     assert "Dropped empty message to chat=555" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_empty_recovery_send_records_all_receipts_without_reply_anchor(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace()
+
+    result = await adapter.send(
+        "555",
+        "",
+        metadata={
+            "notify": True,
+            "_gateway_receipt_ids": ["124", "125"],
+        },
+    )
+
+    assert result.success is False
+    rows = adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT message_id, status FROM discord_messages "
+            "ORDER BY message_id"
+        ).fetchall()
+    )
+    assert rows == [("124", "failed"), ("125", "failed")]
+
+
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))
@@ -418,3 +447,29 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
 
 
+@pytest.mark.asyncio
+async def test_cancelled_typing_task_does_not_untrack_replacement():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = MagicMock()
+    adapter._client.http = MagicMock()
+    adapter._client.http.request = AsyncMock()
+    adapter._typing_tasks = {}
+
+    chat_id = "12345"
+    await adapter.send_typing(chat_id)
+    await asyncio.sleep(0)
+    original = adapter._typing_tasks[chat_id]
+
+    replacement_start = asyncio.create_task(adapter.send_typing(chat_id))
+    await adapter.stop_typing(chat_id)
+    await replacement_start
+    await asyncio.sleep(0)
+
+    replacement = adapter._typing_tasks.get(chat_id)
+    assert replacement is not None
+    assert replacement is not original
+    assert not replacement.done()
+
+    await adapter.stop_typing(chat_id)
+    assert replacement.done()
+    assert chat_id not in adapter._typing_tasks

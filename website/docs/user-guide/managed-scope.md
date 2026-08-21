@@ -16,6 +16,14 @@ When a managed scope is present, the values it specifies win over the user's
 `~/.hermes/config.yaml`, `~/.hermes/.env`, and even the shell environment — for
 exactly the keys it pins. Everything else stays fully user-controlled.
 
+Lists in managed configuration replace user lists; ordinary nested maps merge
+by leaf. Security-sensitive tool-policy elevation can additionally require
+managed provenance, so a user-added channel entry cannot grant itself
+`unrestricted` access. If a managed `config.yaml` was loaded successfully and
+is later malformed, Hermes retains the last-known-good managed policy. If a
+managed file is present but has never parsed successfully, startup fails rather
+than silently dropping administrator policy.
+
 :::note Different from a package-manager–locked install
 A package-manager–managed install (declarative-distro / formula) blocks *all*
 config mutation and tells you to use your package manager. Managed scope is a

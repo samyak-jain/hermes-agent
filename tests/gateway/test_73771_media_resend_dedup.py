@@ -484,6 +484,7 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
     runner = SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: {},
         _reply_anchor_for_event=lambda event: None,
+        _next_stream_delivery_metadata=lambda event, metadata: metadata,
     )
 
     await GatewayRunner._deliver_media_from_response(

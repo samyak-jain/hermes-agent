@@ -5,7 +5,7 @@ import itertools
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, call, patch, MagicMock
 
 import pytest
 
@@ -14,7 +14,11 @@ from cron.scheduler import (
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
+    _cron_archive_prompt,
+    _attach_cron_memory_store,
+    _register_cron_terminal,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_tool_policy,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -134,6 +138,174 @@ class TestPerJobToolsetMcpMerge:
         ):
             result = _resolve_cron_enabled_toolsets(job, {})
         assert result == ["file", "memory", "web"]
+
+
+class TestCronToolPolicy:
+    def test_memory_store_attached_only_when_memory_tool_is_authorized(self):
+        store = object()
+        agent = MagicMock(
+            valid_tool_names={"memory", "session_search"},
+            _memory_store=None,
+        )
+        with patch("tools.memory_tool.load_on_disk_store", return_value=store) as load:
+            assert _attach_cron_memory_store(agent) is True
+        assert agent._memory_store is store
+        load.assert_called_once_with()
+
+        no_memory_agent = MagicMock(
+            valid_tool_names={"session_search"},
+            _memory_store=None,
+        )
+        with patch("tools.memory_tool.load_on_disk_store") as denied_load:
+            assert _attach_cron_memory_store(no_memory_agent) is False
+        denied_load.assert_not_called()
+
+    def test_broad_denylist_keeps_noninteractive_tools(self):
+        policy = _resolve_cron_tool_policy({
+            "cron": {
+                "tool_policy": {
+                    "mode": "denylist",
+                    "tools": ["clarify", "spawn_agent", "cronjob", "send_message"],
+                },
+            },
+        })
+
+        assert policy.allows("terminal")
+        assert policy.allows("browser_navigate")
+        assert policy.allows("mcp__future__tool")
+        assert policy.allows("delegate_task")
+        assert not policy.allows("spawn_agent")
+        assert not policy.allows("send_message")
+
+    def test_terminal_override_uses_validated_task_registry(self):
+        cfg = {
+            "cron": {
+                "terminal": {
+                    "backend": "ssh",
+                    "cwd": "/data",
+                    "ssh_host": "10.0.0.2",
+                    "ssh_user": "root",
+                    "ssh_sync_files": False,
+                },
+            },
+        }
+        with patch(
+            "tools.terminal_tool.register_task_env_overrides"
+        ) as register:
+            assert _register_cron_terminal("cron-session", cfg) is True
+        overrides = register.call_args.args[1]
+        assert register.call_args.args[0] == "cron-session"
+        assert overrides["env_type"] == "ssh"
+        assert overrides["cwd"] == "/data"
+        assert overrides["ssh_sync_files"] is False
+
+    def test_cron_script_uses_registered_terminal_and_cleans_it_up(self):
+        import cron.scheduler as scheduler
+
+        cfg = {"cron": {"terminal": {"backend": "ssh"}}}
+        job = {"id": "watch", "schedule": "*/5 * * * *"}
+        with patch.object(scheduler, "load_config", return_value=cfg), patch.object(
+            scheduler,
+            "_register_cron_terminal",
+            return_value=True,
+        ) as register, patch.object(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+            return_value=(True, "ok"),
+        ) as run_script, patch.object(
+            scheduler,
+            "_cleanup_cron_task_environment",
+        ) as cleanup:
+            result = scheduler._run_cron_job_script(
+                job,
+                "watch.py",
+                session_id="cron_watch_1",
+            )
+
+        assert result == (True, "ok")
+        register.assert_called_once_with("cron_watch_1", cfg)
+        run_script.assert_called_once_with(
+            job,
+            "watch.py",
+            workdir=None,
+            task_id="cron_watch_1",
+        )
+        cleanup.assert_called_once_with("cron_watch_1")
+
+    def test_cron_script_sandbox_configuration_fails_closed(self):
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "load_config", return_value={}), patch.object(
+            scheduler,
+            "_register_cron_terminal",
+            side_effect=ValueError("missing SSH host"),
+        ), patch.object(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+        ) as run_script:
+            success, output = scheduler._run_cron_job_script(
+                {"id": "watch"},
+                "watch.py",
+                session_id="cron_watch_1",
+            )
+
+        assert success is False
+        assert "sandbox configuration failed" in output
+        run_script.assert_not_called()
+
+    def test_prompt_archive_is_omitted_by_default_and_redacted_when_enabled(self):
+        secret = "sk-" + ("x" * 30)
+        assert _cron_archive_prompt(f"token {secret}", {}) == (
+            "[omitted from archive; set cron.archive_prompt: true to retain]"
+        )
+        archived = _cron_archive_prompt(
+            f"token {secret}", {"cron": {"archive_prompt": True}}
+        )
+        assert secret not in archived
+
+    def test_explicit_cron_policy_overrides_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+            "cron": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["delegate_task", "skill_view"],
+                },
+            },
+        })
+
+        assert policy.source == "cron.tool_policy"
+        assert policy.allows("delegate_task")
+        assert policy.allows("skill_view")
+        assert not policy.allows("memory")
+
+    def test_absent_cron_policy_preserves_global_policy(self):
+        policy = _resolve_cron_tool_policy({
+            "agent": {
+                "tool_policy": {
+                    "mode": "allowlist",
+                    "tools": ["memory"],
+                },
+            },
+        })
+
+        assert policy.source == "agent.tool_policy"
+        assert policy.allows("memory")
+        assert not policy.allows("delegate_task")
+
+    def test_malformed_cron_policy_denies_all(self):
+        policy = _resolve_cron_tool_policy({
+            "cron": {"tool_policy": {"mode": "surprise"}},
+        })
+
+        assert not policy.valid
+        assert not policy.allows("delegate_task")
+        assert not policy.allows("memory")
 
 
 class TestResolveOrigin:
@@ -537,6 +709,17 @@ class TestDeliverResultErrorReturns:
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            """
+model:
+  default: test-model
+cron:
+  tool_policy:
+    mode: allowlist
+    tools: [delegate_task, memory]
+""".lstrip(),
+            encoding="utf-8",
+        )
         job = {
             "id": "test-job",
             "name": "test",
@@ -577,6 +760,9 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_id"].startswith("cron_test-job_")
         original_session_id = kwargs["session_id"]
         fake_db.get_compression_tip.assert_called_once_with(original_session_id)
+        assert kwargs["tool_policy"].source == "cron.tool_policy"
+        assert kwargs["tool_policy"].allows("delegate_task")
+        assert not kwargs["tool_policy"].allows("terminal")
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0] == original_session_id
@@ -647,6 +833,68 @@ class TestRunJobSessionPersistence:
         assert "memory" not in (kwargs["disabled_toolsets"] or []), (
             "memory toolset must not be policy-denied in cron"
         )
+
+    def test_explicit_null_cron_max_iterations_is_unlimited(self, tmp_path):
+        from hermes_cli.config import TURN_LIMIT_UNLIMITED
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: test-model\ncron:\n  max_iterations: null\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "unlimited-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == TURN_LIMIT_UNLIMITED
+
+    def test_run_job_resolves_credential_from_lease_id(self, tmp_path):
+        leased_entry = MagicMock(
+            runtime_api_key="leased-key",
+            runtime_base_url="https://leased.invalid/v1",
+        )
+        other_entry = MagicMock(
+            runtime_api_key="other-key",
+            runtime_base_url="https://other.invalid/v1",
+        )
+        pool = MagicMock()
+        pool.acquire_lease.return_value = "leased-id"
+        pool.entry_for_lease.return_value = leased_entry
+        pool.current.return_value = other_entry
+        runtime = {
+            "api_key": "resolver-key",
+            "base_url": "https://resolver.invalid/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "credential_pool": pool,
+        }
+        job = {
+            "id": "lease-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+
+        extra = (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+        )
+        with self._run_job_patches(tmp_path, extra=extra) as (
+            _fake_db,
+            mock_agent_cls,
+        ):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["api_key"] == "leased-key"
+        assert kwargs["base_url"] == "https://leased.invalid/v1"
+        pool.entry_for_lease.assert_called_once_with("leased-id")
+        pool.current.assert_not_called()
 
     def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
         """A per-job enabled_toolsets naming memory keeps it."""
@@ -1067,6 +1315,44 @@ class TestRunJobConfigEnvVarExpansion:
         "api_mode": "chat_completions",
     }
 
+    def test_null_model_uses_bare_global_config(
+        self, tmp_path, monkeypatch
+    ):
+        """The legacy bare ``model: value`` form remains the fallback."""
+        (tmp_path / "config.yaml").write_text(
+            "model: bare-global-model\n", encoding="utf-8"
+        )
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        job = {
+            "id": "bare-global-null-model",
+            "name": "bare global null model",
+            "prompt": "hi",
+            "model": None,
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.managed_scope.apply_managed_overlay",
+                   side_effect=lambda cfg: cfg), \
+             patch("hermes_cli.profiles.get_active_profile_name",
+                   return_value="default"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=self._RUNTIME), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["model"] == "bare-global-model"
+
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")
@@ -1390,10 +1676,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
+            assert task_id and task_id.startswith("cron_skill-env-job_")
             return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -1701,9 +1988,68 @@ class TestRunJobWakeGate:
         call_kwargs = agent.run_conversation.call_args
         prompt_arg = call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs.get("user_message", "")
         assert script_output in prompt_arg
+        assert call_kwargs.kwargs["task_id"] == agent_cls.call_args.kwargs["session_id"]
+        assert call_kwargs.kwargs["task_id"].startswith("cron_job_wake-gate-test_")
         assert success is True
         assert err is None
 
+    def test_script_runs_only_once_on_wake(self):
+        """Wake-true path must not re-run the script inside _build_job_prompt
+        (script would execute twice otherwise, wasting work and risking
+        double-side-effects)."""
+        import cron.scheduler as scheduler
+
+        call_count = 0
+        def _script_stub(path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return (True, "regular output")
+
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "ok", "messages": []
+        })
+        with patch.object(scheduler, "_run_job_script", side_effect=_script_stub), \
+             patch("run_agent.AIAgent", return_value=agent):
+            scheduler.run_job(self._make_job())
+
+        assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
+
+    def test_script_failure_fails_run_without_model_call(self):
+        """A pre-run infrastructure failure is a failed cron run.
+
+        A model successfully paraphrasing the failure must not turn the run
+        green or spend an inference call.
+        """
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(False, '{"wakeAgent": false}')), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job())
+
+        agent_cls.assert_not_called()
+        assert success is False
+        assert final == ""
+        assert "Cron pre-run script failed" in err
+        assert "Cron Job: wake-gate-test (FAILED)" in doc
+
+    def test_no_script_path_runs_agent_normally(self):
+        """Regression: jobs without a script still work."""
+        import cron.scheduler as scheduler
+
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "ok", "messages": []
+        })
+        job = self._make_job(script=None)
+        job.pop("script", None)
+        with patch.object(scheduler, "_run_job_script") as script_fn, \
+             patch("run_agent.AIAgent", return_value=agent) as agent_cls:
+            scheduler.run_job(job)
+
+        script_fn.assert_not_called()
+        agent_cls.assert_called_once()
 
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""
@@ -2785,10 +3131,6 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-
-
-
 class TestFailureStreakNudge:
     """Poke-inspired repeated-failure review nudge (_failure_streak_nudge)."""
 

@@ -111,14 +111,46 @@ class TestAgentCloseMethod:
                  patch("run_agent.cleanup_vm") as mock_cleanup_vm, \
                  patch("run_agent.cleanup_browser") as mock_cleanup_browser, \
                  patch("tools.computer_use.release_computer_use_session") as mock_cleanup_cua:
+                mock_registry.has_active_processes.return_value = False
                 agent.close()
 
                 mock_registry.kill_all.assert_called_once_with(
-                    task_id="test-close-cleanup"
+                    task_id="test-close-cleanup",
+                    preserve_notify_on_complete=True,
                 )
                 mock_cleanup_vm.assert_called_once_with("test-close-cleanup")
                 mock_cleanup_browser.assert_called_once_with("test-close-cleanup")
                 mock_cleanup_cua.assert_called_once_with("test-close-cleanup")
+
+    def test_close_keeps_environment_for_notifying_background_process(self):
+        """A preserved remote wait must not be killed by environment cleanup."""
+        from unittest.mock import patch
+
+        with patch("run_agent.AIAgent.__init__", return_value=None):
+            from run_agent import AIAgent
+            agent = AIAgent.__new__(AIAgent)
+            agent.session_id = "test-durable-wait"
+            agent._active_children = []
+            agent._active_children_lock = threading.Lock()
+            agent.client = None
+
+            with patch("tools.process_registry.process_registry") as mock_registry, \
+                 patch("run_agent.cleanup_vm") as mock_cleanup_vm, \
+                 patch("run_agent.cleanup_browser") as mock_cleanup_browser, \
+                 patch("tools.computer_use.release_computer_use_session") as mock_cleanup_cua:
+                mock_registry.has_active_processes.return_value = True
+                agent.close()
+
+                mock_registry.kill_all.assert_called_once_with(
+                    task_id="test-durable-wait",
+                    preserve_notify_on_complete=True,
+                )
+                mock_registry.has_active_processes.assert_called_once_with(
+                    "test-durable-wait"
+                )
+                mock_cleanup_vm.assert_not_called()
+                mock_cleanup_browser.assert_called_once_with("test-durable-wait")
+                mock_cleanup_cua.assert_called_once_with("test-durable-wait")
 
     def test_close_is_idempotent(self):
         """close() can be called multiple times without error."""

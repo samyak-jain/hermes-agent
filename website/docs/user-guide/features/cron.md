@@ -318,6 +318,15 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
+Because jobs and their next-run timestamps are persisted, the built-in
+scheduler checks overdue jobs immediately after gateway startup. One-shots fire
+at most once; recurring schedules collapse missed intervals into one catch-up
+run and then advance. This makes a one-shot cron job the durable choice for a
+notification that must still be discovered after a gateway restart. It does
+not make an already-running agent execution replay-safe: an execution
+interrupted by restart is recorded as `unknown` and is not automatically
+retried.
+
 ### Execution history
 
 Hermes records each claimed cron attempt in the profile-local
@@ -452,6 +461,46 @@ Only the origin chat is ever touched: fan-out / broadcast targets (`all`,
 explicit other-chat deliveries) are never made continuable. The mirror is
 written as a labelled user turn (`[Cron delivery: <task name>]`), which keeps
 the conversation history alternation-safe across all model providers.
+
+### Automatic main-agent response
+
+Continuable jobs wait for a human reply. If the main agent should react as soon
+as the cron finishes, set `agent_respond: true` when creating or updating the
+job. The result re-enters the exact originating session as an internal turn,
+and the main agent reviews
+it, takes appropriate follow-up action, and sends its own response. The raw
+cron message is suppressed for that origin target so the chat does not receive
+both the dump and the agent's response.
+
+```python
+cronjob(
+    action="create",
+    schedule="every 15m",
+    prompt="Check the deployment and investigate failures",
+    agent_respond=True,
+)
+```
+
+An existing origin-backed job can also be toggled from the CLI:
+
+```bash
+hermes cron edit <job_id> --agent-respond
+hermes cron edit <job_id> --no-agent-respond
+```
+
+This is opt-in and origin-only. Other fan-out targets still receive normal cron
+delivery. It requires the gateway and origin adapter to be live when the job
+fires; otherwise Hermes falls back to raw delivery and mirrors the result into
+the origin transcript for the next turn. Results that trip the cron prompt-
+injection scanner also use the raw-delivery fallback instead of steering the
+full-toolset main agent. A standalone CLI-created job has no captured origin
+conversation, so `--agent-respond` cannot wake a main-agent thread unless that
+job already carries origin metadata.
+
+Enabling `agent_respond` through the model tool from a live gateway
+conversation captures that conversation as the response origin. If the job's
+only delivery target followed its previous origin, delivery moves with the new
+origin. Explicit fan-out and local delivery settings are preserved.
 
 #### Flat, in-channel continuation (Slack)
 

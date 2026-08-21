@@ -94,9 +94,18 @@ class TestRunConversationCodexPath:
                 turn_id="turn-usage-1",
                 thread_id="thread-usage-1",
                 token_usage_last={
-                    "totalTokens": 130,
+                    "totalTokens": 60,
+                    "inputTokens": 40,
+                    "cachedInputTokens": 10,
+                    "cacheCreationInputTokens": 5,
+                    "outputTokens": 5,
+                    "reasoningOutputTokens": 1,
+                },
+                token_usage_turn={
+                    "totalTokens": 135,
                     "inputTokens": 80,
                     "cachedInputTokens": 20,
+                    "cacheCreationInputTokens": 10,
                     "outputTokens": 25,
                     "reasoningOutputTokens": 5,
                 },
@@ -112,28 +121,28 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("hello")
 
         assert result["api_calls"] == 1
-        assert result["prompt_tokens"] == 100
+        assert result["prompt_tokens"] == 110
         assert result["completion_tokens"] == 25
-        assert result["total_tokens"] == 130
+        assert result["total_tokens"] == 135
         assert result["input_tokens"] == 80
         assert result["output_tokens"] == 25
         assert result["cache_read_tokens"] == 20
-        assert result["cache_write_tokens"] == 0
+        assert result["cache_write_tokens"] == 10
         assert result["reasoning_tokens"] == 5
-        assert result["last_prompt_tokens"] == 100
+        assert result["last_prompt_tokens"] == 55
 
         assert agent.session_api_calls == 1
-        assert agent.session_prompt_tokens == 100
+        assert agent.session_prompt_tokens == 110
         assert agent.session_completion_tokens == 25
-        assert agent.session_total_tokens == 130
+        assert agent.session_total_tokens == 135
         assert agent.session_input_tokens == 80
         assert agent.session_output_tokens == 25
         assert agent.session_cache_read_tokens == 20
-        assert agent.session_cache_write_tokens == 0
+        assert agent.session_cache_write_tokens == 10
         assert agent.session_reasoning_tokens == 5
-        assert agent.context_compressor.last_prompt_tokens == 100
-        assert agent.context_compressor.last_completion_tokens == 25
-        assert agent.context_compressor.last_total_tokens == 130
+        assert agent.context_compressor.last_prompt_tokens == 55
+        assert agent.context_compressor.last_completion_tokens == 5
+        assert agent.context_compressor.last_total_tokens == 60
         assert agent.context_compressor.context_length == 200000
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
@@ -204,6 +213,7 @@ class TestRunConversationCodexPath:
         agent = _make_codex_agent()
         agent._memory_manager = MagicMock()
         agent._memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager.prefetch_all.return_value = ""
 
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
@@ -377,6 +387,117 @@ class TestRunConversationCodexPath:
             agent.run_conversation("hi")
 
         assert captured["cwd"] == str(tmp_path)
+
+    def test_cache_aware_system_prompt_parts_reach_the_transport(self, monkeypatch):
+        """Stable and session-specific system tiers must remain separate."""
+        captured: dict[str, object] = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-prompt-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-prompt-1",
+                thread_id="thread-prompt-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        with (
+            patch(
+                "agent.codex_runtime._codex_app_server_config",
+                return_value={"adapter": "claude_agent_sdk"},
+            ),
+            patch(
+                "agent.system_prompt.build_app_server_system_prompt_parts",
+                return_value={
+                    "stable": "SOUL and stable guidance",
+                    "context": "AGENTS project context",
+                    "volatile": "memory and session context",
+                },
+            ),
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent,
+                "_spawn_background_review",
+                return_value=None,
+            ):
+                agent.run_conversation("user-authored text")
+
+        assert captured["system_prompt_identity"] == "SOUL and stable guidance"
+        assert captured["system_prompt_append"] == (
+            "AGENTS project context\n\nmemory and session context"
+        )
+
+    def test_configured_turn_timeout_reaches_session(self, monkeypatch):
+        captured: dict[str, object] = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        with patch(
+            "agent.codex_runtime._codex_app_server_config",
+            return_value={"turn_timeout": 2400},
+        ):
+            agent = _make_codex_agent()
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                agent.run_conversation("long task")
+
+        assert captured["turn_timeout"] == 2400.0
+
+    def test_app_server_receives_api_only_gateway_turn_context(self, monkeypatch):
+        """Per-turn gateway notes must reach Claude without dirtying history."""
+        captured: dict[str, object] = {}
+
+        def fake_init(self, **kwargs):
+            self._thread_id = "thread-context-1"
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-context-1",
+                thread_id="thread-context-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        with patch(
+            "agent.codex_runtime._codex_app_server_config",
+            return_value={"adapter": "claude_agent_sdk"},
+        ):
+            agent = _make_codex_agent()
+            agent._gateway_turn_context_notes = (
+                "[Voice channel now: Samyak is speaking]"
+            )
+            with patch.object(
+                agent,
+                "_spawn_background_review",
+                return_value=None,
+            ):
+                result = agent.run_conversation("user-authored text")
+
+        assert captured["user_input"] == (
+            "user-authored text\n\n"
+            "[Voice channel now: Samyak is speaking]"
+        )
+        user_messages = [
+            message for message in result["messages"]
+            if message.get("role") == "user"
+        ]
+        assert user_messages[-1]["content"] == "user-authored text"
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
@@ -753,6 +874,25 @@ class TestCodexToolProgressBridge:
         on_event({"method": "item/completed", "params": {}})
         on_event({})
         assert events == []
+
+    def test_mapper_host_tools_use_argument_aware_previews(self):
+        from agent.codex_runtime import _codex_item_to_preview
+
+        spawn = {
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "spawn_agent",
+            "arguments": {"label": "OAuth status", "prompt": "long private prompt"},
+        }
+        assert _codex_item_to_preview(spawn) == "OAuth status"
+
+        memory = {
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "memory",
+            "arguments": {"operations": [{"action": "add", "content": "private"}]},
+        }
+        assert _codex_item_to_preview(memory) is None
 
     def test_session_wired_with_on_event_that_fires_tool_progress(self, monkeypatch):
         """The session is constructed with an on_event hook that, when fed an

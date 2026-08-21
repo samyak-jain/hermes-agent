@@ -307,6 +307,43 @@ class TestCreateThread:
         )
 
 
+class TestSendMessage:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_message_to_channel_or_thread(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "901"}
+
+        result = json.loads(
+            discord_core(
+                action="send_message",
+                channel_id="800",
+                content="<@42> Please take this handoff.",
+            )
+        )
+
+        assert result == {
+            "success": True,
+            "channel_id": "800",
+            "message_id": "901",
+        }
+        mock_req.assert_called_once_with(
+            "POST",
+            "/channels/800/messages",
+            "test-token",
+            body={"content": "<@42> Please take this handoff."},
+        )
+
+    def test_send_message_rejects_empty_content(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(
+            discord_core(action="send_message", channel_id="800", content="")
+        )
+
+        assert "Missing required parameters" in result["error"]
+        assert "content" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------

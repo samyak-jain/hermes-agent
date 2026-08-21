@@ -44,12 +44,16 @@ def _secret_redact(text: str) -> str:
     """Always-on secret redaction. force=True so user config can't disable it."""
     try:
         from agent.redact import redact_sensitive_text
-        out = redact_sensitive_text(text, force=True)
+        # Shape patterns run on the ORIGINAL text: the key/value redactor may
+        # rewrite "Authorization: Bearer <tok>" into "Authorization: [redacted]
+        # <tok>" (it treats "Bearer" as the value), which would hide the
+        # "Bearer <tok>" shape from these regexes and leak the token.
+        out = _BEARER_RE.sub("[redacted]", text)
+        out = _TOKEN_RE.sub("[redacted]", out)
+        out = redact_sensitive_text(out, force=True)
     except Exception:
         # Fail CLOSED: if the redactor can't run, do not emit the raw string.
         return "[redaction-unavailable]"
-    out = _BEARER_RE.sub("[redacted]", out)
-    out = _TOKEN_RE.sub("[redacted]", out)
     out = _SECRET_LITERAL_RE.sub("[redacted]", out)
     out = _BEARER_RESIDUE_RE.sub("[redacted]", out)
     return out

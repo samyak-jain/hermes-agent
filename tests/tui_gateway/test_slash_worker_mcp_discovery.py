@@ -51,6 +51,10 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # The interactive default (1.5s) races probe-server startup on
+                # slow CI runners; wait_for_mcp_discovery returns the instant
+                # discovery completes, so a large bound costs nothing locally.
+                "mcp_discovery_timeout": 30.0,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,

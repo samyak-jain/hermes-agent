@@ -128,6 +128,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--agent-respond",
+        action="store_true",
+        help="Have the main agent review this job's result and respond automatically in its captured origin conversation (requires origin metadata and a live gateway).",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -249,6 +254,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
         ),
+    )
+    cron_response_group = cron_edit.add_mutually_exclusive_group()
+    cron_response_group.add_argument(
+        "--agent-respond",
+        dest="agent_respond",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable automatic main-agent response to this job's result.",
+    )
+    cron_response_group.add_argument(
+        "--no-agent-respond",
+        dest="agent_respond",
+        action="store_const",
+        const=False,
+        help="Disable automatic main-agent response to this job's result.",
     )
 
     # lifecycle actions

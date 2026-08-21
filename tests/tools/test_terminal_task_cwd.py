@@ -130,7 +130,15 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
 
         def spawn_local(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
+            return SimpleNamespace(
+                id="proc_test",
+                pid=1234,
+                exited=False,
+                exit_code=None,
+                output_buffer="",
+                completion_reason="",
+                notify_on_complete=False,
+            )
 
     import tools.process_registry as process_registry_mod
 

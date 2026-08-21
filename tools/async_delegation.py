@@ -7,7 +7,8 @@ subagent that runs on a module-level daemon executor and returns a handle
 immediately, so the user and the model can keep working while the child runs.
 
 When the child finishes, a completion event is pushed onto the SHARED
-``process_registry.completion_queue`` with ``type="async_delegation"``. The
+``process_registry.completion_queue`` (normally ``type="async_delegation"``;
+thin adapters may select another routed type such as ``spawn_result``). The
 CLI (``cli.py`` process_loop) and gateway (``_run_process_watcher`` /
 ``completion_queue`` drain) already poll that queue while the agent is idle
 and forge a fresh user/internal turn from each event. We deliberately reuse
@@ -23,7 +24,7 @@ that rail rather than reaching into a running agent loop:
 
 The completion payload carries a RICH, self-contained task-source block (the
 original goal, the context the parent supplied, toolsets, model, dispatch
-time, status, and the full result summary). When the result re-enters the
+time, status, and the context-budgeted result summary). When the result re-enters the
 conversation the parent may be deep in unrelated context and won't remember
 why the subagent existed; the block lets it either use the result or
 re-dispatch if the world has moved on.
@@ -89,6 +90,7 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+ROUTED_COMPLETION_TYPES = frozenset({"async_delegation", "spawn_result"})
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -140,9 +142,9 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+    from hermes_state import apply_sqlite_storage_policy
 
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    apply_sqlite_storage_policy(conn, db_label="state.db (async delegation)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -233,6 +235,46 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
+def _reject_if_draining() -> Optional[Dict[str, str]]:
+    try:
+        from gateway.drain_control import drain_requested
+
+        if drain_requested():
+            return {
+                "status": "rejected",
+                "error": (
+                    "Gateway drain is active; new background subagents are "
+                    "temporarily disabled until the planned restart completes."
+                ),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _route_selectors_match(
+    selectors: tuple[str, str, str],
+    recorded: tuple[str, str, str],
+) -> bool:
+    return any(
+        candidate and candidate == value
+        for candidate, value in zip(selectors, recorded)
+    )
+
+
+def _discard_failed_dispatch(delegation_id: str) -> None:
+    with _records_lock:
+        _records.pop(delegation_id, None)
+    try:
+        _delete_durable_delegation(delegation_id)
+    except Exception:
+        logger.debug(
+            "Could not delete failed async dispatch %s",
+            delegation_id,
+            exc_info=True,
+        )
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -243,11 +285,21 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     task_payload = {
         key: record.get(key)
         for key in (
-            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "goal",
+            "goals",
+            "context",
+            "toolsets",
+            "role",
+            "model",
+            "is_batch",
+            "completion_type",
+            "label",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id",
+            "user_id",
+            "user_name",
         )
         if key in record
     }
@@ -359,7 +411,8 @@ def recover_abandoned_delegations() -> int:
                 continue
             task = json.loads(task_json or "{}")
             event = {
-                "type": "async_delegation", "delegation_id": delegation_id,
+                "type": task.get("completion_type") or "async_delegation",
+                "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
@@ -368,6 +421,7 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "label": task.get("label"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -478,7 +532,7 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") != "async_delegation":
+    if evt.get("type") not in ROUTED_COMPLETION_TYPES:
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
@@ -561,12 +615,12 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if claim_id and evt.get("type") in ROUTED_COMPLETION_TYPES:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if claim_id and evt.get("type") in ROUTED_COMPLETION_TYPES:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
@@ -586,6 +640,73 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+    }
+
+
+def get_owned_durable_delegation(
+    delegation_id: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    completion_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return one durable result only when the caller proves route ownership.
+
+    The ownership contract matches ``interrupt_delegation``: at least one
+    non-empty route selector must equal the dispatch record. ``completion_type``
+    additionally binds thin adapters such as spawn_agent to their own handle
+    namespace. Returning ``None`` for both absent and unowned ids prevents a
+    caller from probing another conversation's background work.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    selectors = (
+        str(session_key or ""),
+        str(origin_ui_session_id or ""),
+        str(parent_session_id or ""),
+    )
+    if not delegation_id or not any(selectors):
+        return None
+
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT origin_session, origin_ui_session_id, parent_session_id,
+                      state, dispatched_at, completed_at, event_json,
+                      result_json, task_json
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+
+    origin_session, origin_ui, parent_id = (
+        str(row[0] or ""),
+        str(row[1] or ""),
+        str(row[2] or ""),
+    )
+    if not _route_selectors_match(
+        selectors,
+        (origin_session, origin_ui, parent_id),
+    ):
+        return None
+
+    event = json.loads(row[6]) if row[6] else {}
+    result = json.loads(row[7]) if row[7] else None
+    task = json.loads(row[8]) if row[8] else {}
+    recorded_type = event.get("type") or task.get("completion_type")
+    if completion_type and recorded_type != completion_type:
+        return None
+
+    return {
+        "delegation_id": delegation_id,
+        "origin_session": origin_session,
+        "origin_ui_session_id": origin_ui,
+        "parent_session_id": parent_id,
+        "state": row[3],
+        "dispatched_at": row[4],
+        "completed_at": row[5],
+        "event": event,
+        "result": result,
     }
 
 
@@ -765,6 +886,9 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    delegation_id: Optional[str] = None,
+    completion_type: str = "async_delegation",
+    label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -801,6 +925,10 @@ def dispatch_async_delegation(
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
         should fall back to sync or tell the user) rather than queued, so a
         runaway model can't pile up unbounded background work.
+    delegation_id, completion_type, label
+        Optional adapter metadata. Defaults preserve the delegate_task handle
+        and completion payload exactly; spawn_agent supplies its compact id,
+        routed event type, and display label.
 
     Returns
     -------
@@ -808,7 +936,11 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    delegation_id = _new_delegation_id()
+    draining = _reject_if_draining()
+    if draining is not None:
+        return draining
+
+    delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -822,6 +954,8 @@ def dispatch_async_delegation(
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
+        "completion_type": completion_type,
+        "label": label,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -853,9 +987,6 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
-
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
@@ -876,13 +1007,11 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
+        _persist_dispatch(record)
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _discard_failed_dispatch(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -961,7 +1090,7 @@ def _push_completion_event(
     completed_at = record.get("completed_at") or time.time()
 
     evt = {
-        "type": "async_delegation",
+        "type": record.get("completion_type") or "async_delegation",
         "delegation_id": record.get("delegation_id"),
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
@@ -969,6 +1098,7 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "label": record.get("label"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -1001,6 +1131,14 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
+    # spawn_agent and single-task adapters may expose the same live-view side
+    # channel as delegate_task. Keep it on the routed completion so durable
+    # recovery and downstream consumers retain the audit path, without
+    # changing the payload shape for adapters that do not provide transcripts.
+    if result.get("live_transcript"):
+        evt["live_transcript"] = result["live_transcript"]
+    if result.get("live_transcripts"):
+        evt["live_transcripts"] = result["live_transcripts"]
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
@@ -1049,6 +1187,10 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    draining = _reject_if_draining()
+    if draining is not None:
+        return draining
+
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1096,9 +1238,6 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
-
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
@@ -1125,12 +1264,11 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
-        # Propagate the dispatching profile to the detached batch children.
+        _persist_dispatch(record)
+        executor = _get_executor(max_async_children)
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _discard_failed_dispatch(delegation_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1193,8 +1331,9 @@ def _push_batch_completion_event(
         # consolidated multi-task block from this.
         "results": combined.get("results") or [],
         # Per-task live transcript log paths (cache/delegation/live/...).
-        # They persist after completion and double as the full-fidelity
-        # operational record of each child's run.
+        # They persist after completion as a compact operational view. Each
+        # event is independently preview-truncated, so this is not a
+        # full-fidelity replacement for a spilled result summary.
         "live_transcripts": combined.get("live_transcripts"),
         "error": combined.get("error"),
         "total_duration_seconds": combined.get("total_duration_seconds"),
@@ -1497,6 +1636,62 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
+
+
+def interrupt_delegation(
+    delegation_id: str,
+    *,
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    completion_type: Optional[str] = None,
+) -> bool:
+    """Signal one running async delegation owned by the caller to stop.
+
+    At least one ownership selector must match the dispatch record.  This is
+    intentionally stricter than a process-global id lookup: gateway processes
+    host multiple users, so possession (or guessing) of a short delegation id
+    must not permit one conversation to interrupt another conversation's work.
+
+    ``completion_type`` lets thin adapters constrain the handle namespace;
+    ``spawn_agent`` uses it to avoid cancelling a ``delegate_task`` batch even
+    if an id is accidentally passed across the two APIs.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    selectors = (
+        str(session_key or ""),
+        str(origin_ui_session_id or ""),
+        str(parent_session_id or ""),
+    )
+    if not delegation_id or not any(selectors):
+        return False
+
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") != "running":
+            return False
+        if completion_type and record.get("completion_type") != completion_type:
+            return False
+        if not _route_selectors_match(
+            selectors,
+            (
+                str(record.get("session_key") or ""),
+                str(record.get("origin_ui_session_id") or ""),
+                str(record.get("parent_session_id") or ""),
+            ),
+        ):
+            return False
+        interrupt_fn = record.get("interrupt_fn")
+
+    if not callable(interrupt_fn):
+        return False
+    try:
+        interrupt_fn()
+    except Exception as exc:
+        logger.debug("interrupt_delegation(%s) failed: %s", delegation_id, exc)
+        return False
+    logger.info("Requested interrupt for async delegation %s by id", delegation_id)
+    return True
 
 
 def interrupt_all(reason: str = "shutdown") -> int:

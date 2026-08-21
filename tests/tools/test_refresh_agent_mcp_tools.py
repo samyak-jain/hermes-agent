@@ -19,12 +19,51 @@ def _tool(name):
 
 
 def _agent(tool_names, *, enabled=None, disabled=None):
+    from agent.tool_policy import LEGACY_TOOL_POLICY
+
     a = types.SimpleNamespace()
     a.tools = [_tool(n) for n in tool_names]
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a.tool_policy = LEGACY_TOOL_POLICY
     return a
+
+
+def test_stderr_header_write_failure_is_best_effort(monkeypatch):
+    """A broken log sink must not crash MCP server startup."""
+
+    class _BrokenLog:
+        @staticmethod
+        def write(_value):
+            raise OSError("disk full")
+
+        @staticmethod
+        def flush():
+            raise AssertionError("flush should not run after write fails")
+
+    monkeypatch.setattr(mcp_tool, "_get_mcp_stderr_log", lambda: _BrokenLog())
+
+    mcp_tool._write_stderr_log_header("demo")
+
+
+def test_refresh_policy_failure_denies_entire_staged_surface(monkeypatch):
+    """Policy evaluation errors fail closed instead of publishing unfiltered tools."""
+    agent = _agent(["read_file"])
+    agent.tool_policy = object()  # no ``allows``/``mode`` policy contract
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_unfiltered_tool")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
 
 
 def test_refresh_adds_late_landing_tools(monkeypatch):
@@ -42,6 +81,154 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert added == {"mcp_granola_get_account_info"}
     assert "mcp_granola_get_account_info" in agent.valid_tool_names
     assert len(agent.tools) == 3
+
+
+def test_refresh_cannot_add_mcp_tool_to_exact_allowlist(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"clarify", "delegate_task", "memory", "skills_list", "skill_manage"}
+    agent = _agent(allowed, enabled=["hermes-discord", "mcp-demo"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool(n) for n in sorted(allowed | {"mcp__demo__new_tool"})],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.valid_tool_names == allowed
+    assert "mcp__demo__new_tool" not in agent.valid_tool_names
+
+
+def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+    from tools.registry import registry
+
+    allowed = {"discord", "memory"}
+    agent = _agent(allowed, enabled=["hermes-discord", "mcp-demo"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+    original_tools = agent.tools
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("memory")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools is original_tools
+    assert agent.valid_tool_names == allowed
+    assert agent._tool_snapshot_generation == registry._generation
+
+
+def test_incomplete_exact_refresh_replaces_invalid_existing_snapshot(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"discord", "memory"}
+    agent = _agent(["memory", "unexpected"], enabled=["hermes-discord"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("memory")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
+
+
+def test_incomplete_exact_refresh_never_empties_successfully_filtered_subset(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"discord", "memory"}
+    agent = _agent([], enabled=["hermes-discord"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("memory"), _tool("unexpected")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == {"memory"}
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
+
+
+def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):
+    """No new tools → empty set, and the snapshot object is not swapped."""
+    agent = _agent(["read_file", "terminal"])
+    original_tools = agent.tools
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("terminal")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools is original_tools  # not replaced → no churn / no cache thrash
+
+
+def test_refresh_detects_equal_size_swap(monkeypatch):
+    """Name-based diff catches an add+remove of equal count (count-compare can't)."""
+    agent = _agent(["a", "old_mcp_tool"])  # 2 tools
+
+    import model_tools
+    # Same COUNT (2) but a different membership: old_mcp_tool removed, new added.
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool("a"), _tool("new_mcp_tool")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == {"new_mcp_tool"}
+    assert agent.valid_tool_names == {"a", "new_mcp_tool"}
+    assert "old_mcp_tool" not in agent.valid_tool_names
+
+
+def test_refresh_passes_agent_toolset_filters(monkeypatch):
+    """The rebuild re-derives with the agent's OWN enabled/disabled toolsets."""
+    agent = _agent(["a"], enabled=["coding", "granola"], disabled=["messaging"])
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("a"), _tool("b")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert seen["enabled_toolsets"] == ["coding", "granola"]
+    assert seen["disabled_toolsets"] == ["messaging"]
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):

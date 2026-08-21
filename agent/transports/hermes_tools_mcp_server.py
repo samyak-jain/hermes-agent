@@ -49,7 +49,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,27 @@ _JSON_TO_PY = {
     "array": list,
     "object": dict,
 }
+
+
+def _python_type_from_schema(schema: dict | None) -> type:
+    spec = schema or {}
+    direct = _JSON_TO_PY.get(spec.get("type"))
+    if direct is not None:
+        return direct
+
+    variants = spec.get("anyOf") or spec.get("oneOf")
+    if not isinstance(variants, list):
+        return Any
+    mapped: list[type] = []
+    for variant in variants:
+        candidate = _JSON_TO_PY.get((variant or {}).get("type"))
+        if candidate is not None and candidate not in mapped:
+            mapped.append(candidate)
+    if not mapped:
+        return Any
+    if len(mapped) == 1:
+        return mapped[0]
+    return Union[tuple(mapped)]
 
 
 def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
@@ -81,7 +102,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
     for pname, pspec in props.items():
         if pname.startswith("_"):
             continue
-        py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        py = _python_type_from_schema(pspec)
         ann, default = (
             (py, inspect.Parameter.empty)
             if pname in required

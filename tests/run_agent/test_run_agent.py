@@ -2111,6 +2111,7 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                allowed_tool_names=None,
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
@@ -2458,6 +2459,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("setup_mcp", {"server": "linear", "action": "install"}),
         ("tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
+        ("spawn_agent", {"prompt": "Check the background path"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2516,6 +2518,11 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             agent,
             "_dispatch_delegate_task",
+            lambda args: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            agent,
+            "_dispatch_spawn_agent",
             lambda args: '{"ok":true}',
         )
         agent._memory_manager = None

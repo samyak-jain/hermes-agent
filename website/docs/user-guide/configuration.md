@@ -87,6 +87,87 @@ sandboxes
 where the limit cannot be changed, startup continues without changing the
 limit.
 
+## Agent configuration broker
+
+Managed deployments can expose a service-gated `config` tool to the
+conversational agent. The default mode is an explicit allowlist:
+
+```yaml
+agent_config:
+  enabled: true
+  ownership_mode: allowlist
+  editable_paths:
+    - display.*
+    - memory.memory_char_limit
+  guarded_paths:
+    - model.default
+```
+
+Alternatively, an operator can derive ownership from the managed overlay:
+
+```yaml
+agent_config:
+  enabled: true
+  ownership_mode: unmanaged
+  require_approval: false
+```
+
+In `unmanaged` mode, every schema-known or existing effective, non-secret
+configuration leaf is agent-owned unless the administrator-managed overlay
+pins it. In `allowlist` mode, the configured lists only narrow Hermes's
+built-in non-secret candidate surface. Neither mode can expose credential
+paths, internal metadata, absent unknown paths, or let the broker edit its own
+policy. The tool reports effective values and whether each came from defaults,
+user config, or the administrator-managed overlay. Managed leaves remain
+read-only.
+
+Set `require_approval: false` only when the operator wants validated
+agent-owned mutations to apply autonomously. It defaults to `true`; either
+policy retains optimistic concurrency, a cross-process lock, atomic
+replacement, protected pre-change snapshots, and metadata-only audit history.
+The broker policy cannot edit itself. Delegated children and cron should deny
+the `config` tool. No raw configuration file needs to be mounted into their
+execution sandbox.
+
+### Self-SOUL broker
+
+Managed deployments can separately grant a top-level profile agent safe
+access to its own `SOUL.md`:
+
+```yaml
+soul_edit:
+  enabled: true
+  require_approval: true
+  max_bytes: 65536
+  read_only_profiles: []
+```
+
+This policy only activates the service-gated `soul` tool when its standalone
+toolset is also enabled. The tool exposes `read`, `update`, `history`, and
+`rollback`; it never accepts a profile or filesystem path. Hermes derives the
+active profile, rejects symlinks and non-regular files, validates UTF-8 and
+the configured byte ceiling, requires compare-and-swap versions for writes,
+uses atomic replacement, writes metadata-only audit records, and retains five
+restorable snapshots.
+
+`require_approval` defaults to `true`. Set it to `false` only as an explicit
+operator decision. `read_only_profiles` accepts profile names or `*`.
+Distribution-owned SOUL files are also read-only. The `config` broker cannot
+inspect or modify `soul_edit`, so an agent cannot enable or weaken its own
+authorization policy. Delegated children and cron should not receive the
+`soul` tool.
+
+Secrets remain outside this surface. The broker rejects credential-shaped
+paths and values; use the relevant authentication or secret-management flow.
+The one structured exception is `mcp_servers.<name>.env`: an operator-directed
+change may store a name-preserving environment reference such as
+`{"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"}`. The referenced value must
+already be injected by the host; plaintext credentials remain rejected.
+Structured leaves are transported and stored as their native JSON/YAML types.
+For compatibility with older tool bridges, the broker repairs JSON-encoded
+strings only when the destination is known to require a list or the approved
+MCP environment-reference mapping. It does not reinterpret ordinary strings.
+
 ## Environment Variable Substitution
 
 You can reference environment variables in `config.yaml` using `${VAR_NAME}` syntax:
@@ -346,6 +427,11 @@ Runs commands on a remote server over SSH. Uses ControlMaster for connection reu
 terminal:
   backend: ssh
   persistent_shell: true           # Keep a long-lived bash session (default: true)
+  # Recommended for a trusted systemd-based sandbox:
+  ssh_systemd_run: true
+  ssh_systemd_slice: hermes-work.slice
+  ssh_command_memory_max_mb: 1024
+  ssh_background_ttl_seconds: 21600
 ```
 
 **Required environment variables:**
@@ -362,8 +448,30 @@ TERMINAL_SSH_USER=ubuntu
 | `TERMINAL_SSH_PORT` | `22` | SSH port |
 | `TERMINAL_SSH_KEY` | (system default) | Path to SSH private key |
 | `TERMINAL_SSH_PERSISTENT` | `true` | Enable persistent shell |
-
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`. Persistent shell keeps a single `bash -l` process alive on the remote host, communicating via temporary files. Commands that need `stdin_data` or `sudo` automatically fall back to one-shot mode.
+
+When `ssh_systemd_run` is enabled, each foreground command receives a remote
+`RuntimeMaxSec` deadline and `KillMode=control-group`; killing or timing out the
+local SSH client also stops the remote unit. Background commands become leased
+transient services and are stopped when `ssh_background_ttl_seconds` elapses.
+Hermes resolves the remote shell and systemd utilities to absolute paths before
+launch, disables systemd's command-line environment expansion, and accepts the
+launch only after receiving a numeric remote PID. A unit that has already
+failed returns its actual nonzero status and a redacted diagnostic; its process
+session ID remains available to `process(action="wait")` and
+`process(action="log")`.
+
+:::caution Remote completion watchers do not survive a Hermes restart
+The transient SSH unit may continue running on the remote host, but Hermes does
+not currently reconstruct a remote `process` registry entry or its
+`notify_on_complete` delivery watcher after the gateway/CLI process restarts.
+Use a persisted one-shot cron job when the wake-up itself must survive a gateway
+restart. `notify_on_complete` is reliable only while the originating Hermes
+process remains alive.
+:::
+
+This mode requires a remote systemd service manager and permission to create
+transient units.
 
 ### Modal Backend
 
@@ -2495,6 +2603,10 @@ delegation:
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
+  subagent_grant_toolsets: []               # Toolsets available to children even when disabled on the parent
+  profile_subagent_tool_grants: {}          # Profile-specific exact grants; currently only config is accepted
+  child_terminal: {}                        # Optional shared task-scoped child backend
+  profile_child_terminal: {}                # Profile-specific backend; matching entry wins
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
@@ -2510,6 +2622,73 @@ delegation:
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+
+**Child-only toolsets:** Set `agent.disabled_toolsets` to hide a capability from the main agent, then list it under `delegation.subagent_grant_toolsets` to make it available only to delegated children. For example, `agent.disabled_toolsets: [browser]` together with `delegation.subagent_grant_toolsets: [browser]` keeps browser schemas out of main-agent calls while allowing the main agent to delegate browsing tasks. Security-blocked child capabilities such as delegation and memory cannot be restored through this setting. The `delegate_task` description tells the main model which child-only toolsets are available.
+
+**Profile-scoped coordinator children:** Infrastructure-managed deployments can
+route one profile's children to a different task backend with
+`delegation.profile_child_terminal.<profile>`. A matching entry replaces the
+shared `child_terminal` mapping for that profile only. The companion
+`profile_subagent_tool_grants.<profile>` exact-name list can move the `config`
+broker from a coordinator's main schema to its children. `config` is the only
+accepted normally-blocked exception; recursive delegation, memory, SOUL,
+messaging, scheduling, and user interaction remain blocked.
+
+### Exact tool policies
+
+For a fail-closed main-agent surface, use an individual-name allowlist. The
+same policy filters schemas and runtime execution, including plugin, MCP,
+memory-provider, and context-engine tools:
+
+```yaml
+agent:
+  # Clear legacy parent-only denylisting. The exact policy is the main-agent
+  # boundary; unrestricted trusted channels still respect disabled_toolsets.
+  disabled_toolsets: []
+  tool_policy:
+    mode: allowlist
+    tools: [clarify, delegate_task, memory, skills_list, skill_manage]
+    gateway_override_authority: managed_only
+
+delegation:
+  child_tool_policy:
+    mode: all_configured
+  subagent_grant_toolsets: []
+```
+
+`all_configured` gives children the complete registered tool universe for the
+active profile independently of the parent's exact visibility. Normal service
+checks still remove tools whose prerequisites are not configured. Hermes then
+subtracts blocked capability toolsets through the same `disabled_toolsets`
+boundary used by normal agents, after composite expansion. An exact residual
+deny covers gateway-injected tools without an owning toolset. Configured MCP
+and plugin tools therefore reach children automatically, while leaf children
+retain Hermes's security restrictions across later schema refreshes.
+
+A managed Discord channel may remove the main-agent cap without tying trust to
+its model:
+
+```yaml
+platforms:
+  discord:
+    channel_overrides:
+      "123456789012345678":
+        model: openai/gpt-5
+        provider: openrouter
+        tool_policy:
+          mode: unrestricted
+```
+
+`unrestricted` means all tools configured and available for that platform and
+profile, not every process-global registry entry. With
+`gateway_override_authority: managed_only`, only administrator-managed channel
+policy can elevate access. Discord threads inherit their parent channel policy;
+an exact managed thread policy takes precedence.
+
+When migrating from a child-only `browser` deny/grant pair, remove it or pin
+the two empty lists above in managed configuration. Otherwise the trusted
+channel's `unrestricted` policy will correctly continue honoring the legacy
+main-agent `disabled_toolsets: [browser]` setting.
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 

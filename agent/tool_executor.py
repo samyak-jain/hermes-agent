@@ -32,6 +32,9 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.tool_policy import (
+    allowed_tool_names_for_dispatch as _allowed_tool_names_for_dispatch,
+)
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -1180,6 +1183,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            parsed_calls.append(
+                (tool_call, function_name, function_args, [], _policy_block, False)
+            )
+            continue
+
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
@@ -2039,6 +2050,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        from agent.tool_policy import authorize_agent_tool
+        _policy_block = authorize_agent_tool(agent, function_name)
+        if _policy_block is not None:
+            messages.append(make_tool_result_message(
+                function_name, _policy_block, tool_call.id,
+            ))
+            _flush_session_db_after_tool_progress(
+                agent, messages, stage=f"policy-blocked tool {function_name}",
+            )
+            agent._apply_pending_steer_to_tool_results(messages, 1)
+            continue
+
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
         _execution_dispatched = False
@@ -2364,6 +2387,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == "spawn_agent":
+            def _execute(next_args: dict) -> Any:
+                return agent._dispatch_spawn_agent(next_args)
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
@@ -2470,6 +2507,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                         )
 
                 (
@@ -2552,6 +2590,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tool_names=_allowed_tool_names_for_dispatch(agent),
                         )
 
                 (
@@ -2617,7 +2656,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
         # The agent-runtime tools above (todo, session_search, memory,
-        # context-engine, memory-manager, clarify, delegate_task) are
+        # context-engine, memory-manager, clarify, delegate_task, spawn_agent) are
         # dispatched inline — they never reach handle_function_call, so the
         # executor is the one that has to fire post_tool_call. For
         # Every dispatch suppresses the inner handle_function_call observer so

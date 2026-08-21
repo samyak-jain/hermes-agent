@@ -1,0 +1,1189 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+import yaml
+
+from hermes_cli import config as config_module
+from hermes_cli import managed_scope
+from hermes_cli.agent_config import (
+    AgentConfigError,
+    _secret_shaped_path,
+    apply_change,
+    apply_rollback,
+    history,
+    inspect_config,
+    prepare_change,
+    prepare_rollback,
+)
+from agent.redact import is_secret_config_key, is_secret_config_path
+from tools import config_tool as config_tool_module
+
+
+FIRECRAWL_TOOL_NAMES = [
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_search",
+    "firecrawl_search_feedback",
+    "firecrawl_crawl",
+    "firecrawl_check_crawl_status",
+    "firecrawl_extract",
+    "firecrawl_agent",
+    "firecrawl_agent_status",
+    "firecrawl_interact",
+    "firecrawl_interact_stop",
+    "firecrawl_research_search_papers",
+    "firecrawl_research_inspect_paper",
+    "firecrawl_research_related_papers",
+    "firecrawl_research_read_paper",
+    "firecrawl_research_search_github",
+]
+
+
+@pytest.fixture()
+def broker_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    for subdir in ("cron", "sessions", "logs", "memories"):
+        (home / subdir).mkdir(parents=True, exist_ok=True)
+    managed.mkdir()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "display": {"skin": "default", "compact": False},
+                "memory": {"memory_char_limit": 2200},
+                "code_execution": {"timeout": 120},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent_config": {
+                    "enabled": True,
+                    "ownership_mode": "unmanaged",
+                    "require_approval": False,
+                },
+                "model": {"default": "managed-model"},
+                "agent": {
+                    "profile_models": {
+                        "vegapunk": {
+                            "provider": "anthropic",
+                            "model": "managed-profile-model",
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.delenv("HERMES_MANAGED", raising=False)
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._RAW_CONFIG_CACHE.clear()
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    config_module._HERMES_HOME_ENSURED.clear()
+    managed_scope.invalidate_managed_cache()
+    yield home
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._RAW_CONFIG_CACHE.clear()
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    config_module._HERMES_HOME_ENSURED.clear()
+    managed_scope.invalidate_managed_cache()
+
+
+def _result(**kwargs):
+    return json.loads(config_tool_module.config_tool(**kwargs))
+
+
+def test_inspect_reports_effective_source_without_exposing_policy(broker_home: Path):
+    result = inspect_config()
+    by_path = {item["path"]: item for item in result["settings"]}
+
+    assert by_path["display.skin"] == {
+        "path": "display.skin",
+        "value": "default",
+        "source": "user",
+        "editable": True,
+        "classification": "agent_owned",
+        "apply": "next_session",
+    }
+    assert by_path["model.default"]["value"] == "managed-model"
+    assert by_path["model.default"]["source"] == "managed"
+    assert by_path["model.default"]["editable"] is False
+    assert by_path["model.default"]["classification"] == "operator_managed"
+    assert not any(item["path"].startswith("agent_config.") for item in result["settings"])
+    assert not any(item["path"].startswith("soul_edit.") for item in result["settings"])
+
+
+def test_unmanaged_mode_exposes_every_recognized_non_secret_leaf(
+    broker_home: Path,
+):
+    result = inspect_config()
+    by_path = {item["path"]: item for item in result["settings"]}
+
+    # This is intentionally outside the legacy curated preference allowlist.
+    inspected = inspect_config("code_execution.timeout")
+    assert inspected["editable"] is True
+    assert inspected["classification"] == "agent_owned"
+    assert inspected["apply"] == "restart_required"
+    assert by_path["display.skin"]["editable"] is True
+    prepared = prepare_change(
+        operation="set",
+        path="code_execution.timeout",
+        value=121,
+        reason="operator asked",
+    )
+    assert prepared["classification"] == "agent_owned"
+
+
+def test_unmanaged_mode_rejects_internal_metadata(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="Internal configuration metadata"):
+        prepare_change(
+            operation="set",
+            path="_config_version",
+            value=99,
+            reason="operator asked",
+        )
+
+
+def test_config_broker_cannot_modify_soul_access_policy(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="SOUL access policy"):
+        prepare_change(
+            operation="set",
+            path="soul_edit.enabled",
+            value=True,
+            reason="attempt self-enablement",
+        )
+
+
+def test_allowlist_mode_remains_backward_compatible(
+    broker_home: Path,
+):
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent_config": {
+                    "enabled": True,
+                    "editable_paths": ["display.*"],
+                    "guarded_paths": ["model.default"],
+                },
+                "model": {"default": "managed-model"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    assert inspect_config("display.skin")["classification"] == "safe"
+    with pytest.raises(AgentConfigError, match="not a recognized or operator-authorized"):
+        inspect_config("code_execution.timeout")
+
+
+def test_managed_and_secret_shaped_paths_fail_closed(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="managed"):
+        prepare_change(
+            operation="set",
+            path="model.default",
+            value="other-model",
+            reason="operator asked",
+        )
+    with pytest.raises(AgentConfigError, match="credential-shaped"):
+        prepare_change(
+            operation="set",
+            path="display.api_key",
+            value="not-even-a-real-key",
+            reason="operator asked",
+        )
+    with pytest.raises(AgentConfigError, match="broker policy"):
+        prepare_change(
+            operation="set",
+            path="agent_config.enabled",
+            value=False,
+            reason="operator asked",
+        )
+
+
+def test_parent_mapping_rejection_enumerates_managed_shadowed_leaves(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={
+            "default": "agent-model",
+            "provider": "openrouter",
+        },
+        reason="operator requested a parent model update",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is False
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+    assert result["unshadowed_leaves"] == ["model.provider"]
+    assert "No parent mapping was written" in result["warning"]
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert "model" not in raw
+
+    # The same managed overlay also owns the active profile route. The broker
+    # reports only descendants touched by this parent write, never unrelated
+    # managed leaves.
+    effective = config_module.load_config()
+    assert (
+        effective["agent"]["profile_models"]["vegapunk"]["model"]
+        == "managed-profile-model"
+    )
+
+
+def test_wholly_shadowed_parent_mapping_is_explicitly_refused(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="model",
+        value={"default": "agent-model"},
+        reason="replace the managed model through its parent",
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["wholly_shadowed"] is True
+    assert result["unshadowed_leaves"] == []
+    assert result["shadowed_leaves"] == [
+        {
+            "path": "model.default",
+            "source": "managed",
+            "effective_value": "managed-model",
+        }
+    ]
+
+
+def test_inspect_mapping_recursively_redacts_sensitive_leaves_and_preserves_shape(
+    broker_home: Path,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "provider": "openrouter",
+        "runtime_options": {
+            "headers": {
+                "Authorization": "Bearer not-a-real-production-token",
+                "X-Label": "public",
+            },
+            "targets": [
+                {"name": "alpha", "client_secret": "also-not-real"},
+                {"name": "beta", "weight": 2},
+            ],
+            "modes": ["fast", "careful"],
+        },
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    options = result["value"]["runtime_options"]
+    assert options["headers"] == {
+        "Authorization": "[REDACTED]",
+        "X-Label": "public",
+    }
+    assert options["targets"] == [
+        {"name": "alpha", "client_secret": "[REDACTED]"},
+        {"name": "beta", "weight": 2},
+    ]
+    assert options["modes"] == ["fast", "careful"]
+    assert result["redacted_paths"] == [
+        "model.runtime_options.headers.Authorization",
+        "model.runtime_options.targets[0].client_secret",
+    ]
+
+
+def test_secret_key_canonicalization_redacts_deep_punctuation_and_case_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api.key": "leak-api-dot",
+        "private.key": "leak-private-dot",
+        "access.token": "leak-access-dot",
+        "api-key": "leak-api-hyphen",
+        "access-token": "leak-access-hyphen",
+        "clientSecret": "leak-client-camel",
+        "AUTH TOKEN": "leak-auth-space",
+        "private_key": "leak-private-underscore",
+        "api_-._key": "leak-api-mixed",
+        "private.-_key": "leak-private-mixed",
+        "access_-.token": "leak-access-mixed",
+        "PassWord": "leak-password-case",
+    }
+    nested = {
+        "public.key": "publishable-material",
+        "monkey": "capuchin",
+        "keyboard": "split-layout",
+        "docs.public.key": "public-key-documentation",
+        "children": [
+            {
+                "label": "public",
+                "token_usage": 17,
+                "keyboard.layout": "dvorak",
+            },
+            {
+                "settings": secret_values,
+                "deeper": [
+                    {"api.key": "leak-list-api-dot"},
+                    {"private_key": "leak-list-private-underscore"},
+                    {"access-.token": "leak-list-access-mixed"},
+                ],
+            },
+        ],
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": nested}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    options = result["value"]["runtime_options"]
+    assert options["public.key"] == "publishable-material"
+    assert options["monkey"] == "capuchin"
+    assert options["keyboard"] == "split-layout"
+    assert options["docs.public.key"] == "public-key-documentation"
+    assert result["value"]["runtime_options"]["children"][0] == {
+        "label": "public",
+        "token_usage": 17,
+        "keyboard.layout": "dvorak",
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+    redacted = options["children"][1]["settings"]
+    assert set(redacted.values()) == {"[REDACTED]"}
+    assert options["children"][1]["deeper"] == [
+        {"api.key": "[REDACTED]"},
+        {"private_key": "[REDACTED]"},
+        {"access-.token": "[REDACTED]"},
+    ]
+
+
+def test_nested_benign_path_components_do_not_form_secret_phrases(
+    broker_home: Path,
+):
+    public_options = {
+        "auth": {"token_usage": 17},
+        "api": {"key_rotation_days": 30},
+        "private": {"key_count": 2},
+        "client": {"secret_format": "environment-reference"},
+        "controls": {
+            "monkey": "capuchin",
+            "keyboard": "split-layout",
+            "max_tokens": 4096,
+            "token_usage_limit": 100,
+        },
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": public_options}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    assert result["value"]["runtime_options"] == public_options
+    assert "redacted_paths" not in result
+
+
+def test_nested_structural_secret_phrases_redact_only_exact_leaves(
+    broker_home: Path,
+):
+    secret_values = {
+        "api": {"key": "SENTINEL_NESTED_API_KEY", "key_rotation_days": 30},
+        "private": {"key": "SENTINEL_NESTED_PRIVATE_KEY", "key_count": 2},
+        "auth": {"token": "SENTINEL_NESTED_AUTH_TOKEN", "token_usage": 17},
+        "client": {
+            "secret": "SENTINEL_NESTED_CLIENT_SECRET",
+            "secret_format": "environment-reference",
+        },
+    }
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": secret_values}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    result = inspect_config("model")
+
+    assert result["value"]["runtime_options"] == {
+        "api": {"key": "[REDACTED]", "key_rotation_days": 30},
+        "private": {"key": "[REDACTED]", "key_count": 2},
+        "auth": {"token": "[REDACTED]", "token_usage": 17},
+        "client": {
+            "secret": "[REDACTED]",
+            "secret_format": "environment-reference",
+        },
+    }
+    assert result["redacted_paths"] == [
+        "model.runtime_options.api.key",
+        "model.runtime_options.private.key",
+        "model.runtime_options.auth.token",
+        "model.runtime_options.client.secret",
+    ]
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert "SENTINEL_NESTED_" not in rendered
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "model.runtime_options.api.key",
+        "model.runtime_options.private.key",
+        "model.runtime_options.auth.token",
+        "model.runtime_options.client.secret",
+        "model.runtime_options.api[0].key",
+    ],
+)
+def test_secret_path_classifier_matches_exact_adjacent_structural_phrases(path: str):
+    assert _secret_shaped_path(path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
+    ],
+)
+def test_secret_classifiers_share_the_full_canonical_vocabulary(key: str):
+    assert is_secret_config_key(key)
+    assert is_secret_config_path(f"model.runtime_options.{key}")
+    assert _secret_shaped_path(f"model.runtime_options.{key}")
+
+
+def test_config_display_redaction_uses_canonical_secret_classifier():
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.config import redact_config_value
+
+    secrets = {
+        "apikey": "opaque-one",
+        "tokens": "opaque-two",
+        "encryption_key": "opaque-three",
+        "signingKey": "opaque-four",
+    }
+    rendered = json.dumps(redact_config_value(secrets), ensure_ascii=False)
+
+    assert not any(secret in rendered for secret in secrets.values())
+    config_text = "\n".join(
+        [
+            "service.encryption_key=opaque-five",
+            "signing_key: opaque-six",
+            '"api_keys": "opaque-seven"',
+        ]
+    )
+    redacted_text = redact_sensitive_text(config_text, force=True)
+    assert "opaque-five" not in redacted_text
+    assert "opaque-six" not in redacted_text
+    assert "opaque-seven" not in redacted_text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "model.runtime_options.api.key_rotation_days",
+        "model.runtime_options.private.key_count",
+        "model.runtime_options.client.secret_format",
+    ],
+)
+def test_secret_path_classifier_preserves_benign_structural_suffixes(path: str):
+    assert not _secret_shaped_path(path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api-key",
+        "api_-_key",
+        "clientSecret",
+        "AUTH TOKEN",
+        "access-token",
+        "private_key",
+        "PassWord",
+        "apikey",
+        "tokens",
+        "secrets",
+        "api_keys",
+        "auth",
+        "jwt",
+        "bearer",
+        "encryption_key",
+        "signing_key",
+    ],
+)
+def test_inspect_sensitive_scalar_refuses_canonical_key_variants(
+    broker_home: Path,
+    key: str,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {key: "short-secret"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(AgentConfigError, match="sensitive") as exc_info:
+        inspect_config(f"model.runtime_options.{key}")
+
+    assert "short-secret" not in str(exc_info.value)
+    assert "short-secret" not in repr(exc_info.value)
+
+
+def test_inspect_returns_raw_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {
+        "runtime_options": {"endpoint": "${BROKER_ENDPOINT}/v1"}
+    }
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("BROKER_ENDPOINT", "opaque-expanded-value")
+    config_module.invalidate_config_caches(config_path)
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+    listed = {
+        item["path"]: item["value"] for item in inspect_config()["settings"]
+    }
+
+    assert inspected["value"] == "${BROKER_ENDPOINT}/v1"
+    assert listed["model.runtime_options.endpoint"] == "${BROKER_ENDPOINT}/v1"
+    assert "opaque-expanded-value" not in json.dumps(inspected)
+
+
+def test_inspect_returns_managed_env_template_instead_of_expansion(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    managed_path = Path(os.environ["HERMES_MANAGED_DIR"]) / "config.yaml"
+    managed = yaml.safe_load(managed_path.read_text(encoding="utf-8"))
+    managed["model"]["runtime_options"] = {
+        "endpoint": "${MANAGED_BROKER_ENDPOINT}/v1"
+    }
+    managed_path.write_text(yaml.safe_dump(managed, sort_keys=False), encoding="utf-8")
+    monkeypatch.setenv("MANAGED_BROKER_ENDPOINT", "managed-expanded-value")
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    inspected = inspect_config("model.runtime_options.endpoint")
+
+    assert inspected["value"] == "${MANAGED_BROKER_ENDPOINT}/v1"
+    assert inspected["source"] == "managed"
+    assert inspected["editable"] is False
+    assert "managed-expanded-value" not in json.dumps(inspected)
+
+
+def test_managed_shadow_report_redacts_canonical_secret_key_variants(
+    broker_home: Path,
+):
+    secret_values = {
+        "api-key": "shadow-api-hyphen",
+        "client-secret": "shadow-client-hyphen",
+        "auth-token": "shadow-auth-hyphen",
+        "private-key": "shadow-private-hyphen",
+        "access.token": "shadow-access-dot",
+    }
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    managed_config = yaml.safe_load(
+        (managed / "config.yaml").read_text(encoding="utf-8")
+    )
+    managed_config["model"] = {
+        "runtime_options": {
+            "deep": [
+                {"public-key": "publishable-material"},
+                secret_values,
+            ]
+        }
+    }
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(managed_config, sort_keys=False),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+
+    result = _result(
+        action="set",
+        path="model",
+        value={"runtime_options": {"deep": "new-value"}},
+        reason="exercise managed shadow refusal",
+    )
+    rendered = json.dumps(result, ensure_ascii=False)
+
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["shadowed_leaves"][0]["effective_value"][0] == {
+        "public-key": "publishable-material"
+    }
+    for secret in secret_values.values():
+        assert secret not in rendered
+        assert secret not in repr(result)
+
+
+def test_inspect_sensitive_scalar_returns_precise_refusal(broker_home: Path):
+    config_path = broker_home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["model"] = {"runtime_options": {"client_secret": "not-real"}}
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    with pytest.raises(
+        AgentConfigError,
+        match=r"Requested scalar 'model\.runtime_options\.client_secret' is sensitive",
+    ):
+        inspect_config("model.runtime_options.client_secret")
+
+
+def test_mcp_env_reference_map_is_structured_and_approval_free(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
+    )
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value={"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"},
+        reason="operator requested environment reference wiring",
+    )
+
+    assert result["success"] is True
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["mcp_servers"]["firecrawl"]["env"] == {
+        "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
+    }
+
+
+def test_json_encoded_mcp_env_reference_map_is_recovered(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
+    )
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value=json.dumps({"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"}),
+        reason="operator requested environment reference wiring",
+    )
+
+    assert result["success"] is True
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["mcp_servers"]["firecrawl"]["env"] == {
+        "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
+    }
+
+
+def test_archived_json_encoded_mcp_list_is_repaired_to_native_list(
+    broker_home: Path,
+):
+    path = broker_home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    encoded = json.dumps(FIRECRAWL_TOOL_NAMES)
+    raw["mcp_servers"] = {
+        "firecrawl": {"tools": {"include": encoded}},
+    }
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config_module.invalidate_config_caches(path)
+
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=encoded,
+        reason="operator requested repair of the typed tool filter",
+    )
+
+    assert result["success"] is True
+    stored = yaml.safe_load(path.read_text(encoding="utf-8"))
+    include = stored["mcp_servers"]["firecrawl"]["tools"]["include"]
+    assert include == FIRECRAWL_TOOL_NAMES
+    assert isinstance(include, list)
+
+
+def test_native_mcp_list_stays_typed_and_rejects_non_string_items(
+    broker_home: Path,
+):
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=FIRECRAWL_TOOL_NAMES,
+        reason="operator requested a typed tool filter",
+    )
+    assert result["success"] is True
+    repeated = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.include",
+        value=FIRECRAWL_TOOL_NAMES,
+        reason="operator repeated the same typed tool filter",
+    )
+    assert repeated["success"] is False
+    assert "already has" in repeated["error"]
+
+    rejected = _result(
+        action="set",
+        path="mcp_servers.firecrawl.tools.exclude",
+        value=["firecrawl_scrape", 7],
+        reason="operator requested an invalid tool filter",
+    )
+    assert rejected["success"] is False
+    assert "only string list items" in rejected["error"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"FIRECRAWL_API_KEY": "plaintext"},
+        {"FIRECRAWL_API_KEY": "${OTHER_KEY}"},
+        {"bad-key": "${bad-key}"},
+        {},
+    ],
+)
+def test_mcp_env_map_rejects_plaintext_or_mismatched_references(
+    broker_home: Path, value: dict
+):
+    result = _result(
+        action="set",
+        path="mcp_servers.firecrawl.env",
+        value=value,
+        reason="operator requested environment wiring",
+    )
+    assert result["success"] is False
+    assert "KEY: ${KEY}" in result["error"]
+
+
+def test_arbitrary_mapping_remains_rejected(broker_home: Path):
+    result = _result(
+        action="set",
+        path="display.skin",
+        value={"theme": "pastel"},
+        reason="operator requested mapping",
+    )
+    assert result["success"] is False
+    assert "Mappings are not agent-editable" in result["error"]
+
+
+def test_autonomous_policy_skips_approval_and_writes_atomically(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous config must not request approval"),
+    )
+    result = _result(
+        action="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+        actor="session=test",
+    )
+
+    assert result["success"] is True
+    assert result["apply"] == "next_session"
+    raw = yaml.safe_load((broker_home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["display"]["skin"] == "pastel"
+    audit = history()
+    assert audit["changes"][-1]["path"] == "display.skin"
+    assert "value" not in audit["changes"][-1]
+    backup = (
+        broker_home
+        / "state"
+        / "agent-config"
+        / "revisions"
+        / f"{result['revision']}.yaml"
+    )
+    assert backup.exists()
+    assert oct(backup.stat().st_mode & 0o777) == "0o600"
+
+
+def test_broker_history_and_secret_backups_are_retention_capped(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import hermes_cli.agent_config as agent_config_module
+
+    monkeypatch.setattr(agent_config_module, "_MAX_REVISIONS", 2)
+    monkeypatch.setattr(agent_config_module, "_MAX_AUDIT_RECORDS", 3)
+    for skin in ("pastel", "default", "pastel", "default"):
+        apply_change(
+            prepare_change(
+                operation="set",
+                path="display.skin",
+                value=skin,
+                reason=f"operator selected {skin}",
+            )
+        )
+
+    state_dir = broker_home / "state" / "agent-config"
+    assert len(list((state_dir / "revisions").glob("*.yaml"))) == 2
+    assert len((state_dir / "audit.jsonl").read_text().splitlines()) == 3
+    assert history(limit=100)["count"] == 3
+
+
+def test_prepare_rollback_names_missing_retained_backup(broker_home: Path):
+    changed = apply_change(
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="pastel",
+            reason="operator selected pastel",
+        )
+    )
+    backup = (
+        broker_home
+        / "state"
+        / "agent-config"
+        / "revisions"
+        / f"{changed['revision']}.yaml"
+    )
+    backup.unlink()
+
+    with pytest.raises(AgentConfigError, match=changed["revision"]):
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+
+
+def test_required_approval_denial_changes_nothing(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    managed = Path(os.environ["HERMES_MANAGED_DIR"])
+    policy = yaml.safe_load((managed / "config.yaml").read_text(encoding="utf-8"))
+    policy["agent_config"]["require_approval"] = True
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump(policy, sort_keys=False), encoding="utf-8"
+    )
+    managed_scope.invalidate_managed_cache()
+    config_module.invalidate_config_caches()
+    before = (broker_home / "config.yaml").read_bytes()
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: {"approved": False, "message": "denied"},
+    )
+    result = _result(
+        action="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    assert result["success"] is False
+    assert (broker_home / "config.yaml").read_bytes() == before
+
+
+def test_approval_race_does_not_clobber_external_change(broker_home: Path):
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    path = broker_home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["display"]["compact"] = True
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(AgentConfigError, match="changed after this change was prepared"):
+        apply_change(prepared)
+    after = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert after["display"]["skin"] == "default"
+    assert after["display"]["compact"] is True
+
+
+def test_failed_audit_restores_original_config(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    before = (broker_home / "config.yaml").read_bytes()
+    monkeypatch.setattr(
+        "hermes_cli.agent_config._append_audit",
+        lambda _record: (_ for _ in ()).throw(OSError("audit disk unavailable")),
+    )
+
+    with pytest.raises(AgentConfigError, match="automatically rolled back"):
+        apply_change(prepared)
+
+    assert (broker_home / "config.yaml").read_bytes() == before
+    assert history()["count"] == 0
+
+
+def test_rollback_restores_exact_bytes_including_comments(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    original = b"# operator comment\ndisplay:\n  skin: default  # keep this\n"
+    path.write_bytes(original)
+    invalidate_config_caches(path)
+
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    changed = apply_change(prepared)
+    rollback = prepare_rollback(
+        changed["revision"], reason="operator requested rollback"
+    )
+    apply_rollback(rollback)
+
+    assert path.read_bytes() == original
+
+
+def test_rollback_restores_originally_absent_config(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    path.unlink()
+    invalidate_config_caches(path)
+
+    prepared = prepare_change(
+        operation="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    changed = apply_change(prepared)
+    assert path.exists()
+    rollback = prepare_rollback(
+        changed["revision"], reason="operator requested rollback"
+    )
+    apply_rollback(rollback)
+
+    assert not path.exists()
+
+
+def test_rollback_of_absent_file_rollback_restores_changed_file(broker_home: Path):
+    from hermes_cli.config import invalidate_config_caches
+
+    path = broker_home / "config.yaml"
+    path.unlink()
+    invalidate_config_caches(path)
+    changed = apply_change(
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="pastel",
+            reason="operator requested pastel",
+        )
+    )
+    rollback = apply_rollback(
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+    )
+    assert not path.exists()
+
+    apply_rollback(
+        prepare_rollback(
+            rollback["revision"], reason="operator requested undoing rollback"
+        )
+    )
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["display"]["skin"] == "pastel"
+
+
+def test_noop_set_is_rejected(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="already has"):
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="default",
+            reason="operator requested default",
+        )
+
+
+def test_shared_config_lock_is_reentrant_for_one_profile(broker_home: Path):
+    from hermes_cli.config import atomic_config_write, config_write_lock
+
+    path = broker_home / "config.yaml"
+    with config_write_lock(path):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw["display"]["compact"] = True
+        atomic_config_write(path, raw, sort_keys=False)
+
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["display"]["compact"] is True
+    assert oct((broker_home / ".config.yaml.write.lock").stat().st_mode & 0o777) == "0o600"
+
+
+def test_reader_is_not_blocked_while_writer_waits_for_process_lock(
+    broker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import fcntl
+    import threading
+
+    from hermes_cli.config import config_write_lock, read_raw_config
+
+    waiting = threading.Event()
+    release = threading.Event()
+
+    def blocking_flock(_fd, operation):
+        if operation == fcntl.LOCK_EX:
+            waiting.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(fcntl, "flock", blocking_flock)
+    errors = []
+
+    def writer():
+        try:
+            with config_write_lock(broker_home / "config.yaml"):
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert waiting.wait(timeout=5)
+    try:
+        assert read_raw_config()["display"]["skin"] == "default"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_rollback_only_applies_to_current_revision(
+    broker_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        config_tool_module,
+        "_approval",
+        lambda _prepared: pytest.fail("autonomous rollback must not request approval"),
+    )
+    changed = _result(
+        action="set",
+        path="display.skin",
+        value="pastel",
+        reason="operator requested pastel",
+    )
+    prepared = prepare_rollback(
+        changed["revision"], reason="operator requested rollback"
+    )
+    path = broker_home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["display"]["compact"] = True
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(AgentConfigError, match="changed since that revision"):
+        prepare_rollback(changed["revision"], reason="operator requested rollback")
+
+    # The already-prepared rollback also has a final optimistic check.
+    with pytest.raises(AgentConfigError, match="rollback was prepared"):
+        apply_rollback(prepared)
+
+
+def test_value_that_looks_like_secret_is_rejected(broker_home: Path):
+    with pytest.raises(AgentConfigError, match="resembles credential"):
+        prepare_change(
+            operation="set",
+            path="display.skin",
+            value="Bearer abcdefghijklmnopqrstuvwxyz",
+            reason="operator requested it",
+        )
+
+
+def test_config_tool_is_blocked_from_delegated_children():
+    from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS
+
+    assert "config" in DELEGATE_BLOCKED_TOOLS
+
+
+def test_policy_filtered_config_schema_reaches_app_server_tool_search_bridge(
+    broker_home: Path,
+):
+    from types import SimpleNamespace
+
+    import model_tools
+    from agent.codex_runtime import _app_server_tool_schemas
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    eager = model_tools.get_tool_definitions(
+        enabled_toolsets=["config"],
+        skip_tool_search_assembly=True,
+    )
+    assert {item["function"]["name"] for item in eager} == {"config"}
+    value_schema = eager[0]["function"]["parameters"]["properties"]["value"]
+    variants = value_schema["anyOf"]
+    assert {variant.get("type") for variant in variants} == {
+        "string",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "null",
+    }
+    object_schema = next(item for item in variants if item.get("type") == "object")
+    assert object_schema["additionalProperties"] == {"type": "string"}
+
+    tools = model_tools.get_tool_definitions(enabled_toolsets=["config"])
+    names = {item["function"]["name"] for item in tools}
+    assert names == {"tool_search", "tool_describe", "tool_call"}
+
+    agent = SimpleNamespace(tools=tools, valid_tool_names=names)
+    bridged = _app_server_tool_schemas(agent)
+    assert {item["name"] for item in bridged} == names
+
+
+def test_config_mutation_approval_cannot_be_permanent_or_bypassed_by_yolo(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured = {}
+
+    def fake_request(tool_name, reason, **kwargs):
+        captured.update(tool_name=tool_name, reason=reason, **kwargs)
+        return {"approved": False, "message": "test"}
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", fake_request)
+    config_tool_module._approval(
+        {
+            "operation": "set",
+            "path": "display.skin",
+            "value": "pastel",
+            "reason": "operator requested pastel",
+            "expected_hash": "abc",
+        }
+    )
+    assert captured["tool_name"] == "config"
+    assert captured["allow_permanent"] is False
+    assert captured["allow_yolo"] is False

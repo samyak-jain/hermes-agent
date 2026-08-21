@@ -8,6 +8,56 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_anthropic_singleton_applies_provider_neutral_agent_runtime(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "default": "claude-fable-5",
+            "agent_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(
+        rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False)
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "oauth-token",
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["api_key"] == "oauth-token"
+
+
+def test_unset_main_provider_runtime_does_not_capture_explicit_side_provider(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rp,
+        "_resolve_runtime_provider_unadjusted",
+        lambda **_kwargs: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"agent_runtime": "codex_app_server"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_mode"] == "codex_responses"
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(

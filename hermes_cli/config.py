@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -260,6 +261,8 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_TRANSACTION_LOCK = threading.Lock()
+_CONFIG_FILE_LOCK_STATE = threading.local()
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -2037,9 +2040,171 @@ class ConfigIssue:
     severity: str  # "error", "warning"
     message: str
     hint: str
+    source: str = "config.yaml"
+    path: str = ""
 
 
-def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
+_TOOL_POLICY_FIELDS = frozenset({"mode", "tools", "gateway_override_authority"})
+
+
+def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
+    """Yield ``(source_path, raw_policy)`` across supported Discord layouts."""
+    discord_maps = []
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict) and isinstance(platforms.get("discord"), dict):
+        discord_maps.append(("platforms.discord", platforms["discord"]))
+    if isinstance(config.get("discord"), dict):
+        discord_maps.append(("discord", config["discord"]))
+
+    for prefix, discord_config in discord_maps:
+        overrides = discord_config.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        for channel_id, override in overrides.items():
+            if not isinstance(override, dict) or "tool_policy" not in override:
+                continue
+            yield (
+                f"{prefix}.channel_overrides.{channel_id}.tool_policy",
+                override.get("tool_policy"),
+            )
+
+
+def _fork_validation_issues(
+    config: Dict[str, Any],
+    *,
+    source: str,
+    unknown_severity: str,
+) -> List["ConfigIssue"]:
+    from dataclasses import fields
+
+    from agent.tool_policy import parse_tool_policy
+    from gateway.config import ChannelOverride, SessionResetPolicy, StreamingConfig
+
+    issues: List[ConfigIssue] = []
+    channel_override_fields = frozenset(
+        field.name for field in fields(ChannelOverride)
+    )
+    session_reset_fields = frozenset(
+        field.name for field in fields(SessionResetPolicy)
+    )
+    streaming_fields = frozenset(
+        {field.name for field in fields(StreamingConfig)} | {"mode"}
+    )
+
+    def add_unknown(path: str) -> None:
+        issues.append(
+            ConfigIssue(
+                unknown_severity,
+                f"Unknown typed config key from {source}: {path}",
+                "Move the key to its documented dotted path or remove it; "
+                "this Hermes version would otherwise ignore it.",
+                source=source,
+                path=path,
+            )
+        )
+
+    def check_mapping(value: Any, prefix: str, allowed: frozenset[str]) -> None:
+        if not isinstance(value, dict):
+            return
+        for key in value:
+            if str(key) not in allowed:
+                add_unknown(f"{prefix}.{key}")
+
+    def check_channel_overrides(platform_block: Any, prefix: str) -> None:
+        if not isinstance(platform_block, dict):
+            return
+        overrides = platform_block.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            return
+        for channel_id, override in overrides.items():
+            override_path = f"{prefix}.channel_overrides.{channel_id}"
+            if not isinstance(override, dict):
+                continue
+            check_mapping(override, override_path, channel_override_fields)
+            check_mapping(
+                override.get("tool_policy"),
+                f"{override_path}.tool_policy",
+                _TOOL_POLICY_FIELDS,
+            )
+
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        for platform, block in platforms.items():
+            check_channel_overrides(block, f"platforms.{platform}")
+    gateway = config.get("gateway")
+    gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    if isinstance(gateway_platforms, dict):
+        for platform, block in gateway_platforms.items():
+            check_channel_overrides(block, f"gateway.platforms.{platform}")
+    for root_key, block in config.items():
+        if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
+            continue
+        if "channel_overrides" in block:
+            check_channel_overrides(block, str(root_key))
+
+    check_mapping(config.get("session_reset"), "session_reset", session_reset_fields)
+    check_mapping(config.get("streaming"), "streaming", streaming_fields)
+    if isinstance(gateway, dict):
+        check_mapping(
+            gateway.get("session_reset"),
+            "gateway.session_reset",
+            session_reset_fields,
+        )
+        check_mapping(
+            gateway.get("streaming"),
+            "gateway.streaming",
+            streaming_fields,
+        )
+
+    policies = []
+    agent_config = config.get("agent")
+    if isinstance(agent_config, dict) and agent_config.get("tool_policy") is not None:
+        policies.append(("agent.tool_policy", agent_config["tool_policy"]))
+    cron_config = config.get("cron")
+    if isinstance(cron_config, dict) and cron_config.get("tool_policy") is not None:
+        policies.append(("cron.tool_policy", cron_config["tool_policy"]))
+    policies.extend(_iter_discord_channel_tool_policies(config))
+    for policy_source, raw_policy in policies:
+        parsed_policy = parse_tool_policy(raw_policy, source=policy_source)
+        if not parsed_policy.valid:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    parsed_policy.error,
+                    "Use mode: allowlist with a YAML list of individual tool "
+                    "names, or mode: unrestricted/legacy",
+                )
+            )
+
+    delegation = config.get("delegation")
+    child_policy = (
+        delegation.get("child_tool_policy")
+        if isinstance(delegation, dict)
+        else None
+    )
+    if child_policy is not None:
+        child_mode = (
+            child_policy.get("mode")
+            if isinstance(child_policy, dict)
+            else child_policy
+        )
+        if str(child_mode or "").strip().lower() not in {"legacy", "all_configured"}:
+            issues.append(
+                ConfigIssue(
+                    "error",
+                    f"delegation.child_tool_policy has invalid mode {child_mode!r}",
+                    "Use mode: legacy or mode: all_configured",
+                )
+            )
+    return issues
+
+
+def validate_config_structure(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    source: str = "config.yaml",
+    unknown_severity: str = "warning",
+) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
     Catches common YAML formatting mistakes that produce confusing runtime
@@ -2054,6 +2219,13 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+    issues.extend(
+        _fork_validation_issues(
+            config,
+            source=source,
+            unknown_severity=unknown_severity,
+        )
+    )
 
     # ── voice.submit_mode: direct | draft ────────────────────────────────
     voice_cfg = config.get("voice")
@@ -3393,6 +3565,53 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
+@contextmanager
+def config_write_lock(config_path: Optional[Path] = None):
+    """Serialize config transactions across threads and POSIX processes."""
+    path = config_path or get_config_path()
+    depth = int(getattr(_CONFIG_FILE_LOCK_STATE, "depth", 0))
+    if depth:
+        active_path = getattr(_CONFIG_FILE_LOCK_STATE, "path", None)
+        if active_path != str(path):
+            raise RuntimeError(
+                "Cannot nest Hermes configuration transactions for "
+                "different config files."
+            )
+        _CONFIG_FILE_LOCK_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_STATE.depth -= 1
+        return
+
+    with _CONFIG_TRANSACTION_LOCK:
+        lock_path = path.with_name(f".{path.name}.write.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if sys.platform != "win32":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _CONFIG_FILE_LOCK_STATE.depth = 1
+            _CONFIG_FILE_LOCK_STATE.handle = handle
+            _CONFIG_FILE_LOCK_STATE.path = str(path)
+            try:
+                yield
+            finally:
+                _CONFIG_FILE_LOCK_STATE.depth = 0
+                _CONFIG_FILE_LOCK_STATE.handle = None
+                _CONFIG_FILE_LOCK_STATE.path = None
+                if sys.platform != "win32":
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
 
@@ -3415,8 +3634,59 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """
     from utils import atomic_yaml_write
 
-    require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        atomic_yaml_write(config_path, data, **kwargs)
+        invalidate_config_caches(config_path)
+
+
+def atomic_config_bytes_write(config_path: Path, data: bytes) -> None:
+    """Restore exact ``config.yaml`` bytes under the shared write lock.
+
+    Revision rollback and audit-failure compensation must preserve comments,
+    quoting, whitespace, and an empty file exactly. Normal configuration
+    mutation remains schema-aware YAML; this helper is intentionally limited
+    to previously captured, already-validated snapshots.
+    """
+    from utils import atomic_replace
+
+    with config_write_lock(config_path):
+        require_readable_config_before_write(config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            current_stat = config_path.stat()
+        except OSError:
+            current_stat = None
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(config_path.parent),
+            prefix=f".{config_path.stem}_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            real_path = Path(atomic_replace(tmp_path, config_path))
+            try:
+                os.chmod(
+                    real_path,
+                    (current_stat.st_mode & 0o777) if current_stat else 0o600,
+                )
+            except OSError:
+                pass
+            if current_stat is not None and hasattr(os, "chown"):
+                try:
+                    os.chown(real_path, current_stat.st_uid, current_stat.st_gid)
+                except OSError:
+                    pass
+            invalidate_config_caches(config_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def load_config() -> Dict[str, Any]:
@@ -3457,6 +3727,14 @@ def load_config_readonly() -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+def invalidate_config_caches(config_path: Optional[Path] = None) -> None:
+    """Invalidate cached raw and effective config for one profile."""
+    path_key = str(config_path or get_config_path())
+    with _CONFIG_LOCK:
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
 
 
 def write_platform_config_field(
@@ -3504,6 +3782,10 @@ TERMINAL_CONFIG_ENV_MAP = {
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
     "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_systemd_run": "TERMINAL_SSH_SYSTEMD_RUN",
+    "ssh_systemd_slice": "TERMINAL_SSH_SYSTEMD_SLICE",
+    "ssh_command_memory_max_mb": "TERMINAL_SSH_COMMAND_MEMORY_MAX_MB",
+    "ssh_background_ttl_seconds": "TERMINAL_SSH_BACKGROUND_TTL_SECONDS",
     "container_cpu": "TERMINAL_CONTAINER_CPU",
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -3865,7 +4147,9 @@ def save_config(
     Full-document replacement callers (dashboard raw YAML editor, callers that
     already deep-merge) must leave this False so intentional deletions survive.
     """
-    with _CONFIG_LOCK:
+    ensure_hermes_home()
+    config_path = get_config_path()
+    with config_write_lock(config_path):
         if is_managed():
             managed_error("save configuration")
             return
@@ -3885,10 +4169,6 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
-        from utils import atomic_yaml_write
-
-        ensure_hermes_home()
-        config_path = get_config_path()
         require_readable_config_before_write(config_path)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
@@ -3950,7 +4230,7 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
+        atomic_config_write(
             config_path,
             normalized,
             extra_content="".join(parts) if parts else None,
@@ -3981,6 +4261,29 @@ def _parse_env_value(raw_value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1]
     return value
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Strip a dotenv-style inline comment from a raw value."""
+    value = value.strip()
+    if not value:
+        return value
+    quote = value[0]
+    if quote in ("'", '"'):
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                remainder = value[index + 1:].lstrip()
+                if remainder.startswith("#"):
+                    return value[: index + 1]
+                return value
+            index += 1
+        return value
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
 def load_env() -> Dict[str, str]:
@@ -4533,43 +4836,18 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
-# Key names (case-insensitive, exact match) whose VALUE is a credential and
-# must be masked before printing any config dict to the terminal. Covers the
-# fields a custom provider stuffs into the `model`/`custom_providers` blocks
-# (`api_key`) plus the usual token/secret/password shapes. Exact-match only so
-# benign keys like `token_count` or `secret_santa` don't get masked.
-_SECRET_CONFIG_KEYS = frozenset({
-    "api_key",
-    "apikey",
-    "key",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "secret",
-    "client_secret",
-    "password",
-    "passwd",
-    "auth",
-    "authorization",
-    "private_key",
-    "bearer",
-    "jwt",
-})
-
-
 def redact_config_value(value: Any, _depth: int = 0) -> Any:
     """Return a copy of ``value`` with credential-shaped keys masked for display.
 
-    Recursively walks dicts/lists and replaces the value of any key in
-    ``_SECRET_CONFIG_KEYS`` (case-insensitive) with a masked form via
-    :func:`agent.redact.mask_secret`. Non-secret keys and scalar values pass
+    Recursively walks dicts/lists and replaces the value of any key classified
+    as secret with a masked form via :func:`agent.redact.mask_secret`.
+    Non-secret keys and scalar values pass
     through unchanged. Use this before ``print``-ing any config sub-tree that
     might carry a custom-provider ``api_key`` — ``print`` bypasses the logging
     redactor, and opaque tokens (e.g. Cloudflare ``cfut_...``) don't match the
     vendor-prefix regexes either, so structural key-name masking is required.
     """
-    from agent.redact import mask_secret
+    from agent.redact import is_secret_config_key, mask_secret
 
     # Defensive bound on recursion depth for pathological/cyclic configs.
     if _depth > 20:
@@ -4577,7 +4855,7 @@ def redact_config_value(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(k, str) and k.lower() in _SECRET_CONFIG_KEYS and isinstance(v, str) and v:
+            if is_secret_config_key(k) and isinstance(v, str) and v:
                 out[k] = mask_secret(v)
             else:
                 out[k] = redact_config_value(v, _depth + 1)
@@ -5380,7 +5658,13 @@ def _coerce_float(value: str):
     return f
 
 
-def set_config_value(key: str, value: str, force: bool = False):
+def set_config_value(
+    key: str,
+    value: str,
+    force: bool = False,
+    *,
+    _config_lock_held: bool = False,
+):
     """Set a configuration value.
 
     Args:
@@ -5437,6 +5721,19 @@ def set_config_value(key: str, value: str, force: bool = False):
         save_provider_env_credential(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
+
+    # Re-enter once under the cross-process lock so every existing validation,
+    # read, mutation, and write below remains one transaction.
+    if not _config_lock_held:
+        ensure_hermes_home()
+        config_path = get_config_path()
+        with config_write_lock(config_path):
+            return set_config_value(
+                key,
+                value,
+                force,
+                _config_lock_held=True,
+            )
 
     # Unknown-key notice (#34067): the key is still written (arbitrary keys
     # are supported — top-level scalars are bridged into os.environ for
@@ -5609,8 +5906,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    atomic_config_write(config_path, user_config, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
@@ -5635,9 +5931,10 @@ def set_config_value(key: str, value: str, force: bool = False):
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
-    _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
-        from agent.redact import mask_secret
+    from agent.redact import is_secret_config_key, mask_secret
+
+    _leaf_key = key.rsplit(".", 1)[-1]
+    if is_secret_config_key(_leaf_key) and isinstance(value, str) and value:
         _display_value = mask_secret(value)
     else:
         _display_value = value
@@ -5677,7 +5974,7 @@ def get_config_value(key: str, *, as_json: bool = False):
     print(_format_config_get_value(value, as_json=as_json))
 
 
-def unset_config_value(key: str):
+def unset_config_value(key: str, *, _config_lock_held: bool = False):
     """Remove a user-set configuration or .env value."""
     if is_managed():
         managed_error("unset configuration values")
@@ -5708,6 +6005,12 @@ def unset_config_value(key: str):
         print(f"✓ Unset {key} from {get_env_path()}")
         return
 
+    if not _config_lock_held:
+        ensure_hermes_home()
+        config_path = get_config_path()
+        with config_write_lock(config_path):
+            return unset_config_value(key, _config_lock_held=True)
+
     config_path = get_config_path()
     require_readable_config_before_write(config_path)
     user_config = {}
@@ -5737,14 +6040,75 @@ def unset_config_value(key: str):
         sys.exit(1)
 
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    atomic_config_write(config_path, user_config, sort_keys=False)
     print(f"✓ Unset {key} from {config_path}")
 
 
 # =============================================================================
 # Command handler
 # =============================================================================
+
+def _config_validate_command(args) -> None:
+    managed_path = getattr(args, "managed", None)
+    config_path = Path(managed_path).expanduser() if managed_path else get_config_path()
+    source = f"managed:{config_path}" if managed_path else f"user:{config_path}"
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            candidate = yaml.safe_load(handle) or {}
+        if not isinstance(candidate, dict):
+            issues = [
+                ConfigIssue(
+                    "error",
+                    f"{source} must contain a YAML mapping",
+                    "Replace the document root with a mapping of dotted config sections.",
+                    source=source,
+                    path="",
+                )
+            ]
+        else:
+            issues = validate_config_structure(
+                candidate,
+                source=source,
+                unknown_severity="error" if managed_path else "warning",
+            )
+    except (OSError, yaml.YAMLError) as exc:
+        issues = [
+            ConfigIssue(
+                "error",
+                f"Could not validate {source}: {exc}",
+                "Fix the path, permissions, or YAML syntax and retry.",
+                source=source,
+                path="",
+            )
+        ]
+
+    result = {
+        "success": not any(issue.severity == "error" for issue in issues),
+        "source": source,
+        "issues": [
+            {
+                "severity": issue.severity,
+                "source": issue.source,
+                "path": issue.path,
+                "message": issue.message,
+                "hint": issue.hint,
+            }
+            for issue in issues
+        ],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif not issues:
+        print(color(f"✓ Configuration is valid: {source}", Colors.GREEN))
+    else:
+        for issue in issues:
+            marker = "✗" if issue.severity == "error" else "⚠"
+            print(f"{marker} [{issue.severity}] {issue.message}")
+            if issue.hint:
+                print(f"  {issue.hint}")
+    if not result["success"]:
+        sys.exit(1)
+
 
 def config_command(args):
     """Handle config subcommands."""
@@ -5864,13 +6228,13 @@ def config_command(args):
         print()
         print(color("📋 Configuration Status", Colors.CYAN, Colors.BOLD))
         print()
-        
+
         current_ver, latest_ver = check_config_version()
         if current_ver >= latest_ver:
             print(f"  Config version: {current_ver} ✓")
         else:
             print(color(f"  Config version: {current_ver} → {latest_ver} (update available)", Colors.YELLOW))
-        
+
         print()
         print(color("  Required:", Colors.BOLD))
         for var_name in REQUIRED_ENV_VARS:
@@ -5878,7 +6242,7 @@ def config_command(args):
                 print(f"    ✓ {var_name}")
             else:
                 print(color(f"    ✗ {var_name} (missing)", Colors.RED))
-        
+
         print()
         print(color("  Optional:", Colors.BOLD))
         for var_name, info in OPTIONAL_ENV_VARS.items():
@@ -5888,14 +6252,17 @@ def config_command(args):
                 tools = info.get("tools", [])
                 tools_str = f" → {', '.join(tools[:2])}" if tools else ""
                 print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
-        
+
         missing_config = get_missing_config_fields()
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
-        
+
         print()
+
+    elif subcmd == "validate":
+        _config_validate_command(args)
     
     else:
         print(f"Unknown config command: {subcmd}")
@@ -5907,6 +6274,7 @@ def config_command(args):
         print("  hermes config set <key> <value>   Set a config value")
         print("  hermes config unset <key>        Remove a config value")
         print("  hermes config check     Check for missing/outdated config")
+        print("  hermes config validate  Validate non-secret config structure")
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")

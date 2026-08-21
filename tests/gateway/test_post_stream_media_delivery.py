@@ -42,6 +42,7 @@ def _fake_runner(thread_meta):
     return SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
         _reply_anchor_for_event=lambda event: None,
+        _next_stream_delivery_metadata=lambda event, metadata: metadata,
     )
 
 
@@ -109,5 +110,4 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     images_kwargs = adapter.send_multiple_images.await_args.kwargs
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
-
 

@@ -68,6 +68,13 @@ _PREVIEW_RAW_SELECT = (
 )
 
 
+_ENDING_PREVIEW_RAW_SELECT = (
+    "CAST(LENGTH(m3.content) AS TEXT) || X'00' || "
+    "SUBSTR(RTRIM(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' ')), "
+    "-240, 240)"
+)
+
+
 def _shape_preview(raw: Any) -> str:
     """Turn a ``_preview_raw`` column into the short preview callers show."""
     text = str(raw or "").strip()
@@ -78,6 +85,22 @@ def _shape_preview(raw: Any) -> str:
     if len(text) > _PREVIEW_MAX_CHARS:
         return text[:_PREVIEW_MAX_CHARS] + "..."
     return text
+
+
+def _shape_ending_preview(raw: Any) -> str:
+    """Turn an ``_ending_preview_raw`` column into a compact tail preview."""
+    encoded = str(raw or "")
+    length_text, separator, tail = encoded.partition("\x00")
+    if separator:
+        try:
+            truncated = int(length_text) > 240
+        except ValueError:
+            truncated = len(tail.strip()) > 240
+        text = tail.strip()
+    else:
+        text = encoded.strip()
+        truncated = len(text) > 240
+    return ("..." if truncated else "") + text[-240:]
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
@@ -381,6 +404,13 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS discord_recovery_cursors (
+    channel_id TEXT PRIMARY KEY,
+    last_message_id TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    boundary_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (

@@ -17,7 +17,9 @@ from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from hermes_state_common import (
     SCHEMA_SQL,
     _PREVIEW_RAW_SELECT,
+    _ENDING_PREVIEW_RAW_SELECT,
     _shape_preview,
+    _shape_ending_preview,
     _sql_session_last_active,
 )
 
@@ -110,6 +112,16 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
+                COALESCE(
+                    (SELECT {_ENDING_PREVIEW_RAW_SELECT}
+                     FROM messages m3
+                     WHERE m3.session_id = s.id
+                       AND m3.role IN ('user', 'assistant')
+                       AND m3.content IS NOT NULL
+                       AND TRIM(m3.content) != ''
+                     ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                    ''
+                ) AS _ending_preview_raw,
                 {_sql_session_last_active("s")} AS last_active
             FROM sessions s
             LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
@@ -125,6 +137,9 @@ class SessionPortabilityMixin:
         for row in rows:
             s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            s["ending_preview"] = _shape_ending_preview(
+                s.pop("_ending_preview_raw", "")
+            )
             runs.append(s)
         return runs
 
@@ -194,6 +209,16 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
+                COALESCE(
+                    (SELECT {_ENDING_PREVIEW_RAW_SELECT}
+                     FROM messages m3
+                     WHERE m3.session_id = s.id
+                       AND m3.role IN ('user', 'assistant')
+                       AND m3.content IS NOT NULL
+                       AND TRIM(m3.content) != ''
+                     ORDER BY m3.timestamp DESC, m3.id DESC LIMIT 1),
+                    ''
+                ) AS _ending_preview_raw,
                 {_sql_session_last_active("s")} AS last_active
             FROM sessions s
             {prompt_join}
@@ -206,6 +231,9 @@ class SessionPortabilityMixin:
         for row in rows:
             s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            s["ending_preview"] = _shape_ending_preview(
+                s.pop("_ending_preview_raw", "")
+            )
             result[s["id"]] = s
         return result
 

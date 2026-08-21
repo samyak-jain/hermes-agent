@@ -275,6 +275,38 @@ def _custom_provider_runtime_ids(value: Any) -> set[str]:
     return {normalized, f"custom:{normalized}"}
 
 
+def _apply_tool_policy(agent, *, require_complete_allowlist: bool = False) -> None:
+    """Filter the assembled tool surface and rebuild its name indexes."""
+    from agent.tool_policy import filter_tool_definitions
+
+    agent.tools = filter_tool_definitions(
+        getattr(agent, "tools", None) or [],
+        agent.tool_policy,
+    )
+    agent.valid_tool_names = {
+        tool["function"]["name"]
+        for tool in agent.tools
+        if tool.get("function", {}).get("name")
+    }
+    context_names = getattr(agent, "_context_engine_tool_names", None)
+    if isinstance(context_names, set):
+        context_names.intersection_update(agent.valid_tool_names)
+
+    if not require_complete_allowlist or agent.tool_policy.mode != "allowlist":
+        return
+    missing = agent.tool_policy.allowed_names - agent.valid_tool_names
+    if not missing:
+        return
+    _ra().logger.error(
+        "Exact tool allowlist is incomplete (%s); denying all tools",
+        ", ".join(sorted(missing)),
+    )
+    agent.tools = []
+    agent.valid_tool_names = set()
+    if isinstance(context_names, set):
+        context_names.clear()
+
+
 def _build_codex_gpt5_autoraise_notice(
     autoraise: Dict[str, Any], context_length: Optional[int] = None
 ) -> str:
@@ -523,6 +555,7 @@ def init_agent(
     max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    tool_policy=None,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -929,6 +962,26 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    from agent.tool_policy import ToolAccessPolicy, parse_tool_policy
+    try:
+        from hermes_cli.managed_scope import ManagedConfigError as _ManagedConfigError
+    except Exception:
+        _ManagedConfigError = ()  # type: ignore[assignment,misc]
+    if tool_policy is None:
+        try:
+            from agent.tool_policy import policy_from_config
+            from hermes_cli.config import load_config_readonly
+            tool_policy = policy_from_config(load_config_readonly())
+        except Exception as exc:
+            # A present but untrusted managed policy must never degrade to the
+            # historical unrestricted/legacy behavior.
+            if isinstance(exc, _ManagedConfigError):
+                raise
+            from agent.tool_policy import LEGACY_TOOL_POLICY
+            tool_policy = LEGACY_TOOL_POLICY
+    elif not isinstance(tool_policy, ToolAccessPolicy):
+        tool_policy = parse_tool_policy(tool_policy, source="AIAgent.tool_policy")
+    agent.tool_policy = tool_policy
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1568,6 +1621,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        tool_policy=agent.tool_policy,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1937,6 +1991,7 @@ def init_agent(
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
+    _apply_tool_policy(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -2866,6 +2921,10 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # Context engines are runtime injectors rather than registry entries; apply
+    # the same exact-name boundary after they have had a chance to contribute.
+    _apply_tool_policy(agent, require_complete_allowlist=True)
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

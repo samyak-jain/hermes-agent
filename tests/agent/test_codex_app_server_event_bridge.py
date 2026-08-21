@@ -28,6 +28,7 @@ from agent.codex_runtime import (
     _codex_item_to_tool_name,
     make_codex_app_server_event_bridge,
 )
+from agent.transports.codex_event_projector import CodexEventProjector
 
 
 def _make_stub_agent() -> SimpleNamespace:
@@ -63,17 +64,35 @@ class TestCodexItemToToolName:
             {"type": "dynamicToolCall", "tool": "web_search"}
         ) == "web_search"
 
-    def test_hermes_tools_mcp_server_emits_bare_tool_name(self):
-        """The hermes-tools MCP server wraps Hermes' own tools for codex;
-        the inner dispatch subprocess can't fire native progress events,
-        so the codex-level event IS the display event — shown without the
-        mcp.hermes-tools.* namespacing (from #26541 by @simpolism)."""
+    def test_agent_runtime_mcp_server_emits_bare_tool_name(self):
         assert _codex_item_to_tool_name(
-            {"type": "mcpToolCall", "server": "hermes-tools", "tool": "web_search"}
+            {"type": "mcpToolCall", "server": "agent-runtime", "tool": "web_search"}
         ) == "web_search"
         assert _codex_item_to_tool_name(
-            {"type": "mcpToolCall", "server": "hermes-tools", "tool": "browser_navigate"}
+            {"type": "mcpToolCall", "server": "agent-runtime", "tool": "browser_navigate"}
         ) == "browser_navigate"
+
+    def test_bridge_identity_matches_projected_host_tool_history(self):
+        item = {
+            "type": "mcpToolCall",
+            "id": "host-call-1",
+            "server": "agent-runtime",
+            "tool": "web_search",
+            "arguments": {"query": "Hermes"},
+            "result": "found",
+        }
+        agent = _make_stub_agent()
+        agent.tool_start_callback = MagicMock()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started(item))
+
+        projected = CodexEventProjector().project(_item_completed(item)).messages[0]
+        projected_call = projected["tool_calls"][0]
+        agent.tool_start_callback.assert_called_once_with(
+            projected_call["id"],
+            projected_call["function"]["name"],
+            {"query": "Hermes"},
+        )
 
 
 
@@ -124,6 +143,30 @@ class TestCodexItemToPreview:
         })
         assert "/p0.py" in preview and "/p2.py" in preview
         assert "+2 more" in preview
+
+    def test_agent_runtime_spawn_preview_does_not_leak_prompt(self):
+        preview = _codex_item_to_preview({
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "spawn_agent",
+            "arguments": {
+                "label": "OAuth status",
+                "prompt": "long private prompt",
+            },
+        })
+        assert preview == "OAuth status"
+        assert "private prompt" not in preview
+
+    def test_agent_runtime_memory_preview_does_not_leak_contents(self):
+        preview = _codex_item_to_preview({
+            "type": "mcpToolCall",
+            "server": "agent-runtime",
+            "tool": "memory",
+            "arguments": {
+                "operations": [{"action": "add", "content": "private"}],
+            },
+        })
+        assert preview is None
 
 
 

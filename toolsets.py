@@ -106,6 +106,18 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
     # Basic toolsets - individual tool categories
+    "config": {
+        "description": "Validated agent-owned Hermes configuration",
+        "tools": ["config"],
+        "includes": [],
+    },
+
+    "soul": {
+        "description": "Validated self-SOUL access for the active profile",
+        "tools": ["soul"],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
@@ -299,6 +311,12 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    "spawn": {
+        "description": "Fire-and-forget background subagents with compact results",
+        "tools": ["spawn_agent"],
         "includes": []
     },
 

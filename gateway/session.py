@@ -28,6 +28,59 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _daily_reset_boundary(now: datetime, at_hour: int) -> datetime:
+    """Return the latest configured-local reset boundary in ``now``'s basis.
+
+    Session routing timestamps are historically stored as naive server-local
+    datetimes.  Compute the wall-clock boundary in the configured Hermes
+    timezone, then convert it back before comparing so timezone support does
+    not require a persisted timestamp migration.
+
+    A local date always maps to one instant: ambiguous fall-back hours use
+    ``fold=0`` (the first occurrence), while nonexistent spring-forward hours
+    normalize forward by the DST gap. Explicit zones use ``ZoneInfo``; the
+    unconfigured fallback uses the runtime's transition-aware local rules.
+    """
+    was_naive = now.tzinfo is None
+    instant = now.astimezone() if was_naive else now
+
+    from hermes_time import get_timezone
+
+    configured_tz = get_timezone()
+    configured_now = (
+        instant.astimezone(configured_tz)
+        if configured_tz is not None
+        else datetime.fromtimestamp(instant.timestamp())
+    )
+
+    def boundary_for(local_date) -> datetime:
+        wall_time = datetime(
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            at_hour,
+            tzinfo=configured_tz,
+            fold=0,
+        )
+        return datetime.fromtimestamp(
+            wall_time.timestamp(),
+            configured_tz,
+        )
+
+    boundary = boundary_for(configured_now.date())
+    if boundary.timestamp() > instant.timestamp():
+        boundary = boundary_for(configured_now.date() - timedelta(days=1))
+
+    if was_naive:
+        return datetime.fromtimestamp(boundary.timestamp())
+    return boundary.astimezone(now.tzinfo)
+
+
+def _is_before_daily_reset(updated_at: datetime, boundary: datetime) -> bool:
+    """Compare reset instants without losing naive server-local ``fold``."""
+    return updated_at.timestamp() < boundary.timestamp()
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -831,6 +884,11 @@ class SessionEntry:
     # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
+
+    # Receipt id of the Discord recovery command that created this fresh
+    # session. A replay after a crash between the reset and receipt completion
+    # must observe the already-applied reset instead of rotating again.
+    last_reset_idempotency_key: Optional[str] = None
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -905,6 +963,7 @@ class SessionEntry:
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
+            "last_reset_idempotency_key": self.last_reset_idempotency_key,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -916,6 +975,8 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        if self.updated_at.fold:
+            result["updated_at_fold"] = self.updated_at.fold
         return result
     
     @classmethod
@@ -972,11 +1033,16 @@ class SessionEntry:
                 "Invalid session_key: potential directory traversal detected"
             )
 
+        updated_at = datetime.fromisoformat(data["updated_at"])
+        updated_at_fold = data.get("updated_at_fold")
+        if type(updated_at_fold) is int and updated_at_fold in (0, 1):
+            updated_at = updated_at.replace(fold=updated_at_fold)
+
         return cls(
             session_key=session_key,
             session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            updated_at=updated_at,
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -998,6 +1064,9 @@ class SessionEntry:
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
+            last_reset_idempotency_key=data.get(
+                "last_reset_idempotency_key"
+            ),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -2353,13 +2422,8 @@ class SessionStore:
                 return True
 
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour,
-                minute=0, second=0, microsecond=0,
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
-            if entry.updated_at < today_reset:
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return True
 
         return False
@@ -2454,16 +2518,9 @@ class SessionStore:
                 return "idle"
         
         if policy.mode in {"daily", "both"}:
-            today_reset = now.replace(
-                hour=policy.at_hour, 
-                minute=0, 
-                second=0, 
-                microsecond=0
-            )
-            if now.hour < policy.at_hour:
-                today_reset -= timedelta(days=1)
+            today_reset = _daily_reset_boundary(now, policy.at_hour)
             
-            if entry.updated_at < today_reset:
+            if _is_before_daily_reset(entry.updated_at, today_reset):
                 return "daily"
         
         return None
@@ -3335,7 +3392,13 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -3348,6 +3411,12 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+            if (
+                idempotency_key
+                and old_entry.last_reset_idempotency_key
+                == str(idempotency_key)
+            ):
+                return old_entry
             db_end_session_id = old_entry.session_id
 
             now = _now()
@@ -3363,6 +3432,9 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                last_reset_idempotency_key=(
+                    str(idempotency_key) if idempotency_key else None
+                ),
             )
 
             self._entries[session_key] = new_entry
@@ -3467,6 +3539,23 @@ class SessionStore:
             # restart-resume freshness gate (#85709).
             self._save()
             return entry
+
+    def reset_idempotency_applied(
+        self,
+        session_key: str,
+        idempotency_key: str,
+    ) -> bool:
+        """Return whether a receipt-backed reset already rotated this lane."""
+        if not idempotency_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return bool(
+                entry is not None
+                and entry.last_reset_idempotency_key
+                == str(idempotency_key)
+            )
 
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.

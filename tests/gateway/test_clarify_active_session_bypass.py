@@ -70,6 +70,7 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
 
     adapter = _ClarifyBypassAdapter()
     adapter._message_handler = AsyncMock(return_value="")
+    adapter._drain_message_handler = AsyncMock(return_value=(True, None))
     adapter._busy_session_handler = AsyncMock(return_value=True)
     event = _event("None of those are valid options")
     session_key = build_session_key(
@@ -83,6 +84,7 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
     await adapter.handle_message(event)
 
     adapter._message_handler.assert_awaited_once_with(event)
+    adapter._drain_message_handler.assert_not_awaited()
     adapter._busy_session_handler.assert_not_awaited()
     assert adapter._pending_messages == {}
 
@@ -140,3 +142,62 @@ async def test_active_session_bypass_uses_profile_namespaced_key_under_multiplex
     assert adapter._pending_messages == {}
 
 
+@pytest.mark.asyncio
+async def test_gateway_clarify_reply_resumes_typing_before_returning_empty_ack():
+    """The intercepted clarify answer must resume the original run's typing."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    adapter.pause_typing_for_chat("12345")
+    event = _event("the missing details")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-session"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-2", "clarify-session", "What is missing?", None)
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        result = await runner._handle_message(event)
+
+    assert result == ""
+    assert "12345" not in adapter._typing_paused
+
+
+@pytest.mark.asyncio
+async def test_internal_notification_does_not_resolve_pending_clarify():
+    """Subagent/process notifications are not user answers to clarify."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    event = _event("approve")
+    event.internal = True
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._session_key_for_source = lambda source: "clarify-session"
+    runner._update_prompt_pending = {}
+
+    cm.register("clarify-internal", "clarify-session", "Choose", ["A", "B"])
+
+    class ReachedNextDispatch(RuntimeError):
+        pass
+
+    with patch("tools.slash_confirm.get_pending", side_effect=ReachedNextDispatch):
+        with pytest.raises(ReachedNextDispatch):
+            await runner._handle_message(event)
+
+    pending = cm.get_pending_for_session(
+        "clarify-session", include_choice_prompts=True,
+    )
+    assert pending is not None
+    assert pending.clarify_id == "clarify-internal"
+    assert pending.response is None

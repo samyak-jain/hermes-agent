@@ -136,6 +136,32 @@ class TestBareSecretEnvSuffixes:
             result = redact_sensitive_text(text, force=True)
             assert result == text
 
+    def test_compound_secret_names_in_env_dump_mask(self):
+        secret_values = (
+            "abc123randomopaquetokenvalue999",
+            "stripeopaquevalue123456789",
+            "databaseopaquevalue123456789",
+            "falopaquevalue123456789",
+        )
+        env_dump = "\n".join(
+            (
+                f"MY_SERVICE_TOKEN={secret_values[0]}",
+                f"STRIPE_SECRET={secret_values[1]}",
+                f"DB_PW={secret_values[2]}",
+                f"FAL_KEY={secret_values[3]}",
+                "HOME=/home/u",
+                "KEYBOARD=ansi104",
+                "PASSAGE=chapter-one",
+            )
+        )
+
+        result = redact_sensitive_text(env_dump, force=True)
+
+        for value in secret_values:
+            assert value not in result
+        for line in ("HOME=/home/u", "KEYBOARD=ansi104", "PASSAGE=chapter-one"):
+            assert line in result
+
     def test_form_body_not_swallowed(self):
         # A bare `password=`/`token=` in a form body must not be eaten greedily
         text = "password=mysecret&username=bob&token=opaqueValue"

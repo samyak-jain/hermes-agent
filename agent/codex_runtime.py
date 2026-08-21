@@ -85,6 +85,44 @@ def _log_codex_request_failure(
         getattr(agent, "model", "unknown"),
     )
 
+def _codex_app_server_config() -> dict[str, Any]:
+    """Return the validated ``model.codex_app_server`` mapping."""
+    try:
+        from hermes_cli.config import load_config
+
+        model_cfg = (load_config().get("model") or {})
+        if not isinstance(model_cfg, dict):
+            return {}
+        app_cfg = model_cfg.get("codex_app_server") or {}
+        return dict(app_cfg) if isinstance(app_cfg, dict) else {}
+    except Exception:
+        logger.debug("failed to load codex app-server config", exc_info=True)
+        return {}
+
+
+def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
+    """Convert the agent's policy-filtered OpenAI tools to bridge schemas."""
+    allowed = set(getattr(agent, "valid_tool_names", set()) or set())
+    schemas: list[dict[str, Any]] = []
+    for raw_tool in getattr(agent, "tools", None) or []:
+        if not isinstance(raw_tool, dict):
+            continue
+        function = raw_tool.get("function") or raw_tool
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "")
+        if not name or name not in allowed:
+            continue
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        schemas.append(
+            {
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": parameters,
+            }
+        )
+    return schemas
+
 
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
@@ -105,19 +143,20 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
-    inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
-    totalTokens.
+    inputTokens, cachedInputTokens, cacheCreationInputTokens, outputTokens,
+    reasoningOutputTokens, totalTokens.
 
-    Hermes' canonical prompt bucket includes uncached input + cached input.
-    The Codex app-server protocol does not currently expose cache-write tokens,
-    so that bucket remains zero on this runtime.
-
+    Hermes' canonical prompt bucket includes uncached, cache-read, and
+    cache-write input.
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
     agent.session_api_calls += 1
 
-    usage = getattr(turn, "token_usage_last", None)
+    last_usage = getattr(turn, "token_usage_last", None)
+    usage = getattr(turn, "token_usage_turn", None)
+    if not isinstance(usage, dict) or not usage:
+        usage = last_usage
     if not isinstance(usage, dict) or not usage:
         compressor = getattr(agent, "context_compressor", None)
         if (
@@ -154,6 +193,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    cache_write_tokens = _coerce_usage_int(
+        usage.get("cacheCreationInputTokens")
+    )
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
@@ -162,7 +204,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=0,
+        cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         raw_usage=usage,
     )
@@ -179,11 +221,45 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
+    last_prompt_tokens = prompt_tokens
+    last_usage_dict: dict[str, int] | None = None
+    if isinstance(last_usage, dict) and last_usage:
+        last_canonical = CanonicalUsage(
+            input_tokens=_coerce_usage_int(last_usage.get("inputTokens")),
+            output_tokens=_coerce_usage_int(last_usage.get("outputTokens")),
+            cache_read_tokens=_coerce_usage_int(
+                last_usage.get("cachedInputTokens")
+            ),
+            cache_write_tokens=_coerce_usage_int(
+                last_usage.get("cacheCreationInputTokens")
+            ),
+            reasoning_tokens=_coerce_usage_int(
+                last_usage.get("reasoningOutputTokens")
+            ),
+            raw_usage=last_usage,
+        )
+        last_prompt_tokens = last_canonical.prompt_tokens
+        last_usage_dict = {
+            "prompt_tokens": last_canonical.prompt_tokens,
+            "completion_tokens": last_canonical.output_tokens,
+            "total_tokens": _coerce_usage_int(last_usage.get("totalTokens"))
+            or last_canonical.total_tokens,
+            "input_tokens": last_canonical.input_tokens,
+            "output_tokens": last_canonical.output_tokens,
+            "cache_read_tokens": last_canonical.cache_read_tokens,
+            "cache_write_tokens": last_canonical.cache_write_tokens,
+            "reasoning_tokens": last_canonical.reasoning_tokens,
+        }
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            if last_usage_dict is not None:
+                compressor.update_from_response(last_usage_dict)
+            elif getattr(
+                compressor, "awaiting_real_usage_after_compression", False
+            ):
+                compressor.update_from_response({})
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
@@ -242,7 +318,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     return {
         **usage_dict,
-        "last_prompt_tokens": prompt_tokens,
+        "last_prompt_tokens": last_prompt_tokens,
         "estimated_cost_usd": float(cost_result.amount_usd)
         if cost_result.amount_usd is not None else None,
         "cost_status": cost_result.status,
@@ -357,38 +433,13 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
     {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
 )
 
-# Internal MCP server that wraps Hermes' native tools for codex. When
-# codex calls back through it, the inner dispatch runs in a SEPARATE
-# hermes-tools-mcp-server subprocess that has no access to the parent
-# agent's tool_progress_callback — so the inner call can never surface
-# its own native progress event. The codex-level mcpToolCall event IS
-# the display event for those calls; we strip the mcp.hermes-tools.*
-# namespacing and emit the bare tool name (web_search, browser_navigate,
-# vision_analyze, ...) since the user thinks of these as Hermes tools,
-# not as MCP calls.
-_INTERNAL_MCP_SERVER = "hermes-tools"
-
-
 def _codex_item_to_tool_name(item: dict) -> str:
     """Synthetic Hermes tool name for a codex item. Mirrors
     CodexEventProjector so the progress bubble and the projected
     tool_calls entry use the same identifier."""
-    item_type = item.get("type") or ""
-    if item_type == "commandExecution":
-        return "exec_command"
-    if item_type == "fileChange":
-        return "apply_patch"
-    if item_type == "mcpToolCall":
-        server = item.get("server") or "mcp"
-        tool = item.get("tool") or "unknown"
-        if server == _INTERNAL_MCP_SERVER:
-            return tool
-        return f"mcp.{server}.{tool}"
-    if item_type == "dynamicToolCall":
-        return item.get("tool") or "dynamic"
-    if item_type == "webSearch":
-        return "web_search"
-    return item_type or "unknown"
+    from agent.transports.codex_event_projector import codex_item_identity
+
+    return codex_item_identity(item)[0]
 
 
 def _codex_item_to_args(item: dict) -> dict:
@@ -433,6 +484,15 @@ def _codex_item_to_preview(item: dict) -> Any:
         args = item.get("arguments") or {}
         if not isinstance(args, dict) or not args:
             return None
+        # Host-tool calls can carry private prompts, memory contents, typed
+        # browser text, and similar sensitive values. Use the same
+        # argument-aware preview builder as Hermes' native execution path
+        # instead of dumping raw JSON into a gateway progress bubble.
+        if item_type == "dynamicToolCall" or item.get("server") == "agent-runtime":
+            from agent.display import build_tool_preview
+
+            tool = item.get("tool") or "unknown"
+            return build_tool_preview(tool, args) or None
         try:
             return json.dumps(args, ensure_ascii=False)[:120]
         except (TypeError, ValueError):
@@ -518,26 +578,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
-    def _stable_call_id(item: dict, name: str) -> str:
+    def _stable_call_id(item: dict) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
         session is resumed and history is projected."""
-        from agent.transports.codex_event_projector import _deterministic_call_id
+        from agent.transports.codex_event_projector import codex_item_identity
 
-        item_id = item.get("id") or ""
-        item_type = item.get("type") or ""
-        if item_type == "commandExecution":
-            return _deterministic_call_id("exec", item_id)
-        if item_type == "fileChange":
-            return _deterministic_call_id("apply_patch", item_id)
-        if item_type == "mcpToolCall":
-            server = item.get("server") or "mcp"
-            tool = item.get("tool") or "unknown"
-            return _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
-        if item_type == "dynamicToolCall":
-            tool = item.get("tool") or "unknown"
-            return _deterministic_call_id(f"dyn_{tool}", item_id)
-        return _deterministic_call_id(name, item_id)
+        return codex_item_identity(item)[1]
 
     def _fire_tool_started(item: dict) -> None:
         item_id = item.get("id") or ""
@@ -561,7 +608,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         start_cb = getattr(agent, "tool_start_callback", None)
         if start_cb is not None:
             try:
-                start_cb(_stable_call_id(item, name), name, args)
+                start_cb(_stable_call_id(item), name, args)
             except Exception:
                 logger.debug(
                     "tool_start_callback raised for %s", name, exc_info=True,
@@ -596,7 +643,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if complete_cb is not None:
             args = prior[1] if prior is not None else _codex_item_to_args(item)
             try:
-                complete_cb(_stable_call_id(item, name), name, args, result)
+                complete_cb(_stable_call_id(item), name, args, result)
             except Exception:
                 logger.debug(
                     "tool_complete_callback raised for %s", name, exc_info=True,
@@ -677,10 +724,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    system_message: str | None = None,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -700,8 +748,12 @@ def run_codex_app_server_turn(
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         from agent.runtime_cwd import resolve_agent_cwd
+        from agent.system_prompt import build_app_server_system_prompt_parts
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        app_cfg = _codex_app_server_config()
+        adapter = str(app_cfg.get("adapter") or "").strip().lower()
+        use_host_bridge = adapter == "claude_agent_sdk"
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -739,8 +791,54 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        def _invoke_host_tool(
+            name: str,
+            arguments: dict[str, Any],
+            tool_call_id: str,
+        ) -> Any:
+            if name not in (getattr(agent, "valid_tool_names", set()) or set()):
+                raise PermissionError(f"Tool is not enabled for this session: {name}")
+            context = getattr(agent, "_codex_host_tool_context", {}) or {}
+            return agent._invoke_tool(
+                name,
+                arguments,
+                context.get("effective_task_id") or "",
+                tool_call_id=tool_call_id or None,
+                messages=context.get("messages"),
+            )
+
+        app_server_prompt_parts = (
+            build_app_server_system_prompt_parts(
+                agent,
+                system_message=system_message,
+            )
+            if use_host_bridge
+            else {}
+        )
+        system_prompt_static = app_server_prompt_parts.get("stable") or None
+        system_prompt_dynamic = "\n\n".join(
+            part
+            for part in (
+                app_server_prompt_parts.get("context"),
+                app_server_prompt_parts.get("volatile"),
+            )
+            if part
+        ) or None
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_bin=str(app_cfg.get("binary") or "codex"),
+            model=(str(app_cfg.get("model") or agent.model) if use_host_bridge else None),
+            permission_mode=(
+                str(app_cfg.get("permission_mode") or "bypassPermissions")
+                if use_host_bridge
+                else None
+            ),
+            host_session_id=(agent.session_id if use_host_bridge else None),
+            system_prompt_append=system_prompt_dynamic,
+            system_prompt_identity=system_prompt_static,
+            tool_schemas=(_app_server_tool_schemas(agent) if use_host_bridge else None),
+            tool_callback=(_invoke_host_tool if use_host_bridge else None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -749,12 +847,42 @@ def run_codex_app_server_turn(
             on_event=make_codex_app_server_event_bridge(agent),
         )
 
+    agent._codex_host_tool_context = {
+        "effective_task_id": effective_task_id,
+        "messages": messages,
+    }
+    app_cfg = _codex_app_server_config()
+    try:
+        quiet_timeout = max(
+            1.0,
+            float(app_cfg.get("post_tool_quiet_timeout") or 300.0),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid model.codex_app_server.post_tool_quiet_timeout; using 300 seconds"
+        )
+        quiet_timeout = 300.0
+    try:
+        turn_timeout = max(
+            1.0,
+            float(app_cfg.get("turn_timeout") or 600.0),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid model.codex_app_server.turn_timeout; using 600 seconds"
+        )
+        turn_timeout = 600.0
+
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=turn_timeout,
+            post_tool_quiet_timeout=quiet_timeout,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

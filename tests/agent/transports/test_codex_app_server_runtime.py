@@ -340,3 +340,30 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+
+@pytest.mark.parametrize("provider", ["anthropic", "openrouter", "bedrock"])
+def test_provider_neutral_agent_runtime(provider: str) -> None:
+    assert _maybe_apply_codex_app_server_runtime(
+        provider=provider,
+        api_mode="anthropic_messages",
+        model_cfg={"agent_runtime": "codex_app_server"},
+    ) == "codex_app_server"
+
+
+def test_provider_neutral_agent_runtime_is_case_insensitive() -> None:
+    assert _maybe_apply_codex_app_server_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={"agent_runtime": "Codex_App_Server"},
+    ) == "codex_app_server"
+
+
+def test_configured_main_runtime_does_not_capture_side_provider() -> None:
+    assert _maybe_apply_codex_app_server_runtime(
+        provider="openai-codex",
+        api_mode="codex_responses",
+        model_cfg={
+            "provider": "anthropic",
+            "agent_runtime": "codex_app_server",
+        },
+    ) == "codex_responses"

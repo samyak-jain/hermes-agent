@@ -55,6 +55,7 @@ MUTATING_TOOL_NAMES = frozenset(
         "send_message",
         "cronjob",
         "delegate_task",
+        "spawn_agent",
         "process",
     }
 )

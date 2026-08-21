@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -38,6 +39,10 @@ _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
 
+class ManagedConfigError(RuntimeError):
+    """A present administrator-managed config could not be trusted."""
+
+
 def _under_pytest() -> bool:
     """True when running inside the test suite.
 
@@ -46,7 +51,7 @@ def _under_pytest() -> bool:
     that exercise managed scope set ``HERMES_MANAGED_DIR`` explicitly, which is
     still honored (the override path below runs before this guard takes effect).
     """
-    return "PYTEST_CURRENT_TEST" in os.environ
+    return "pytest" in sys.modules
 
 
 def get_managed_dir() -> Optional[Path]:
@@ -65,7 +70,14 @@ def get_managed_dir() -> Optional[Path]:
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
-        return p if p.is_dir() else None
+        if p.is_dir():
+            return p
+        logger.error(
+            "managed scope: HERMES_MANAGED_DIR points to a missing or "
+            "non-directory path: %s",
+            p,
+        )
+        return None
     if _under_pytest():
         return None
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
@@ -78,13 +90,12 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, fail_closed: bool = False):
     """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
 
-    Returns ``None`` when the file is absent or fails to parse (fail-open). A
-    parse failure is logged LOUDLY — the admin needs to know their policy isn't
-    being applied — but never raises, so a malformed managed file can't brick
-    startup.
+    Returns ``None`` when the file is absent. Ordinary managed files remain
+    fail-soft; security-bearing config is fail-closed, retaining a prior good
+    parse or raising when no trusted value has ever loaded.
     """
     try:
         st = path.stat()
@@ -100,6 +111,18 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+        with _CACHE_LOCK:
+            previous = cache.get(path_key)
+        if fail_closed and previous is not None:
+            logger.error(
+                "managed scope: failed to parse %s: %s — retaining last-known-good policy",
+                path, exc,
+            )
+            return copy.deepcopy(previous[2])
+        if fail_closed:
+            raise ManagedConfigError(
+                f"managed scope: {path} is present but cannot be parsed: {exc}"
+            ) from exc
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -113,7 +136,7 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
 
 
 def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+    """Parsed managed config.yaml; absent is empty, malformed is fail-closed."""
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
@@ -121,6 +144,7 @@ def load_managed_config() -> dict:
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
         lambda f: yaml.safe_load(f) or {},
+        fail_closed=True,
     )
     return parsed if isinstance(parsed, dict) else {}
 
@@ -150,8 +174,9 @@ def apply_managed_overlay(config: dict) -> dict:
       * leaf-level deep-merge managed ON TOP, so managed wins per-leaf while
         sibling keys stay user-controlled.
 
-    Fail-open: returns ``config`` unchanged if no managed scope is present or on
-    any error — managed scope must never break a caller's startup. Mutates and
+    A missing scope is a no-op. A present malformed config retains its
+    last-known-good parse or raises ``ManagedConfigError`` on fresh startup;
+    silently dropping administrator policy is never allowed. Mutates and
     returns ``config`` (callers pass a dict they own).
     """
     try:
@@ -172,19 +197,28 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
-    except Exception:  # noqa: BLE001 — overlay must never break a caller
+    except ManagedConfigError:
+        raise
+    except Exception:  # noqa: BLE001 — non-policy overlay errors stay fail-soft
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 
 
 def _parse_env(f) -> Dict[str, str]:
+    from hermes_cli.config import _parse_env_value, _strip_inline_comment
+
     out: Dict[str, str] = {}
-    for line in f:
-        line = line.strip()
+    for raw in f:
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
         key, _, value = line.partition("=")
-        out[key.strip()] = value.strip().strip("\"'")
+        key = key.strip().lstrip("\ufeff")
+        if not key:
+            continue
+        out[key] = _parse_env_value(_strip_inline_comment(value))
     return out
 
 

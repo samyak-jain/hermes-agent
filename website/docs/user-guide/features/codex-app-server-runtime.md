@@ -68,7 +68,7 @@ Hermes registers itself as an MCP server so codex can call back for tools codex 
 
 When the model wants one of these, codex spawns the `hermes_tools_mcp_server` subprocess via stdio MCP, the call is dispatched through `model_tools.handle_function_call()` (same code path as Hermes' default runtime), and the result is returned to codex like any other MCP response.
 
-### What's NOT available on this runtime
+### What's NOT available with the standard Codex callback
 
 These four Hermes tools require the running AIAgent context (mid-loop state) to dispatch, and a stateless MCP callback can't drive them. Switch back to the default runtime (`/codex-runtime auto`) when you need any of them:
 
@@ -76,6 +76,24 @@ These four Hermes tools require the running AIAgent context (mid-loop state) to 
 - **`memory`** — Hermes' persistent memory store
 - **`session_search`** — cross-session search
 - **`todo`** — Hermes' todo store (codex's `update_plan` is the in-runtime equivalent)
+
+The in-image `claude_agent_sdk` adapter uses a different, stateful callback.
+It builds its MCP surface from the live agent's policy-filtered tool schemas and
+dispatches calls back through that same `AIAgent`, so `spawn_agent`,
+`delegate_task`, `memory`, `session_search`, and `todo` are available whenever
+the current channel policy enables them. Claude Code's native action tools are
+disabled in this mode, preventing them from bypassing the host tool policy.
+
+The adapter appends SOUL.md plus a short context contract to the Claude Code
+preset. On the first user turn it supplies the complete gateway message,
+project context (including AGENTS.md), MEMORY.md, USER.md, external-memory
+context, and memory/skill guidance in a tagged host-context block. Claude keeps
+that block in its resumable session, while the smaller preset append stays on
+the subscription's included-usage path. It omits Hermes' default product
+identity and incompatible provider/tool-loop instructions. Skills are
+discovered natively through `~/.claude/skills`; completed calls still project
+into the normal transcript, so memory and automatic skill review retain their
+usual cadence.
 
 ## Workflow features (`/goal`, kanban, cron)
 
@@ -196,6 +214,35 @@ You can also set it manually in `~/.hermes/config.yaml`:
 model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
 ```
+
+For the provider-neutral Claude Agent SDK adapter, configure the runtime
+explicitly instead:
+
+```yaml
+model:
+  default: claude-fable-5
+  provider: anthropic
+  agent_runtime: codex_app_server
+  codex_app_server:
+    adapter: claude_agent_sdk
+    binary: codex
+    model: claude-fable-5
+    permission_mode: bypassPermissions
+    post_tool_quiet_timeout: 300
+```
+
+The adapter removes API keys, authorization tokens, custom endpoints and
+alternate-cloud selectors from the SDK child environment, and disables Claude
+filesystem settings so they cannot override subscription authentication. Run
+`codex --subscription-login` interactively as the runtime user on the machine
+that will run the adapter, then verify the non-secret usage state with
+`codex --subscription-status`. Keep the resulting
+`~/.claude/.credentials.json` private. Do not copy a live credential file
+between machines: OAuth refreshes rotate that login session, so two copies can
+invalidate each other. When the main provider is Anthropic, configure
+`delegation` and `auxiliary.background_review` explicitly if child agents and
+self-improvement review should use a different provider such as
+`openai-codex`.
 
 ## Self-improvement loop (memory + skill nudges)
 

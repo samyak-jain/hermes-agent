@@ -85,6 +85,25 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _cron_event(execution_id="exec_duplicate"):
+    return {
+        "type": "cron_result",
+        "execution_id": execution_id,
+        "text": "[Automated cron result]",
+        "session_key": "agent:vegapunk:telegram:dm:12345:678",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "12345",
+        "thread_id": "678",
+        "profile": "vegapunk",
+        "message_id": f"cron:{execution_id}",
+        "event_metadata": {
+            "automated_trigger": "cron_result",
+            "cron_job_id": "job-1",
+        },
+    }
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -111,6 +130,85 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_awaited_once()
+
+
+def test_duplicate_cron_queue_replay_injects_once(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(dict(_cron_event()))
+    isolated.put(dict(_cron_event()))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert delivered.message_id == "cron:exec_duplicate"
+    assert delivered.source.profile == "vegapunk"
+    assert delivered.metadata["automated_trigger"] == "cron_result"
+    assert delivered.metadata["cron_job_id"] == "job-1"
+
+
+def test_failed_cron_injection_is_requeued_for_retry(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_cron_event("exec-retry"))
+
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
+    )
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+
+
+def test_spawn_result_has_positive_dedup_identity():
+    assert GatewayRunner._completion_delivery_identity({
+        "type": "spawn_result",
+        "delegation_id": "spawn-1",
+    }) == ("spawn_result", "spawn-1", "")
+
+
+def test_spawn_result_is_acked_and_not_restored_after_gateway_restart(
+    monkeypatch, isolated_registry,
+):
+    """A delivered spawn completion must not replay in the next process."""
+    from tools import async_delegation
+
+    event = _async_event("spawn_restart")
+    event["type"] = "spawn_result"
+    record = {
+        "delegation_id": event["delegation_id"],
+        "completion_type": event["type"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": event["dispatched_at"],
+    }
+    async_delegation._persist_dispatch(record)
+    async_delegation._persist_completion(
+        event,
+        {"status": "completed", "summary": event["summary"]},
+    )
+    isolated_registry.completion_queue.put(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "delivered"
+    assert async_delegation.restore_undelivered_completions(queue.Queue()) == 0
 
 
 def test_unroutable_async_event_is_not_requeued_forever(
@@ -275,6 +373,144 @@ def test_process_tool_redacts_explicit_kill_output(monkeypatch):
         "session_id": session.id,
     }))
     assert result["output"] == "PRIVATE_TOKEN=<redacted>\n"
+
+
+def test_kill_of_already_exited_process_returns_output_before_consuming():
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_already_exited",
+        command="echo complete",
+        task_id="task",
+        started_at=1.0,
+        output_buffer="complete\n",
+        exited=True,
+        exit_code=0,
+    )
+    registry._finished[session.id] = session
+
+    result = registry.kill_process(session.id)
+
+    assert result["status"] == "already_exited"
+    assert result["output"] == "complete\n"
+    assert registry.is_completion_consumed(session.id)
+
+
+def test_read_log_only_consumes_when_terminal_output_page_is_observed():
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_paged_log",
+        command="printf lines",
+        task_id="task",
+        started_at=1.0,
+        output_buffer="first\nsecond\nfinal\n",
+        exited=True,
+        exit_code=0,
+    )
+    registry._finished[session.id] = session
+
+    middle_page = registry.read_log(session.id, offset=1, limit=1)
+    assert middle_page["output"] == "second"
+    assert not registry.is_completion_consumed(session.id)
+
+    final_page = registry.read_log(session.id, offset=2, limit=1)
+    assert final_page["output"] == "final"
+    assert registry.is_completion_consumed(session.id)
+
+
+def test_bulk_kill_does_not_consume_discarded_completion_output(monkeypatch):
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_bulk_kill",
+        command="sleep 999",
+        task_id="task",
+        started_at=1.0,
+        output_buffer="output bulk cleanup does not return\n",
+        notify_on_complete=True,
+    )
+    session.process = MagicMock()
+    session.process.pid = 4243
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    assert registry.kill_all() == 1
+    assert not registry.is_completion_consumed(session.id)
+    queued = registry.completion_queue.get_nowait()
+    assert queued["session_id"] == session.id
+    assert queued["started_at"] == session.started_at
+    assert queued["output"] == "output bulk cleanup does not return\n"
+
+
+def test_turn_cleanup_preserves_notify_on_complete_processes(monkeypatch):
+    registry = ProcessRegistry()
+    durable = ProcessSession(
+        id="proc_durable_wait",
+        command="paseo-handoff wait --agent worker",
+        task_id="vegapunk-turn",
+        started_at=1.0,
+        notify_on_complete=True,
+    )
+    disposable = ProcessSession(
+        id="proc_disposable",
+        command="sleep 999",
+        task_id="vegapunk-turn",
+        started_at=2.0,
+        notify_on_complete=False,
+    )
+    registry._running = {
+        durable.id: durable,
+        disposable.id: disposable,
+    }
+    killed = []
+
+    def fake_kill(session_id, **_kwargs):
+        killed.append(session_id)
+        return {"status": "killed"}
+
+    monkeypatch.setattr(registry, "kill_process", fake_kill)
+
+    assert registry.kill_all(
+        task_id="vegapunk-turn",
+        preserve_notify_on_complete=True,
+    ) == 1
+    assert killed == [disposable.id]
+
+
+def test_unobserved_normal_completion_still_notifies(monkeypatch):
+    import tools.process_registry as pr_module
+
+    class _Registry:
+        def get(self, _session_id):
+            return SimpleNamespace(
+                output_buffer="done\n",
+                exited=True,
+                exit_code=0,
+                command="echo done",
+                started_at=1234.5,
+            )
+
+        def is_completion_consumed(self, _session_id):
+            return False
+
+    monkeypatch.setattr(pr_module, "process_registry", _Registry())
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": "proc_unobserved",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    adapter.handle_message.assert_awaited_once()
 
 
 def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypatch):

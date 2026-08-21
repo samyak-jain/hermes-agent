@@ -42,3 +42,22 @@ def test_overlay_preserves_user_siblings(managed):
     assert out["display"]["show_reasoning"] is True
 
 
+def test_managed_exact_tool_list_replaces_user_list(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, """
+    agent:
+      tool_policy:
+        mode: allowlist
+        tools: [clarify, delegate_task, memory, skills_list, skill_manage]
+        gateway_override_authority: managed_only
+    """)
+    out = managed_scope.apply_managed_overlay({
+        "agent": {"tool_policy": {"mode": "unrestricted", "tools": ["terminal"]}}
+    })
+    assert out["agent"]["tool_policy"]["mode"] == "allowlist"
+    assert out["agent"]["tool_policy"]["tools"] == [
+        "clarify", "delegate_task", "memory", "skills_list", "skill_manage"
+    ]
+    assert out["agent"]["tool_policy"]["gateway_override_authority"] == "managed_only"
+

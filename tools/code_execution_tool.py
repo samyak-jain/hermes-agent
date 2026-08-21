@@ -790,7 +790,7 @@ def _get_or_create_env(task_id: str):
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
+        get_task_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
         _resolve_container_task_id, _resolve_task_host_cwd,
     )
@@ -801,7 +801,7 @@ def _get_or_create_env(task_id: str):
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            return _active_environments[effective_task_id], get_task_env_config(task_id)["env_type"]
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -813,9 +813,9 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+                return _active_environments[effective_task_id], get_task_env_config(task_id)["env_type"]
 
-        config = _get_env_config()
+        config = get_task_env_config(task_id)
         env_type = config["env_type"]
         overrides = _task_env_overrides.get(effective_task_id, {})
 
@@ -852,7 +852,17 @@ def _get_or_create_env(task_id: str):
                 "user": config.get("ssh_user", ""),
                 "port": config.get("ssh_port", 22),
                 "key": config.get("ssh_key", ""),
+                "known_hosts_file": config.get("ssh_known_hosts_file", ""),
+                "sync_files": config.get("ssh_sync_files", True),
                 "persistent": config.get("ssh_persistent", False),
+                "systemd_run": config.get("ssh_systemd_run", False),
+                "systemd_slice": config.get("ssh_systemd_slice", ""),
+                "command_memory_max_mb": config.get(
+                    "ssh_command_memory_max_mb", 0
+                ),
+                "background_ttl_seconds": config.get(
+                    "ssh_background_ttl_seconds", 86400
+                ),
             }
 
         local_config = None

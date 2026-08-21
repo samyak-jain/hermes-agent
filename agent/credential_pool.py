@@ -44,7 +44,6 @@ from hermes_cli.auth import (
 
 logger = logging.getLogger(__name__)
 
-
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
 
@@ -590,6 +589,7 @@ def credential_pool_matches_provider(
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
+RECENT_REFRESH_ALIAS_LIMIT = 128
 
 
 def _write_through_provider_state_to_global_root(
@@ -660,6 +660,11 @@ class CredentialPool:
         # reentrantly at negligible cost.
         self._lock = threading.RLock()
         self._active_leases: Dict[str, int] = {}
+        # Old runtime key -> entry id for a just-completed single-use token
+        # refresh. Concurrent callers that observed the same rejected key can
+        # return the already-refreshed entry instead of consuming the refresh
+        # token again or reporting a spurious failure.
+        self._recent_refresh_aliases: Dict[str, str] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log, used to
         # throttle that message so an empty/exhausted pool cannot storm the
@@ -2272,6 +2277,18 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
+    def entry_for_lease(self, credential_id: Optional[str]) -> Optional[PooledCredential]:
+        """Return the credential identified by an active lease."""
+        if not credential_id:
+            return None
+        with self._lock:
+            if self._active_leases.get(credential_id, 0) <= 0:
+                return None
+            return next(
+                (entry for entry in self._entries if entry.id == credential_id),
+                None,
+            )
+
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._try_refresh_current_unlocked()
@@ -2310,14 +2327,32 @@ class CredentialPool:
                         ),
                         None,
                     )
+                    if entry is None:
+                        refreshed_id = self._recent_refresh_aliases.get(api_key_hint)
+                        if refreshed_id:
+                            return next(
+                                (
+                                    candidate
+                                    for candidate in self._entries
+                                    if candidate.id == refreshed_id
+                                ),
+                                None,
+                            )
                 else:
                     entry = self._current_unlocked() or self._select_unlocked(
                         refresh=False
                     )[0]
             if entry is None:
                 return None
+            old_runtime_key = entry.runtime_api_key
             self._current_id = entry.id
-            return self._try_refresh_current_unlocked()
+            refreshed = self._try_refresh_current_unlocked()
+            if refreshed is not None and old_runtime_key:
+                self._recent_refresh_aliases[old_runtime_key] = refreshed.id
+                while len(self._recent_refresh_aliases) > RECENT_REFRESH_ALIAS_LIMIT:
+                    oldest_key = next(iter(self._recent_refresh_aliases))
+                    self._recent_refresh_aliases.pop(oldest_key, None)
+            return refreshed
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
         entry = self._current_unlocked()

@@ -25,6 +25,144 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+def test_recovery_stream_final_does_not_complete_receipts_early():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={
+            "_gateway_receipt_ids": ["456", "457"],
+        },
+    )
+
+    assert consumer._metadata_for_send(final=True) == {
+        "_gateway_receipt_ids": ["456", "457"],
+        "reply_to_message_id": "456",
+        "notify": False,
+    }
+
+
+def test_recovery_stream_new_messages_get_ordered_chunk_indices():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(final=False)
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
+    second = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert first["_gateway_receipt_ids"] == ["456"]
+    assert second["_gateway_receipt_ids"] == ["456"]
+
+
+def test_recovery_stream_failed_new_send_reuses_chunk_index():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send(
+        content="same logical message",
+        final=False,
+    )
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=False),
+    )
+    retry = consumer._metadata_for_new_send(
+        content="same logical message",
+        final=True,
+    )
+    consumer._mark_new_send_delivered(
+        retry,
+        SimpleNamespace(success=True),
+    )
+    next_segment = consumer._metadata_for_new_send(final=True)
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert retry["_gateway_recovery_text_chunk_index"] == 0
+    assert next_segment["_gateway_recovery_text_chunk_index"] == 1
+
+
+def test_recovery_stream_failed_interim_does_not_reuse_nonce_for_final():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    interim = consumer._metadata_for_new_send(
+        content="interim status",
+        final=False,
+    )
+    consumer._mark_new_send_delivered(
+        interim,
+        SimpleNamespace(success=False),
+    )
+    final = consumer._metadata_for_new_send(
+        content="final answer",
+        final=True,
+    )
+
+    assert interim["_gateway_recovery_text_chunk_index"] == 0
+    assert final["_gateway_recovery_text_chunk_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_edits_keep_current_segment_chunk_index():
+    adapter = MagicMock()
+    adapter.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="m1")
+    )
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    first = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        first,
+        SimpleNamespace(success=True),
+    )
+    await consumer._edit_message(
+        message_id="m1",
+        content="first segment",
+        finalize=True,
+    )
+    second = consumer._metadata_for_new_send()
+    consumer._mark_new_send_delivered(
+        second,
+        SimpleNamespace(success=True),
+    )
+    await consumer._edit_message(
+        message_id="m2",
+        content="second segment",
+        finalize=True,
+    )
+
+    assert first["_gateway_recovery_text_chunk_index"] == 0
+    assert second["_gateway_recovery_text_chunk_index"] == 1
+    assert [
+        call.kwargs["metadata"][
+            "_gateway_recovery_text_chunk_index"
+        ]
+        for call in adapter.edit_message.await_args_list
+    ] == [0, 1]
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -435,6 +573,141 @@ class TestSegmentBreakOnToolBoundary:
         # Post-boundary text must also reach the user.
         assert "Here is the tool result." in all_text
 
+    @pytest.mark.asyncio
+    async def test_no_message_id_enters_fallback_mode(self):
+        """Platform returns success but no message_id (Signal) — must not
+        re-send on every delta.  Should enter fallback mode and send only
+        the continuation at finish."""
+        adapter = MagicMock()
+        # First send succeeds but returns no message_id (Signal behavior)
+        send_result_no_id = SimpleNamespace(success=True, message_id=None)
+        # Fallback final send succeeds
+        send_result_final = SimpleNamespace(success=True, message_id="msg_final")
+        adapter.send = AsyncMock(side_effect=[send_result_no_id, send_result_final])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(" world, this is a longer response.")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        # Should send exactly 2 messages: initial chunk + fallback continuation
+        # NOT one message per delta
+        assert adapter.send.call_count == 2
+        assert consumer.already_sent
+        # edit_message should NOT have been called (no valid message_id to edit)
+        adapter.edit_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_message_id_single_delta_marks_already_sent(self):
+        """When the entire response fits in one delta and platform returns no
+        message_id, already_sent must still be True to prevent the gateway
+        from re-sending the full response."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id=None)
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Short response.")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert consumer.already_sent
+        # Only one send call (the initial message)
+        assert adapter.send.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_message_id_segment_breaks_do_not_resend(self):
+        """On a platform that never returns a message_id (e.g. webhook with
+        github_comment delivery), tool-call segment breaks must NOT trigger
+        a new adapter.send() per boundary.  The fix: _message_id == '__no_edit__'
+        suppresses the reset so all text accumulates and is sent once."""
+        adapter = MagicMock()
+        # No message_id on first send, then one more for the fallback final
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id=None),
+            SimpleNamespace(success=True, message_id=None),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Simulate: text → tool boundary → text → tool boundary → text (3 segments)
+        consumer.on_delta("Phase 1 text")
+        consumer.on_delta(None)   # tool call boundary
+        consumer.on_delta("Phase 2 text")
+        consumer.on_delta(None)   # another tool call boundary
+        consumer.on_delta("Phase 3 text")
+        consumer.finish()
+
+        await consumer.run()
+
+        # Before the fix this would post 3 comments (one per segment).
+        # After the fix: only the initial partial + one fallback-final continuation.
+        assert adapter.send.call_count == 2, (
+            f"Expected 2 sends (initial + fallback), got {adapter.send.call_count}"
+        )
+        assert consumer.already_sent
+        # The continuation must contain the text from segments 2 and 3
+        final_text = adapter.send.call_args_list[1][1]["content"]
+        assert "Phase 2" in final_text
+        assert "Phase 3" in final_text
+
+    @pytest.mark.asyncio
+    async def test_fallback_final_splits_long_continuation_without_dropping_text(self):
+        """Long continuation tails should be chunked when fallback final-send runs."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+            SimpleNamespace(success=True, message_id="msg_3"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:6"))
+        adapter.MAX_MESSAGE_LENGTH = 610
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            config,
+            initial_reply_to_id="456",
+            metadata={"_gateway_receipt_ids": ["456"]},
+        )
+
+        prefix = "Hello world"
+        tail = "x" * 620
+        consumer.on_delta(prefix)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(tail)
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
+        assert len(sent_texts) == 3
+        assert sent_texts[0].startswith(prefix)
+        assert sum(len(t) for t in sent_texts[1:]) == len(tail)
+        recovery_indices = [
+            call.kwargs["metadata"][
+                "_gateway_recovery_text_chunk_index"
+            ]
+            for call in adapter.send.call_args_list
+        ]
+        assert recovery_indices == [0, 1, 2]
 
     @pytest.mark.asyncio
     async def test_fallback_final_sends_full_text_at_tool_boundary(self):
@@ -1487,4 +1760,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

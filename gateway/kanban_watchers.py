@@ -1212,7 +1212,7 @@ class GatewayKanbanWatchersMixin:
             return
 
         try:
-            cfg = _load_config()
+            cfg = await asyncio.to_thread(_load_config)
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return

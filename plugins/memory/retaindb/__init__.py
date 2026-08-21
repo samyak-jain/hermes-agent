@@ -381,6 +381,9 @@ class _WriteQueue:
             conn = sqlite3.connect(
                 str(self._db_path), timeout=30, check_same_thread=False
             )
+            from hermes_state import apply_sqlite_storage_policy
+
+            apply_sqlite_storage_policy(conn, db_label="retaindb/write_queue.db")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
             with self._connections_lock:

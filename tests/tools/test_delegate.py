@@ -250,6 +250,44 @@ class TestStripBlockedTools(unittest.TestCase):
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
 
+    def test_removed_profile_grant_does_not_unblock_config(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["spawn"]
+        parent.disabled_toolsets = []
+        delegation_config = {
+            "child_tool_policy": {"mode": "all_configured"},
+            "profile_subagent_tool_grants": {
+                "vegapunk": ["config"],
+            },
+        }
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value=delegation_config,
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Change an agent-owned setting",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["enabled_toolsets"], ["all"])
+        self.assertIn("config", kwargs["disabled_toolsets"])
+        self.assertNotIn("config", kwargs["tool_policy"].denied_names)
+        for blocked in ("memory", "soul", "cronjob", "clarify"):
+            self.assertIn(blocked, DELEGATE_BLOCKED_TOOLS)
+
 
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
@@ -1244,7 +1282,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
 
     def test_heartbeat_does_not_trip_idle_stale_while_waiting_on_model(self):
         """A slow in-flight model wait (api_call_count frozen, no tool) must
-        stay alive when last_activity_ts keeps advancing.
+        stay alive while the child's activity age remains fresh.
 
         Top-level delegate_task runs in the background; the async stall
         monitor already treats ticking last_activity_ts as progress. The sync
@@ -1265,18 +1303,15 @@ class TestDelegateHeartbeat(unittest.TestCase):
         parent._touch_activity = record
 
         child = MagicMock()
-        activity = {"ts": 1000.0}
-
         def _summary():
-            # Frozen iteration / no tool — only the activity clock moves,
-            # matching direct_api_call's mid-wait heartbeats.
-            activity["ts"] += 1.0
+            # Frozen iteration / no tool. direct_api_call's heartbeat keeps
+            # the authoritative activity age near zero.
             return {
                 "current_tool": None,
                 "api_call_count": 1,
                 "max_iterations": 50,
                 "last_activity_desc": "waiting for non-streaming API response",
-                "last_activity_ts": activity["ts"],
+                "seconds_since_activity": 0.01,
             }
 
         child.get_activity_summary.side_effect = _summary
@@ -1947,6 +1982,96 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestConfiguredChildToolPolicy(unittest.TestCase):
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_grant_toolsets": ["browser"]},
+    )
+    def test_schema_description_advertises_child_only_grants(self, _mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        tasks_desc = overrides["parameters"]["properties"]["tasks"]["description"]
+
+        # Upstream keeps the top-level description byte-stable and places
+        # dynamic limits/grants on parameter descriptions.
+        self.assertIn("child-only toolsets", tasks_desc)
+        self.assertIn("browser", tasks_desc)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_grant_toolsets": ["browser"]},
+    )
+    def test_child_adds_operator_grant_outside_parent_scope(self, _mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Browse without exposing browser to the parent",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["enabled_toolsets"], ["terminal", "browser"]
+        )
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "subagent_grant_toolsets": ["delegation", "memory", "browser"]
+        },
+    )
+    def test_child_filters_security_blocked_operator_grants(self, _mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Keep blocked grants blocked",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        enabled = MockAgent.call_args[1]["enabled_toolsets"]
+        self.assertIn("browser", enabled)
+        self.assertNotIn("delegation", enabled)
+        self.assertNotIn("memory", enabled)
+
+
+@patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+def test_named_provider_honors_explicit_api_mode(mock_resolve):
+    mock_resolve.return_value = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "oauth-access-token",
+        "api_mode": "codex_app_server",
+    }
+    creds = _resolve_delegation_credentials(
+        {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+        },
+        _make_mock_parent(depth=0),
+    )
+    assert creds["api_mode"] == "codex_responses"
 
 
 if __name__ == "__main__":

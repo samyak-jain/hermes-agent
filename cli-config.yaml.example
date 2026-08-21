@@ -11,9 +11,12 @@
 # SQLite reports that WAL is incompatible with the filesystem. Set this to
 # "delete" explicitly for deployments whose backing filesystem is not WAL
 # crash-safe, such as Linux containers bind-mounted through macOS virtiofs,
-# NFS, or SMB. Hermes will not live-downgrade a database already open in WAL.
+# NFS, or SMB. TRUNCATE is also available after running the offline journal
+# migration and avoids a directory-entry mutation per commit. Hermes will not
+# live-downgrade a database already open in WAL.
 database:
-  journal_mode: "wal"  # Supported values: "wal", "delete"
+  journal_mode: "wal"  # Supported values: "wal", "delete", "truncate"
+  synchronous: "auto"  # "auto", "normal", "full", or "extra"
   # Optional WAL sizing pragmas (integers). Unset = SQLite defaults.
   # wal_autocheckpoint: 1000     # pages between automatic checkpoints
   # journal_size_limit: 67108864 # cap the WAL/journal file size in bytes
@@ -358,6 +361,12 @@ terminal:
 #   ssh_user: "myuser"
 #   ssh_port: 22
 #   ssh_key: "~/.ssh/id_rsa"  # Optional - uses ssh-agent if not specified
+#   # For systemd-based remote sandboxes, supervise every command remotely so
+#   # gateway crashes cannot leave unbounded processes behind.
+#   ssh_systemd_run: true
+#   ssh_systemd_slice: "hermes-work.slice"
+#   ssh_command_memory_max_mb: 1024
+#   ssh_background_ttl_seconds: 21600  # Six-hour hard lease
 
 # -----------------------------------------------------------------------------
 # OPTION 3: Docker container
@@ -1484,6 +1493,15 @@ delegation:
                                               # The parent TUI owns stdin, so blocking would deadlock; non-interactive resolution is required.
                                               # Both choices emit a logger.warning audit line. Flip to true only for cron/batch pipelines.
   # inherit_mcp_toolsets: true                # When explicit child toolsets are narrowed, also keep the parent's MCP toolsets (default: true). Set false for strict intersection.
+  # profile_subagent_tool_grants:             # Narrow exact-name child grants for one profile.
+  #   coding-coordinator: [config]             # Currently only the config broker is grantable.
+  # child_terminal: {}                        # Shared task-scoped child backend.
+  # profile_child_terminal:                   # Matching profile wins over child_terminal.
+  #   coding-coordinator:
+  #     backend: ssh
+  #     cwd: /workspace
+  #     ssh_host: 10.0.0.20
+  #     ssh_user: agent
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.

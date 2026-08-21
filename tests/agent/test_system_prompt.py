@@ -5,7 +5,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+from agent.system_prompt import (
+    build_app_server_identity_prompt,
+    build_app_server_system_prompt,
+    build_system_prompt,
+    build_app_server_system_prompt_parts,
+    build_system_prompt_parts,
+)
 
 
 def _make_agent(**overrides):
@@ -24,6 +30,11 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _parallel_tool_call_guidance=False,
+        context_compressor=None,
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -484,3 +495,147 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class _PromptMemoryStore:
+    def format_for_system_prompt(self, target):
+        return {
+            "memory": "# Long-term memory\nThe user prefers terse answers.",
+            "user": "# User profile\nThe user's name is Samyak.",
+        }[target]
+
+
+def test_app_server_prompt_keeps_persona_and_full_hermes_context():
+    agent = _make_agent(
+        valid_tool_names={"memory", "session_search", "skill_manage"},
+        _memory_store=_PromptMemoryStore(),
+        pass_session_id=True,
+        session_id="session-123",
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value="# Soul\nBe warm and incisive."),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md says to verify deployments.",
+        ),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        prompt = build_app_server_system_prompt(
+            agent,
+            system_message="Messages can be prefixed with a sender name.",
+        )
+        identity = build_app_server_identity_prompt(agent)
+
+    assert "Be warm and incisive" in prompt
+    assert "AGENTS.md says to verify deployments" in prompt
+    assert "The user prefers terse answers" in prompt
+    assert "The user's name is Samyak" in prompt
+    assert "Messages can be prefixed" in prompt
+    assert "# Operator-defined persona" in identity
+    assert "# Soul\nBe warm and incisive." in identity
+    assert "# Persona precedence" not in identity
+    assert "Session ID: session-123" in prompt
+    assert "You are Hermes Agent" not in prompt
+    assert "You run on Hermes Agent" not in prompt
+
+
+def test_app_server_prompt_parts_keep_soul_once_and_all_context_in_system():
+    agent = _make_agent(
+        valid_tool_names={"memory"},
+        _memory_store=_PromptMemoryStore(),
+        pass_session_id=True,
+        session_id="session-cache-test",
+        model="claude-fable-5",
+        provider="anthropic",
+        ephemeral_system_prompt=(
+            "## Current Session Context\n"
+            "**Source:** Discord (DM with Samyak)"
+        ),
+    )
+    soul = "# Soul\nBe warm, candid, and curious."
+    with (
+        patch("run_agent.load_soul_md", return_value=soul) as load_soul,
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md says to ship verified work.",
+        ) as context_files,
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        parts = build_app_server_system_prompt_parts(
+            agent,
+            system_message="Messages may be prefixed with a sender name.",
+        )
+
+    assert soul in parts["stable"]
+    assert soul not in parts["context"]
+    assert soul not in parts["volatile"]
+    assert "AGENTS.md says to ship verified work" in parts["context"]
+    assert "Messages may be prefixed" in parts["context"]
+    assert "**Source:** Discord (DM with Samyak)" in parts["context"]
+    assert "The user prefers terse answers" in parts["volatile"]
+    assert "The user's name is Samyak" in parts["volatile"]
+    assert "Conversation started:" in parts["volatile"]
+    assert "Session ID: session-cache-test" in parts["volatile"]
+    assert "Model: claude-fable-5" in parts["volatile"]
+    assert "Provider: anthropic" in parts["volatile"]
+    assert "\n\n".join(parts.values()).count(soul) == 1
+    load_soul.assert_called_once()
+    assert context_files.call_args.kwargs["skip_soul"] is True
+
+
+def test_app_server_prompt_keeps_canonical_context_but_omits_native_tool_loop_boilerplate():
+    agent = _make_agent(
+        valid_tool_names={"memory", "session_search"},
+        _memory_store=_PromptMemoryStore(),
+        model="claude-fable-5",
+        provider="anthropic",
+        platform="discord",
+        pass_session_id=True,
+        session_id="session-parity",
+        ephemeral_system_prompt="## Current Session Context\n**Source:** Discord",
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value="# Soul\nStay human."),
+        patch("run_agent.build_environment_hints", return_value="environment"),
+        patch(
+            "run_agent.build_context_files_prompt",
+            return_value="# Project Context\nAGENTS.md",
+        ),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        canonical = build_system_prompt_parts(agent)
+        app_server = build_app_server_system_prompt_parts(agent)
+
+    assert "# Operator-defined persona" in app_server["stable"]
+    assert "# Soul\nStay human." in app_server["stable"]
+    assert "# Persona precedence" not in app_server["stable"]
+    assert "environment" in canonical["stable"]
+    assert "environment" not in app_server["stable"]
+    assert "environment" in app_server["context"]
+    assert "You have persistent memory across sessions" in app_server["context"]
+    assert "session_search" in app_server["context"]
+    assert "## Mid-turn user steering" in app_server["context"]
+    assert "You run on Hermes Agent" in canonical["stable"]
+    assert "You run on Hermes Agent" not in app_server["stable"]
+    assert canonical["context"] in app_server["context"]
+    assert "## Current Session Context\n**Source:** Discord" in app_server["context"]
+    assert app_server["volatile"] == canonical["volatile"]
+
+
+def test_app_server_soul_load_is_scoped_to_agent_profile(tmp_path):
+    profile_home = tmp_path / "profiles" / "worker"
+    agent = _make_agent(
+        _session_db=SimpleNamespace(db_path=profile_home / "state.db"),
+    )
+    with (
+        patch("hermes_constants.get_hermes_home_override", return_value=None),
+        patch("run_agent.load_soul_md", return_value="# Soul") as load_soul,
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("agent.coding_context.coding_system_blocks", return_value=[]),
+    ):
+        build_app_server_system_prompt_parts(agent)
+
+    load_soul.assert_called_once_with(None, home_override=profile_home)

@@ -1,6 +1,13 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
 
+import argparse
+import json
+from dataclasses import fields
+
+import pytest
+import yaml
+
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _EXTRA_KNOWN_ROOT_KEYS,
@@ -75,6 +82,159 @@ class TestMissingModelSection:
         assert not any("no 'model' section" in i.message for i in issues)
 
 
+class TestExactToolPolicyValidation:
+    def test_typed_gateway_fields_are_derived_from_dataclasses(self):
+        from gateway.config import ChannelOverride, SessionResetPolicy, StreamingConfig
+
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "123": {
+                                field.name: None for field in fields(ChannelOverride)
+                            }
+                        }
+                    }
+                },
+                "session_reset": {
+                    field.name: None for field in fields(SessionResetPolicy)
+                },
+                "streaming": {
+                    **{field.name: None for field in fields(StreamingConfig)},
+                    "mode": "auto",
+                },
+            },
+            source="managed:/etc/hermes/config.yaml",
+            unknown_severity="error",
+        )
+
+        assert not [issue for issue in issues if "Unknown typed config key" in issue.message]
+
+    def test_valid_global_and_channel_policies(self):
+        issues = validate_config_structure({
+            "agent": {"tool_policy": {
+                "mode": "allowlist",
+                "tools": ["memory"],
+                "gateway_override_authority": "managed_only",
+            }},
+            "platforms": {"discord": {"channel_overrides": {
+                "123": {"tool_policy": {"mode": "unrestricted"}},
+            }}},
+        })
+        assert not [issue for issue in issues if "tool policy" in issue.message]
+
+    def test_valid_cron_policy(self):
+        issues = validate_config_structure({
+            "cron": {"tool_policy": {
+                "mode": "allowlist",
+                "tools": ["delegate_task", "memory"],
+            }},
+        })
+
+        assert not [issue for issue in issues if "cron.tool_policy" in issue.message]
+
+    def test_malformed_cron_policy_is_an_error(self):
+        issues = validate_config_structure({
+            "cron": {"tool_policy": {
+                "mode": "unrestricted",
+                "tools": ["delegate_task"],
+            }},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "cron.tool_policy" in issue.message
+            for issue in issues
+        )
+
+    def test_malformed_channel_policy_is_an_error(self):
+        issues = validate_config_structure({
+            "platforms": {"discord": {"channel_overrides": {
+                "123": {"tool_policy": {"mode": "unrestricted", "tools": ["terminal"]}},
+            }}},
+        })
+        assert any(
+            issue.severity == "error" and "only valid" in issue.message
+            for issue in issues
+        )
+
+    def test_legacy_discord_layout_uses_same_channel_policy_validation(self):
+        issues = validate_config_structure({
+            "discord": {"channel_overrides": {
+                "123": {
+                    "tool_policy": {
+                        "mode": "unrestricted",
+                        "tools": ["terminal"],
+                    }
+                },
+            }},
+        })
+
+        assert any(
+            issue.severity == "error"
+            and "discord.channel_overrides.123.tool_policy" in issue.message
+            for issue in issues
+        )
+
+    def test_removed_profile_policy_key_is_flagged_unknown(self):
+        """profile_tool_policies was removed with multi-profile support."""
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": {
+                                "profile_tool_policies": {
+                                    "vegapunk": {"mode": "denylist"},
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            source="managed:/etc/hermes/config.yaml",
+            unknown_severity="error",
+        )
+
+        assert any(
+            issue.severity == "error"
+            and issue.path.endswith("operator-room.profile_tool_policies")
+            for issue in issues
+        )
+
+    def test_unknown_tool_policy_key_surfaces_source_and_dotted_path(self):
+        issues = validate_config_structure(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": {
+                                "tool_policy": {
+                                    "mode": "denylist",
+                                    "tools": ["delegate_task"],
+                                    "toolsets": ["terminal"],
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            source="managed:/nix/store/kumo-config.yaml",
+            unknown_severity="error",
+        )
+
+        issue = next(issue for issue in issues if issue.path.endswith(".toolsets"))
+        assert issue.severity == "error"
+        assert issue.source == "managed:/nix/store/kumo-config.yaml"
+        assert issue.path == (
+            "platforms.discord.channel_overrides.operator-room."
+            "tool_policy.toolsets"
+        )
+        assert issue.source in issue.message
+        assert issue.path in issue.message
+
+
 class TestConfigIssueDataclass:
     """ConfigIssue should be a proper dataclass."""
 
@@ -111,6 +271,77 @@ class TestVoiceSubmitModeValidation:
         )
 
 
+def test_managed_config_validate_command_is_ci_strict_and_value_free(
+    tmp_path,
+    capsys,
+):
+    from hermes_cli.config import config_command
+
+    managed = tmp_path / "managed-config.yaml"
+    managed.write_text(
+        yaml.safe_dump(
+            {
+                "platforms": {
+                    "discord": {
+                        "channel_overrides": {
+                            "operator-room": {
+                                "tool_policy": {
+                                    "mode": "denylist",
+                                    "tools": ["delegate_task"],
+                                    "ignored_typo": "private-value-must-not-print",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        config_command(
+            argparse.Namespace(
+                config_command="validate",
+                managed=str(managed),
+                json=True,
+            )
+        )
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["success"] is False
+    assert payload["issues"][0]["severity"] == "error"
+    assert payload["issues"][0]["path"].endswith(
+        "tool_policy.ignored_typo"
+    )
+    assert "private-value-must-not-print" not in output
+
+
+def test_cache_invalidation_preserves_last_known_good_policy(tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "approvals:\n  deny:\n    - 'curl*evil.example*'\n",
+        encoding="utf-8",
+    )
+    config_module.invalidate_config_caches(config_path)
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
+
+    config_path.write_text("approvals:\n  deny: [unclosed\n", encoding="utf-8")
+    config_module.invalidate_config_caches(config_path)
+
+    assert config_module.load_config()["approvals"]["deny"] == [
+        "curl*evil.example*"
+    ]
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
@@ -140,4 +371,3 @@ class TestUnknownTopLevelKeys:
         ]
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
-

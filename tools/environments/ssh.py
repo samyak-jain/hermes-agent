@@ -1,5 +1,6 @@
 """SSH remote execution environment with ControlMaster connection persistence."""
 
+import atexit
 import hashlib
 import logging
 import os
@@ -13,6 +14,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 
 from tools.environments.base import (
@@ -29,6 +32,87 @@ from tools.environments.file_sync import (
 )
 
 logger = logging.getLogger(__name__)
+
+_control_dir: Path | None = None
+_control_dir_identity: tuple[int, int | None] | None = None
+_control_dir_lock = threading.Lock()
+
+_REMOTE_EXECUTABLE_CANDIDATES = {
+    "bash": ("/run/current-system/sw/bin/bash", "/usr/bin/bash", "/bin/bash"),
+    "mkdir": (
+        "/run/current-system/sw/bin/mkdir",
+        "/usr/bin/mkdir",
+        "/bin/mkdir",
+    ),
+    "rm": ("/run/current-system/sw/bin/rm", "/usr/bin/rm", "/bin/rm"),
+    "systemd-run": (
+        "/run/current-system/sw/bin/systemd-run",
+        "/usr/bin/systemd-run",
+        "/bin/systemd-run",
+    ),
+    "systemctl": (
+        "/run/current-system/sw/bin/systemctl",
+        "/usr/bin/systemctl",
+        "/bin/systemctl",
+    ),
+    "sleep": (
+        "/run/current-system/sw/bin/sleep",
+        "/usr/bin/sleep",
+        "/bin/sleep",
+    ),
+    "tail": (
+        "/run/current-system/sw/bin/tail",
+        "/usr/bin/tail",
+        "/bin/tail",
+    ),
+}
+
+
+def _get_control_dir() -> Path:
+    """Return a private SSH control directory for this process identity.
+
+    A fixed shared ``/tmp/hermes-ssh`` directory can be created by a root
+    diagnostic process before the unprivileged gateway reaches it.  The
+    gateway can then read the directory but cannot create ControlMaster
+    sockets, breaking every SSH-backed cron or child environment until the
+    container restarts.  ``mkdtemp`` gives each process identity an
+    unpredictable, mode-0700 directory, so differently privileged processes
+    cannot poison one another.
+
+    Include the effective UID in the cache identity as well as the PID because
+    a process may construct an environment before and after dropping
+    privileges.  ``geteuid`` is unavailable on Windows, where the system temp
+    directory is already user-scoped.
+    """
+    global _control_dir, _control_dir_identity
+
+    get_euid = getattr(os, "geteuid", None)
+    identity = (os.getpid(), get_euid() if get_euid is not None else None)
+    with _control_dir_lock:
+        if _control_dir is not None and _control_dir_identity == identity:
+            return _control_dir
+
+        # Keep the prefix short: macOS has a 104-byte Unix-socket path limit
+        # and OpenSSH appends its own 17-byte temporary suffix.
+        control_dir = Path(tempfile.mkdtemp(prefix="h-"))
+        control_dir.chmod(0o700)
+        _control_dir = control_dir
+        _control_dir_identity = identity
+        return control_dir
+
+
+def _cleanup_control_dir() -> None:
+    global _control_dir, _control_dir_identity
+
+    with _control_dir_lock:
+        control_dir = _control_dir
+        _control_dir = None
+        _control_dir_identity = None
+    if control_dir is not None:
+        shutil.rmtree(control_dir, ignore_errors=True)
+
+
+atexit.register(_cleanup_control_dir)
 
 
 def _ensure_ssh_available() -> None:
@@ -52,41 +136,71 @@ class SSHEnvironment(BaseEnvironment):
     Uses SSH ControlMaster for connection reuse.
     """
 
-    def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        cwd: str = "~",
+        timeout: int = 60,
+        port: int = 22,
+        key_path: str = "",
+        known_hosts_path: str = "",
+        sync_files: bool = True,
+        task_id: str = "default",
+        systemd_run: bool = False,
+        systemd_slice: str = "",
+        command_memory_max_mb: int = 0,
+        background_ttl_seconds: int = 86400,
+    ):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
+        self.known_hosts_path = known_hosts_path
+        self.task_id = str(task_id or "default")
+        self.systemd_run = bool(systemd_run)
+        self.systemd_slice = str(systemd_slice or "").strip()
+        self.command_memory_max_mb = max(int(command_memory_max_mb or 0), 0)
+        self.background_ttl_seconds = max(int(background_ttl_seconds or 0), 60)
+        self._task_hash = hashlib.sha256(self.task_id.encode()).hexdigest()[:10]
+        self._unit_lock = threading.Lock()
+        self._owned_units: set[str] = set()
+        self._remote_executable_cache: dict[str, str] = {}
 
-        self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
-        self.control_dir.mkdir(parents=True, exist_ok=True)
-        # Keep the socket filename short and deterministic so the full path
-        # stays under the 104-byte sun_path limit that macOS enforces on
-        # Unix domain sockets. A raw ``user@host:port`` — especially with an
-        # IPv6 host — plus the 16-byte random suffix SSH appends in
-        # ControlMaster mode easily exceeds the limit under macOS's
-        # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Hashing the
-        # triple keeps the path stable across reconnects so ControlMaster
-        # reuse still works.
+        self.control_dir = _get_control_dir()
+        # Keep the socket filename short so the full path stays under the
+        # 104-byte sun_path limit that macOS enforces on Unix domain sockets.
+        # A raw ``user@host:port`` — especially with an IPv6 host — plus the
+        # 16-byte random suffix SSH appends in ControlMaster mode easily
+        # exceeds the limit under macOS's deeply-nested $TMPDIR (e.g.
+        # /var/folders/xx/yy/T/).
+        #
+        # Each environment must own its master exclusively. Environments for
+        # concurrent tasks can target the same host, and cleanup() terminates
+        # its master with ``ssh -O exit``. Sharing a deterministic socket made
+        # one task's cleanup disconnect another task's active foreground
+        # command, surfacing completed remote side effects as local exit 255.
+        # Commands within this environment still reuse this stable socket.
         _socket_id = hashlib.sha256(
-            f"{user}@{host}:{port}".encode()
+            f"{user}@{host}:{port}:{uuid.uuid4().hex}".encode()
         ).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        self._sync_manager = None
+        if sync_files:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
 
         self.init_session()
 
@@ -97,7 +211,11 @@ class SSHEnvironment(BaseEnvironment):
             cmd.extend(["-o", "ControlMaster=auto"])
             cmd.extend(["-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes"])
-        cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        if self.known_hosts_path:
+            cmd.extend(["-o", f"UserKnownHostsFile={self.known_hosts_path}"])
+            cmd.extend(["-o", "StrictHostKeyChecking=yes"])
+        else:
+            cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         cmd.extend(["-o", "ConnectTimeout=10"])
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])
@@ -394,25 +512,463 @@ class SSHEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
+
+    def _new_unit_name(self, kind: str) -> str:
+        return f"hermes-{kind}-{self._task_hash}-{uuid.uuid4().hex[:10]}"
+
+    def _resolve_remote_executable(
+        self,
+        name: str,
+        candidates: tuple[str, ...],
+    ) -> str:
+        """Resolve and cache an absolute executable path on the SSH target.
+
+        Transient systemd services commonly receive a much narrower PATH than
+        an interactive SSH login.  In particular, NixOS exposes core tools
+        under ``/run/current-system/sw/bin`` rather than ``/bin``.  Resolve the
+        executable while we still have the login shell, then pass the absolute
+        path into the unit so service startup never depends on that restricted
+        PATH.
+        """
+        cached = self._remote_executable_cache.get(name)
+        if cached:
+            return cached
+        requirements = dict(_REMOTE_EXECUTABLE_CANDIDATES)
+        requirements[name] = candidates
+        self._resolve_remote_executables(requirements)
+        return self._remote_executable_cache[name]
+
+    def _resolve_remote_executables(
+        self,
+        requirements: dict[str, tuple[str, ...]],
+    ) -> None:
+        missing = {
+            name: candidates
+            for name, candidates in requirements.items()
+            if name not in self._remote_executable_cache
+        }
+        if not missing:
+            return
+        statements = ["set -e"]
+        for name, candidates in missing.items():
+            quoted_candidates = " ".join(
+                shlex.quote(path) for path in candidates
+            )
+            statements.append(
+                f"_hermes_path=''; for _hermes_exe in {quoted_candidates}; do "
+                'if [ -x "$_hermes_exe" ]; then _hermes_path="$_hermes_exe"; '
+                "break; fi; done; "
+                f"if [ -z \"$_hermes_path\" ]; then _hermes_path=$(command -v "
+                f"{shlex.quote(name)} 2>/dev/null || true); fi; "
+                'case "$_hermes_path" in /*) ;; *) exit 127 ;; esac; '
+                f"printf '%s=%s\\n' {shlex.quote(name)} \"$_hermes_path\""
+            )
+        cmd = self._build_ssh_command()
+        cmd.append("; ".join(statements))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        resolved = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, path = line.partition("=")
+            if separator and key in missing and path.startswith("/"):
+                resolved[key] = path.strip()
+        if result.returncode != 0 or set(resolved) != set(missing):
+            diagnostic = (result.stderr or result.stdout or "").strip()
+            suffix = f": {diagnostic}" if diagnostic else ""
+            unresolved = sorted(set(missing) - set(resolved))
+            raise RuntimeError(
+                "SSH target has no absolute path for required executable(s) "
+                f"{', '.join(unresolved)}{suffix}"
+            )
+        self._remote_executable_cache.update(resolved)
+
+    def _systemd_properties(self, *, runtime_seconds: int) -> list[str]:
+        properties = [
+            f"--property=RuntimeMaxSec={max(int(runtime_seconds), 1)}s",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=5s",
+        ]
+        if self.command_memory_max_mb > 0:
+            memory_high_mb = max(int(self.command_memory_max_mb * 0.8), 1)
+            properties.extend([
+                f"--property=MemoryHigh={memory_high_mb}M",
+                f"--property=MemoryMax={self.command_memory_max_mb}M",
+            ])
+        if self.systemd_slice:
+            properties.append(f"--slice={self.systemd_slice}")
+        return properties
+
+    @staticmethod
+    def _remote_shell_argv(cmd_string: str, *, login: bool) -> list[str]:
+        argv = ["bash"]
+        if login:
+            argv.append("-l")
+        argv.extend(["-c", cmd_string])
+        return argv
+
+    def _stop_remote_units(self, units: list[str]) -> None:
+        if not units:
+            return
+        quoted_units = " ".join(shlex.quote(unit) for unit in units)
+        try:
+            systemctl = self._resolve_remote_executable(
+                "systemctl", _REMOTE_EXECUTABLE_CANDIDATES["systemctl"]
+            )
+            cmd = self._build_ssh_command()
+            cmd.append(
+                f"{shlex.quote(systemctl)} stop --no-block "
+                f"{quoted_units} >/dev/null 2>&1 || true"
+            )
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=8,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn an SSH process that runs bash on the remote host."""
         cmd = self._build_ssh_command()
-        if login:
-            cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
+        unit = None
+        if self.systemd_run:
+            unit = self._new_unit_name("cmd")
+            # The local wait loop remains the primary timeout reporter. The
+            # remote unit gets a five-second backstop so a killed/OOM'd gateway
+            # cannot leave the command running indefinitely.
+            remote_argv = [
+                "systemd-run",
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                f"--unit={unit}",
+                *self._systemd_properties(runtime_seconds=int(timeout) + 5),
+                *self._remote_shell_argv(cmd_string, login=login),
+            ]
+            cmd.append(shlex.join(remote_argv))
+            with self._unit_lock:
+                self._owned_units.add(unit)
         else:
-            cmd.extend(["bash", "-c", shlex.quote(cmd_string)])
+            if login:
+                cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
+            else:
+                cmd.extend(["bash", "-c", shlex.quote(cmd_string)])
 
-        return _popen_bash(cmd, stdin_data)
+        proc = _popen_bash(cmd, stdin_data)
+        if unit:
+            setattr(proc, "_hermes_remote_systemd_unit", unit)
+        return proc
+
+    def _kill_process(self, proc):
+        """Stop the remote cgroup as well as the local SSH client."""
+        unit = getattr(proc, "_hermes_remote_systemd_unit", "")
+        if unit:
+            self._stop_remote_units([unit])
+            with self._unit_lock:
+                self._owned_units.discard(unit)
+        super()._kill_process(proc)
+
+    def _wait_for_process(
+        self,
+        proc,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+    ):
+        try:
+            return super()._wait_for_process(
+                proc, timeout=timeout, bounded_capture=bounded_capture
+            )
+        finally:
+            unit = getattr(proc, "_hermes_remote_systemd_unit", "")
+            if unit:
+                with self._unit_lock:
+                    self._owned_units.discard(unit)
+
+    def build_background_command(
+        self,
+        *,
+        command: str,
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+        ttl_seconds: int | None = None,
+        cwd: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Build a leased transient service for a sandbox background process."""
+        if not self.systemd_run:
+            return None
+
+        unit = self._new_unit_name("bg")
+        ttl = max(int(ttl_seconds or self.background_ttl_seconds), 60)
+        remote_bash = self._resolve_remote_executable(
+            "bash",
+            ("/run/current-system/sw/bin/bash", "/usr/bin/bash", "/bin/bash"),
+        )
+        remote_systemd_run = self._resolve_remote_executable(
+            "systemd-run",
+            (
+                "/run/current-system/sw/bin/systemd-run",
+                "/usr/bin/systemd-run",
+                "/bin/systemd-run",
+            ),
+        )
+        remote_systemctl = self._resolve_remote_executable(
+            "systemctl",
+            (
+                "/run/current-system/sw/bin/systemctl",
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+            ),
+        )
+        remote_sleep = self._resolve_remote_executable(
+            "sleep",
+            (
+                "/run/current-system/sw/bin/sleep",
+                "/usr/bin/sleep",
+                "/bin/sleep",
+            ),
+        )
+        remote_tail = self._resolve_remote_executable(
+            "tail",
+            (
+                "/run/current-system/sw/bin/tail",
+                "/usr/bin/tail",
+                "/bin/tail",
+            ),
+        )
+        remote_mkdir = self._resolve_remote_executable(
+            "mkdir", _REMOTE_EXECUTABLE_CANDIDATES["mkdir"]
+        )
+        remote_rm = self._resolve_remote_executable(
+            "rm", _REMOTE_EXECUTABLE_CANDIDATES["rm"]
+        )
+
+        working_directory = str(cwd or self.cwd or "").strip()
+        if working_directory == "~":
+            working_directory = self._remote_home
+        elif working_directory.startswith("~/"):
+            working_directory = f"{self._remote_home}/{working_directory[2:]}"
+
+        inner = (
+            f"set +e; printf '%s\\n' \"$BASHPID\" > {shlex.quote(pid_path)}; "
+            f"( eval \"$1\" ) > {shlex.quote(log_path)} 2>&1; "
+            "rc=$?; "
+            f"printf '%s\\n' \"$rc\" > {shlex.quote(exit_path)}; "
+            "exit \"$rc\""
+        )
+        remote_argv = [
+            remote_systemd_run,
+            "--quiet",
+            "--collect",
+            # systemd-run expands $VAR/$$ in command argv by default.  The old
+            # wrapper's "$$" therefore reached Bash as a literal "$", corrupting
+            # the PID file.  The unit shell owns all expansion here.
+            "--expand-environment=no",
+            f"--unit={unit}",
+            *self._systemd_properties(runtime_seconds=ttl),
+        ]
+        if working_directory.startswith("/"):
+            remote_argv.append(f"--working-directory={working_directory}")
+        remote_argv.extend([
+            "--",
+            remote_bash,
+            "-lc",
+            inner,
+            "hermes-background-command",
+            command,
+        ])
+
+        launcher = (
+            "set +e; "
+            f"{shlex.quote(remote_mkdir)} -p "
+            f"{shlex.quote(str(Path(log_path).parent))}; "
+            f"{shlex.quote(remote_rm)} -f {shlex.quote(log_path)} "
+            f"{shlex.quote(pid_path)} "
+            f"{shlex.quote(exit_path)}; "
+            f"{shlex.join(remote_argv)}; "
+            "_hermes_launch_rc=$?; "
+            'if [ "$_hermes_launch_rc" -ne 0 ]; then '
+            'exit "$_hermes_launch_rc"; fi; '
+            "for _hermes_wait in {1..20}; do "
+            f"[ -s {shlex.quote(pid_path)} ] && break; "
+            f"{shlex.quote(remote_systemctl)} is-active --quiet "
+            f"{shlex.quote(unit)} || break; "
+            f"{shlex.quote(remote_sleep)} 0.1; "
+            "done; "
+            f"if [ ! -s {shlex.quote(pid_path)} ]; then "
+            f"{shlex.quote(remote_systemctl)} show {shlex.quote(unit)} "
+            "--property=ActiveState,SubState,Result,ExecMainStatus "
+            "--no-pager >&2 || true; "
+            "exit 1; fi; "
+            f"IFS= read -r _hermes_pid < {shlex.quote(pid_path)}; "
+            'if [[ ! "$_hermes_pid" =~ ^[0-9]+$ ]] || '
+            '(( _hermes_pid <= 0 )); then '
+            'printf \'Invalid background PID handshake: %s\\n\' '
+            '"$_hermes_pid" >&2; exit 1; fi; '
+            # Give commands that fail during shell startup a brief chance to
+            # publish their exit record before we promise a live background
+            # session. Successful fast commands remain valid and are reaped by
+            # the normal poller.
+            f"{shlex.quote(remote_sleep)} 0.1; "
+            f"if [ -s {shlex.quote(exit_path)} ]; then "
+            f"IFS= read -r _hermes_exit < {shlex.quote(exit_path)}; "
+            'if [[ "$_hermes_exit" =~ ^-?[0-9]+$ ]] && '
+            '(( _hermes_exit != 0 )); then '
+            f"{shlex.quote(remote_tail)} -c 4096 -- "
+            f"{shlex.quote(log_path)} >&2 || true; "
+            'exit "$_hermes_exit"; fi; fi; '
+            "printf 'HERMES_BG_PID=%s\\n' \"$_hermes_pid\""
+        )
+        launch = shlex.join(
+            [remote_bash, "-c", launcher, "hermes-background-launcher"]
+        )
+        with self._unit_lock:
+            self._owned_units.add(unit)
+        return launch, unit
+
+    def launch_background_command(self, command: str, *, timeout: int = 10) -> dict:
+        """Launch a prebuilt background unit directly over SSH.
+
+        Calling ``execute()`` here would wrap the launcher in the foreground
+        systemd-run path, creating a nested transient unit with a restricted
+        PATH before the real background service is even started.
+        """
+        self._before_execute()
+        cmd = self._build_ssh_command()
+        cmd.append(command)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            parts = []
+            for part in (exc.stdout, exc.stderr):
+                if isinstance(part, bytes):
+                    part = part.decode("utf-8", errors="replace")
+                if part:
+                    parts.append(part)
+            output = "".join(parts)
+            return {
+                "output": output or "SSH background launcher timed out",
+                "returncode": 124,
+            }
+        output_parts = [
+            part.strip()
+            for part in (result.stdout or "", result.stderr or "")
+            if part and part.strip()
+        ]
+        return {
+            "output": "\n".join(output_parts),
+            "returncode": int(result.returncode),
+        }
+
+    def poll_background_unit(
+        self,
+        unit: str,
+        *,
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+        timeout: int = 10,
+    ) -> dict:
+        if not unit.startswith("hermes-bg-"):
+            raise ValueError("Refusing to poll a non-Hermes background unit")
+        systemctl = self._resolve_remote_executable(
+            "systemctl", _REMOTE_EXECUTABLE_CANDIDATES["systemctl"]
+        )
+        tail = self._resolve_remote_executable(
+            "tail", _REMOTE_EXECUTABLE_CANDIDATES["tail"]
+        )
+        marker = "HERMES_BG_LOG_FOLLOWS"
+        script = (
+            "set +e; _hermes_active=unknown; _hermes_status=''; "
+            f"while IFS='=' read -r _hermes_key _hermes_value; do "
+            'case "$_hermes_key" in '
+            'ActiveState) _hermes_active="$_hermes_value" ;; '
+            'ExecMainStatus) _hermes_status="$_hermes_value" ;; esac; done < <('
+            f"{shlex.quote(systemctl)} show {shlex.quote(unit)} "
+            "--property=ActiveState,ExecMainStatus --no-pager 2>/dev/null); "
+            f"if [ -s {shlex.quote(exit_path)} ]; then "
+            f"IFS= read -r _hermes_exit < {shlex.quote(exit_path)}; "
+            "_hermes_running=0; "
+            "else case \"$_hermes_active\" in "
+            "active|activating|reloading|deactivating) _hermes_running=1 ;; "
+            "*) _hermes_running=0; _hermes_exit=$_hermes_status ;; esac; fi; "
+            "printf 'HERMES_BG_RUNNING=%s\\nHERMES_BG_EXIT=%s\\n' "
+            '"$_hermes_running" "$_hermes_exit"; '
+            f"printf '{marker}\\n'; "
+            f"{shlex.quote(tail)} -c +1 -- {shlex.quote(log_path)} "
+            "2>/dev/null || true"
+        )
+        cmd = self._build_ssh_command()
+        cmd.append(script)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"SSH background poll failed for {unit}: {diagnostic}"
+            )
+        header, separator, output = (result.stdout or "").partition(
+            f"{marker}\n"
+        )
+        if not separator:
+            raise RuntimeError(f"Invalid SSH background poll response for {unit}")
+        values = {}
+        for line in header.splitlines():
+            key, found, value = line.partition("=")
+            if found:
+                values[key] = value.strip()
+        exit_value = values.get("HERMES_BG_EXIT", "")
+        return {
+            "output": output,
+            "running": values.get("HERMES_BG_RUNNING") == "1",
+            "exit_code": int(exit_value) if exit_value else None,
+        }
+
+    def kill_background_unit(self, unit: str) -> None:
+        if not unit.startswith("hermes-bg-"):
+            raise ValueError("Refusing to stop a non-Hermes background unit")
+        self._stop_remote_units([unit])
+        with self._unit_lock:
+            self._owned_units.discard(unit)
+
+    def release_background_unit(self, unit: str) -> None:
+        """Forget a naturally completed transient unit."""
+        with self._unit_lock:
+            self._owned_units.discard(unit)
 
     def cleanup(self):
+        with self._unit_lock:
+            owned_units = list(self._owned_units)
+            self._owned_units.clear()
+        self._stop_remote_units(owned_units)
+
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()

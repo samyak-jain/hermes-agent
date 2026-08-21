@@ -447,6 +447,7 @@ class AIAgent:
         tool_delay: float = None,  # Deprecated: accepted for compatibility, ignored
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        tool_policy=None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -538,6 +539,7 @@ class AIAgent:
             max_iterations=max_iterations,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            tool_policy=tool_policy,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,
@@ -4558,19 +4560,36 @@ class AIAgent:
             pass
 
         task_id = getattr(self, "session_id", None) or ""
+        durable_background_active = False
 
-        # 1. Kill background processes for this task
+        # 1. Kill disposable background processes for this task. A process
+        # created with notify_on_complete=True is an explicit durable wake-up:
+        # keep it registered across this per-turn agent teardown so the
+        # gateway watcher can re-enter the session when it exits.
         try:
             from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
+            process_registry.kill_all(
+                task_id=task_id,
+                preserve_notify_on_complete=True,
+            )
+            durable_background_active = process_registry.has_active_processes(
+                task_id
+            )
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
-        try:
-            cleanup_vm(task_id)
-        except Exception:
-            pass
+        # 2. Clean terminal sandbox environments unless a durable background
+        # process still owns one. SSH cleanup stops every transient unit owned
+        # by the environment; doing that here would kill the notifying process
+        # we deliberately preserved above. The registry poller keeps the live
+        # environment active and the ordinary idle reaper cleans it after the
+        # process exits. Full gateway shutdown still uses kill_all's hard
+        # cleanup default, so this does not leak work across process lifetime.
+        if not durable_background_active:
+            try:
+                cleanup_vm(task_id)
+            except Exception:
+                pass
 
         # 3. Clean browser daemon sessions
         try:
@@ -8389,6 +8408,20 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _dispatch_spawn_agent(self, function_args: dict) -> str:
+        """Dispatch the agent-owned fire-and-forget subagent tool."""
+        from tools.spawn_tool import spawn_agent as _spawn_agent
+
+        return _spawn_agent(
+            prompt=function_args.get("prompt"),
+            label=function_args.get("label"),
+            cancel_id=function_args.get("cancel_id"),
+            result_id=function_args.get("result_id"),
+            offset=function_args.get("offset"),
+            limit=function_args.get("limit"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
@@ -8976,15 +9009,25 @@ class AIAgent:
     def _run_codex_app_server_turn(
         self,
         *,
-        user_message: str,
+        user_message: Any,
         original_user_message: Any,
         messages: List[Dict[str, Any]],
         effective_task_id: str,
+        system_message: Optional[str] = None,
         should_review_memory: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            system_message=system_message,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,

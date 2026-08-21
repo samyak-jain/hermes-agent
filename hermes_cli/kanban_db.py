@@ -2369,15 +2369,18 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                from hermes_state import apply_sqlite_storage_policy
+                journal_mode = apply_sqlite_storage_policy(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                # Bound the WAL file size now that the periodic explicit
-                # checkpoint is PASSIVE (never truncates): on the writer's
-                # natural post-checkpoint reset SQLite trims the -wal file
-                # to this limit. 8 MiB is generous for a kanban board.
-                conn.execute("PRAGMA journal_size_limit=8388608")
+                if journal_mode == "wal":
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
+                    # Bound the WAL file size now that the periodic explicit
+                    # checkpoint is PASSIVE (never truncates): on the writer's
+                    # natural post-checkpoint reset SQLite trims the -wal file
+                    # to this limit. 8 MiB is generous for a kanban board.
+                    conn.execute("PRAGMA journal_size_limit=8388608")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -2429,17 +2432,20 @@ def connect(
                 # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
                 # falls back to DELETE with one ERROR log so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                from hermes_state import apply_sqlite_storage_policy
+                journal_mode = apply_sqlite_storage_policy(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                # Bound the WAL file size now that the periodic explicit
-                # checkpoint is PASSIVE (never truncates): on the writer's
-                # natural post-checkpoint reset SQLite trims the -wal file
-                # to this limit. 8 MiB is generous for a kanban board.
-                conn.execute("PRAGMA journal_size_limit=8388608")
+                if journal_mode == "wal":
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
+                    # Bound the WAL file size now that the periodic explicit
+                    # checkpoint is PASSIVE (never truncates): on the writer's
+                    # natural post-checkpoint reset SQLite trims the -wal file
+                    # to this limit. 8 MiB is generous for a kanban board.
+                    conn.execute("PRAGMA journal_size_limit=8388608")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
                 # cell content; persisted in the DB header for new DBs.

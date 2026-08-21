@@ -1239,9 +1239,17 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     per-task sandbox settings (e.g., a custom Dockerfile for the Modal image).
 
     Supported override keys:
+        - env_type: str -- Terminal backend for this task only
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - ssh_host/ssh_user/ssh_port/ssh_key: SSH connection settings
+        - ssh_known_hosts_file: str -- Pinned SSH known-hosts file
+        - ssh_sync_files: bool -- Whether to sync Hermes files to the remote
+        - ssh_systemd_run: bool -- Run commands in remote transient units
+        - ssh_systemd_slice: str -- Optional remote systemd slice
+        - ssh_command_memory_max_mb: int -- Per-command remote memory ceiling
+        - ssh_background_ttl_seconds: int -- Hard lease for background commands
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1451,6 +1459,35 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
         # Already an in-container path, not a host workspace.
         return None
     return candidate
+
+
+def get_task_env_config(task_id: Optional[str]) -> Dict[str, Any]:
+    """Return terminal configuration with trusted per-task overrides applied.
+
+    The process-wide environment remains authoritative for ordinary sessions.
+    Infrastructure callers can register a task-specific backend before an
+    agent run, allowing a child to execute remotely without changing its
+    parent's terminal environment or mutating process-global ``os.environ``.
+    """
+    config = dict(_get_env_config())
+    overrides = resolve_task_overrides(task_id)
+    supported = {
+        "env_type",
+        "ssh_host",
+        "ssh_user",
+        "ssh_port",
+        "ssh_key",
+        "ssh_known_hosts_file",
+        "ssh_sync_files",
+        "ssh_systemd_run",
+        "ssh_systemd_slice",
+        "ssh_command_memory_max_mb",
+        "ssh_background_ttl_seconds",
+    }
+    for key in supported:
+        if key in overrides:
+            config[key] = overrides[key]
+    return config
 
 
 # Configuration from environment variables
@@ -1663,6 +1700,16 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_systemd_run": os.getenv(
+            "TERMINAL_SSH_SYSTEMD_RUN", "false"
+        ).lower() in {"true", "1", "yes"},
+        "ssh_systemd_slice": os.getenv("TERMINAL_SSH_SYSTEMD_SLICE", ""),
+        "ssh_command_memory_max_mb": _parse_env_var(
+            "TERMINAL_SSH_COMMAND_MEMORY_MAX_MB", "0"
+        ),
+        "ssh_background_ttl_seconds": _parse_env_var(
+            "TERMINAL_SSH_BACKGROUND_TTL_SECONDS", "86400"
+        ),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1723,7 +1770,15 @@ def _ssh_config_from_config(config: Dict[str, Any]) -> dict:
         "user": config.get("ssh_user", ""),
         "port": config.get("ssh_port", 22),
         "key": config.get("ssh_key", ""),
+        "known_hosts_file": config.get("ssh_known_hosts_file", ""),
+        "sync_files": config.get("ssh_sync_files", True),
         "persistent": config.get("ssh_persistent", False),
+        "systemd_run": config.get("ssh_systemd_run", False),
+        "systemd_slice": config.get("ssh_systemd_slice", ""),
+        "command_memory_max_mb": config.get("ssh_command_memory_max_mb", 0),
+        "background_ttl_seconds": config.get(
+            "ssh_background_ttl_seconds", 86400
+        ),
     }
 
 
@@ -1934,8 +1989,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             user=ssh_config["user"],
             port=ssh_config.get("port", 22),
             key_path=ssh_config.get("key", ""),
+            known_hosts_path=ssh_config.get("known_hosts_file", ""),
+            sync_files=ssh_config.get("sync_files", True),
             cwd=cwd,
             timeout=timeout,
+            task_id=task_id,
+            systemd_run=ssh_config.get("systemd_run", False),
+            systemd_slice=ssh_config.get("systemd_slice", ""),
+            command_memory_max_mb=ssh_config.get("command_memory_max_mb", 0),
+            background_ttl_seconds=ssh_config.get("background_ttl_seconds", 86400),
         )
 
     else:
@@ -2658,7 +2720,7 @@ def terminal_tool(
             }, ensure_ascii=False)
 
         # Get configuration
-        config = _get_env_config()
+        config = get_task_env_config(task_id)
         env_type = config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
@@ -3090,6 +3152,30 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                    )
+
+                if proc_session.exited:
+                    from agent.redact import redact_terminal_output
+
+                    diagnostic = (proc_session.output_buffer or "").strip()
+                    if diagnostic:
+                        diagnostic = redact_terminal_output(diagnostic, command)
+                    else:
+                        diagnostic = "Remote background launcher exited before startup"
+                    exit_code = proc_session.exit_code
+                    if exit_code is None or exit_code == 0:
+                        exit_code = -1
+                    return json.dumps(
+                        {
+                            "output": "",
+                            "session_id": proc_session.id,
+                            "pid": proc_session.pid,
+                            "exit_code": exit_code,
+                            "error": diagnostic,
+                            "status": "failed_start",
+                            "completion_reason": proc_session.completion_reason,
+                        },
+                        ensure_ascii=False,
                     )
 
                 result_data = {

@@ -101,6 +101,10 @@ class TestPlatformConfigRoundtrip:
                     model="openrouter/healer-alpha",
                     provider="openrouter",
                     system_prompt="You are a daily news summarizer.",
+                    tool_policy={
+                        "mode": "allowlist",
+                        "tools": ["memory", "cronjob"],
+                    },
                 ),
                 "9876543210": ChannelOverride(
                     model="anthropic/claude-opus-4.6",
@@ -115,6 +119,10 @@ class TestPlatformConfigRoundtrip:
         assert d["channel_overrides"]["9876543210"]["system_prompt"] == "You are a coding assistant."
         restored = PlatformConfig.from_dict(d)
         assert restored.channel_overrides["1234567890"].model == "openrouter/healer-alpha"
+        assert restored.channel_overrides["1234567890"].tool_policy == {
+            "mode": "allowlist",
+            "tools": ["memory", "cronjob"],
+        }
         assert restored.channel_overrides["9876543210"].provider == "anthropic"
 
 
@@ -1096,6 +1104,62 @@ class TestLoadGatewayConfig:
         assert config.multiplex_profiles is True
         assert config.platforms[Platform.DISCORD].token == "worker-token"
         assert Platform.API_SERVER not in config.platforms
+
+    def test_shared_key_loop_merges_root_and_nested_platform_fields(
+        self, tmp_path, monkeypatch
+    ):
+        """A root platform block must not hide distinct nested shared keys."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  require_mention: false\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    require_mention: true\n"
+            "    channel_prompts:\n"
+            '      "1531228453901439109": nested prompt\n'
+            "gateway:\n"
+            "  platforms:\n"
+            "    discord:\n"
+            "      require_mention: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        assert discord.extra["require_mention"] is False
+        assert discord.extra["channel_prompts"] == {
+            "1531228453901439109": "nested prompt",
+        }
+
+    def test_managed_platform_policy_applies_without_user_config(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh named profile must still receive host-managed policy."""
+        hermes_home = tmp_path / "profiles" / "vegapunk"
+        hermes_home.mkdir(parents=True)
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    channel_prompts:\n"
+            '      "1531228453901439109": managed prompt\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+
+        config = load_gateway_config()
+        discord = config.platforms[Platform.DISCORD]
+
+        assert not (hermes_home / "config.yaml").exists()
+        assert discord.extra["channel_prompts"] == {
+            "1531228453901439109": "managed prompt",
+        }
 
 
 class TestWebhookPortBridging:

@@ -14,9 +14,16 @@ on:
     branches: [main]
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional image tag (defaults to sha-<commit>)
+        required: false
+        type: string
 
 permissions:
   contents: read
+  packages: write
 
 # Concurrency: push/release runs are NEVER cancelled so every merge gets
 # its own image.  PR runs reuse a PR-scoped group with
@@ -27,7 +34,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_NAME: nousresearch/hermes-agent
+  DOCKERHUB_IMAGE: nousresearch/hermes-agent
 
 jobs:
   # Classify the PR's changed files. ci.yml used to gate the docker call on
@@ -70,7 +77,7 @@ jobs:
   # protected publish job after these tests pass.
   build:
     needs: [detect]
-    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+    if: needs.detect.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +123,7 @@ jobs:
           file: Dockerfile
           load: true
           platforms: ${{ matrix.platform }}
-          tags: ${{ env.IMAGE_NAME }}:test
+          tags: ${{ env.DOCKERHUB_IMAGE }}:test
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
           cache-from: ${{ matrix.cache-from }}
@@ -128,7 +135,7 @@ jobs:
       #
       # Piggybacking here avoids a second image build: the build step
       # already loaded the image into the daemon under
-      # `${IMAGE_NAME}:test`, so we just point ``HERMES_TEST_IMAGE`` at
+      # `${DOCKERHUB_IMAGE}:test`, so we just point ``HERMES_TEST_IMAGE`` at
       # that.  The fixture's ``HERMES_TEST_IMAGE`` branch (see
       # tests/docker/conftest.py:62-63) short-circuits the rebuild.
       #
@@ -162,7 +169,7 @@ jobs:
       - name: Run docker integration tests
         env:
           # Skip rebuild; use the image already loaded by the build step.
-          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
+          HERMES_TEST_IMAGE: ${{ env.DOCKERHUB_IMAGE }}:test
           # Match the policy in tests.yml :: test job — no accidental
           # real-API calls from inside the harness.
           OPENROUTER_API_KEY: ""
@@ -176,7 +183,7 @@ jobs:
   # matrix passes. This job is the sole Docker Hub credential boundary.
   # ---------------------------------------------------------------------------
   publish:
-    if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     needs: [build]
     environment: container-publish
     strategy:
@@ -199,6 +206,18 @@ jobs:
       - name: Checkout trusted source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Resolve publishing configuration
+        shell: bash
+        run: |
+          repository="${GITHUB_REPOSITORY,,}"
+          ghcr_image="ghcr.io/${repository}"
+          publish_image_names="${ghcr_image}"
+          if [[ "${GITHUB_REPOSITORY}" == "NousResearch/hermes-agent" ]]; then
+            publish_image_names="${DOCKERHUB_IMAGE},${ghcr_image}"
+          fi
+          echo "GHCR_IMAGE=${ghcr_image}" >> "${GITHUB_ENV}"
+          echo "PUBLISH_IMAGE_NAMES=${publish_image_names}" >> "${GITHUB_ENV}"
+
       # Retry once on transient Docker Hub / buildkit pull failures.
       # See build job for rationale; same pattern.
       - name: Set up Docker Buildx
@@ -211,10 +230,18 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
+        if: github.repository == 'NousResearch/hermes-agent'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Push by digest only (no tag). The merge job assembles the tagged
       # manifest list after both architecture publishers complete.
@@ -227,9 +254,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,"name=${{ env.PUBLISH_IMAGE_NAMES }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}
 
@@ -254,14 +282,27 @@ jobs:
   #
   # On main pushes: tags both :main and :latest.
   # On releases: tags :<release_tag_name>.
+  # On manual runs: tags the requested tag or :sha-<commit>.
   # ---------------------------------------------------------------------------
   merge:
-    if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release')
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: [publish]
     timeout-minutes: 10
     environment: container-publish
     steps:
+      - name: Resolve publishing configuration
+        shell: bash
+        run: |
+          repository="${GITHUB_REPOSITORY,,}"
+          ghcr_image="ghcr.io/${repository}"
+          publish_image_names="${ghcr_image}"
+          if [[ "${GITHUB_REPOSITORY}" == "NousResearch/hermes-agent" ]]; then
+            publish_image_names="${DOCKERHUB_IMAGE},${ghcr_image}"
+          fi
+          echo "GHCR_IMAGE=${ghcr_image}" >> "${GITHUB_ENV}"
+          echo "PUBLISH_IMAGE_NAMES=${publish_image_names}" >> "${GITHUB_ENV}"
+
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -281,48 +322,65 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
+        if: github.repository == 'NousResearch/hermes-agent'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create manifest list and push
         working-directory: /tmp/digests
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          args=()
-          for digest_file in *; do
-            args+=("${IMAGE_NAME}@sha256:${digest_file}")
-          done
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tags=(-t "${IMAGE_NAME}:${RELEASE_TAG}")
-          else
-            tags=(-t "${IMAGE_NAME}:main" -t "${IMAGE_NAME}:latest")
-          fi
-          # Retry: Docker Hub API + just-pushed digest eventual consistency
-          # can transiently fail the create; the operation is idempotent.
-          for i in 1 2 3; do
-            if docker buildx imagetools create "${tags[@]}" "${args[@]}"; then
-              break
+          IFS=',' read -r -a images <<< "${PUBLISH_IMAGE_NAMES}"
+          for image in "${images[@]}"; do
+            args=()
+            for digest_file in *; do
+              args+=("${image}@sha256:${digest_file}")
+            done
+            if [[ "${{ github.event_name }}" == "release" ]]; then
+              tags=(-t "${image}:${RELEASE_TAG}")
+            elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              tag="${MANUAL_TAG:-sha-${GITHUB_SHA:0:12}}"
+              tags=(-t "${image}:${tag}")
+            else
+              tags=(-t "${image}:main" -t "${image}:latest")
             fi
-            if [ "$i" = 3 ]; then
-              echo "::error::imagetools create failed after 3 attempts"
-              exit 1
-            fi
-            echo "::warning::imagetools create failed (attempt $i); retrying in 20s"
-            sleep 20
+            # Registry APIs and just-pushed digests can be transiently
+            # inconsistent; retry the idempotent manifest creation.
+            for i in 1 2 3; do
+              if docker buildx imagetools create "${tags[@]}" "${args[@]}"; then
+                break
+              fi
+              if [ "$i" = 3 ]; then
+                echo "::error::imagetools create failed after 3 attempts"
+                exit 1
+              fi
+              echo "::warning::imagetools create failed (attempt $i); retrying in 20s"
+              sleep 20
+            done
           done
 
       - name: Inspect image
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
-            docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}"
+            docker buildx imagetools inspect "${GHCR_IMAGE}:${RELEASE_TAG}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${MANUAL_TAG:-sha-${GITHUB_SHA:0:12}}"
+            docker buildx imagetools inspect "${GHCR_IMAGE}:${tag}"
           else
-            docker buildx imagetools inspect "${IMAGE_NAME}:main"
+            docker buildx imagetools inspect "${GHCR_IMAGE}:main"
           fi

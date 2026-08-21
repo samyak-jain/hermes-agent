@@ -24,6 +24,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -37,7 +38,10 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
 )
-from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.codex_event_projector import (
+    CodexEventProjector,
+    append_projected_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +77,7 @@ class TurnResult:
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_turn: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -278,6 +283,13 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        host_session_id: Optional[str] = None,
+        system_prompt_append: Optional[str] = None,
+        system_prompt_identity: Optional[str] = None,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+        tool_callback: Optional[Callable[[str, dict[str, Any], str], Any]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -292,6 +304,13 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        self._model = model
+        self._permission_mode = permission_mode
+        self._host_session_id = host_session_id
+        self._system_prompt_append = system_prompt_append or ""
+        self._system_prompt_identity = system_prompt_identity or ""
+        self._tool_schemas = list(tool_schemas or [])
+        self._tool_callback = tool_callback
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -323,8 +342,8 @@ class CodexAppServerSession:
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
         self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
+            client_name="host-agent",
+            client_title="Agent Runtime",
             client_version=_get_hermes_version(),
         )
         # Permission selection is intentionally NOT sent on thread/start.
@@ -342,7 +361,18 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
+        params: dict[str, Any] = {
+            "cwd": self._cwd,
+            "model": self._model,
+            "permissionMode": self._permission_mode,
+            "hostSessionId": self._host_session_id,
+            "systemPromptAppend": self._system_prompt_append,
+            "systemPromptIdentity": self._system_prompt_identity,
+            "tools": self._tool_schemas,
+        }
+        params = {
+            key: value for key, value in params.items() if value not in (None, "", [])
+        }
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -612,6 +642,11 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                if not self._server_request_belongs_to_turn(
+                    sreq, result.turn_id
+                ):
+                    self._abort_server_request(sreq)
+                    continue
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -650,7 +685,9 @@ class CodexAppServerSession:
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
                     if proj.messages:
-                        result.projected_messages.extend(proj.messages)
+                        append_projected_messages(
+                            result.projected_messages, proj.messages
+                        )
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
@@ -704,7 +741,9 @@ class CodexAppServerSession:
             # Project into messages
             projection = projector.project(note)
             if projection.messages:
-                result.projected_messages.extend(projection.messages)
+                append_projected_messages(
+                    result.projected_messages, projection.messages
+                )
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a
@@ -785,6 +824,7 @@ class CodexAppServerSession:
 
         with self._active_turn_lock:
             self._active_turn_id = None
+        self._drain_aborted_server_requests()
         self._interrupt_event.clear()
         return result
 
@@ -866,6 +906,11 @@ class CodexAppServerSession:
 
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                if not self._server_request_belongs_to_turn(
+                    sreq, result.turn_id
+                ):
+                    self._abort_server_request(sreq)
+                    continue
                 self._handle_server_request(sreq)
                 continue
 
@@ -930,7 +975,9 @@ class CodexAppServerSession:
 
             projection = projector.project(note)
             if projection.messages:
-                result.projected_messages.extend(projection.messages)
+                append_projected_messages(
+                    result.projected_messages, projection.messages
+                )
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
             if projection.final_text is not None:
@@ -976,6 +1023,7 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        self._drain_aborted_server_requests()
         return result
 
     # ---------- internals ----------
@@ -1013,7 +1061,33 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "item/commandExecution/requestApproval":
+        if method == "agent/tool/call":
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments") or {}
+            tool_call_id = str(params.get("toolCallId") or "")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if self._tool_callback is None:
+                self._client.respond(
+                    rid,
+                    {"content": "Host tool bridge is unavailable", "isError": True},
+                )
+                return
+            try:
+                output = self._tool_callback(name, arguments, tool_call_id)
+                if not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False, default=str)
+                self._client.respond(
+                    rid,
+                    {"content": output, "isError": False},
+                )
+            except Exception as exc:
+                logger.exception("app-server host tool %s failed", name)
+                self._client.respond(
+                    rid,
+                    {"content": f"Tool {name} failed: {exc}", "isError": True},
+                )
+        elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
         elif method == "item/fileChange/requestApproval":
@@ -1052,6 +1126,45 @@ class CodexAppServerSession:
             self._client.respond_error(
                 rid, code=-32601, message=f"Unsupported method: {method}"
             )
+
+    def _server_request_belongs_to_turn(
+        self, req: dict, turn_id: Optional[str]
+    ) -> bool:
+        params = req.get("params") or {}
+        if not isinstance(params, dict):
+            return True
+        observed_thread_id = params.get("threadId") or params.get("thread_id")
+        observed_turn_id = params.get("turnId") or params.get("turn_id")
+        if (
+            observed_thread_id is not None
+            and self._thread_id is not None
+            and str(observed_thread_id) != str(self._thread_id)
+        ):
+            return False
+        if observed_turn_id is not None:
+            return turn_id is not None and str(observed_turn_id) == str(turn_id)
+        return True
+
+    def _abort_server_request(self, req: dict) -> None:
+        if self._client is None:
+            return
+        rid = req.get("id")
+        if req.get("method") == "agent/tool/call":
+            self._client.respond(
+                rid,
+                {"content": "turn aborted", "isError": True},
+            )
+            return
+        self._client.respond_error(rid, code=-32800, message="turn aborted")
+
+    def _drain_aborted_server_requests(self) -> None:
+        if self._client is None:
+            return
+        while True:
+            req = self._client.take_server_request(timeout=0)
+            if req is None:
+                return
+            self._abort_server_request(req)
 
     def _decide_exec_approval(self, params: dict) -> str:
         """Decide a Codex exec approval request.
@@ -1199,9 +1312,12 @@ def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
     if not isinstance(token_usage, dict):
         return
     last = token_usage.get("last")
+    turn = token_usage.get("turn")
     total = token_usage.get("total")
     if isinstance(last, dict):
         result.token_usage_last = dict(last)
+    if isinstance(turn, dict):
+        result.token_usage_turn = dict(turn)
     if isinstance(total, dict):
         result.token_usage_total = dict(total)
     window = token_usage.get("modelContextWindow")

@@ -274,6 +274,10 @@ def _make_monitor_job(hermes_env, script_body: str):
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",
+        # Keep these scheduler-path tests isolated from upstream's inference
+        # drift guard. They exercise monitor hashing, not provider migration.
+        provider="test",
+        model="test-model",
     )
 
 

@@ -10,11 +10,32 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Service-gated, policy-filtered configuration broker for conversational
+    # agents. ``allowlist`` preserves narrow explicit ownership; ``unmanaged``
+    # permits schema-known or existing non-secret leaves unless an overlay
+    # pins them.
+    "agent_config": {
+        "enabled": False,
+        "ownership_mode": "allowlist",
+        # Operators may allow validated agent-owned changes to apply directly.
+        "require_approval": True,
+        "editable_paths": [],
+        "guarded_paths": [],
+    },
+    # Service-gated broker that can read and replace only the active profile's
+    # SOUL.md. Authorization and safety ceilings remain operator-owned.
+    "soul_edit": {
+        "enabled": False,
+        "require_approval": True,
+        "max_bytes": 65_536,
+        "read_only_profiles": [],
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
-    # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
-    # not crash-safe (for example macOS virtiofs, NFS, or SMB).
+    # normal default; use DELETE or TRUNCATE for weak-fsync/shared filesystems
+    # after an offline migration. TRUNCATE avoids a directory mutation per commit.
     "database": {
         "journal_mode": "wal",
+        "synchronous": "auto",
         # Optional WAL sizing pragmas, applied when set to integers.
         # None = SQLite defaults (autocheckpoint 1000 pages, no size limit).
         "wal_autocheckpoint": None,
@@ -54,6 +75,8 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Global effort when no per-session or per-model override is present.
+        "reasoning_effort": "",
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -484,6 +507,13 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # Optional remote command supervision for trusted SSH sandboxes.
+        # These config values are bridged to the internal terminal environment
+        # used by child processes; users configure them here, not in .env.
+        "ssh_systemd_run": False,
+        "ssh_systemd_slice": "",
+        "ssh_command_memory_max_mb": 0,
+        "ssh_background_ttl_seconds": 86400,
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in
@@ -552,6 +582,11 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        "browserbase": {
+            # Fail instead of silently dropping requested keepAlive/proxy
+            # capability when Browserbase reports that the plan lacks it.
+            "require_paid_features": False,
+        },
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.
@@ -1907,6 +1942,22 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Toolsets granted to every child independently of the parent's loaded
+        # schemas. The normal subagent security blocklist still applies.
+        "subagent_grant_toolsets": [],
+        # legacy preserves parent/toolset inheritance. all_configured uses the
+        # complete configured universe, then applies the delegated-child
+        # disabled_toolsets boundary (plus an exact residual deny for tools
+        # without an owning toolset).
+        "child_tool_policy": {"mode": "legacy"},
+        # Optional task-scoped terminal backend for delegated children.
+        # ssh_sync_files defaults to false for this isolated backend; opt in
+        # only when the remote intentionally needs the host's Hermes files.
+        # Credentials must not cross the boundary by default.
+        "child_terminal": {},
+        # Per-profile child backend override. A matching profile entry wins
+        # over child_terminal; other profiles retain the shared default.
+        "profile_child_terminal": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -2195,11 +2246,11 @@ DEFAULT_CONFIG = {
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "missed_message_backfill": {
-            "enabled": False,             # Replay missed Discord messages after reconnect/startup
-            "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
+            "enabled": True,              # Replay missed human Discord messages after reconnect/startup
+            "channels": "",               # Extra channel IDs; known DMs/home/active channels are included automatically
             "window_seconds": 21600,      # Only inspect messages from the last 6 hours
-            "limit": 100,                 # Global cap on messages scanned per reconnect
-            "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
+            "limit": 100,                 # Per-channel cap on messages scanned per reconnect
+            "max_dispatches": 10,         # Per-channel cap on recovered human turns
         },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         # Discord Gateway transport health. These settings inspect the active
@@ -2566,6 +2617,13 @@ DEFAULT_CONFIG = {
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
         # same setting the scheduler reads.
         "script_timeout_seconds": 3600,
+        # The live agent receives the full prompt, but diagnostic archives omit
+        # it by default because scheduled inputs often contain private data.
+        "archive_prompt": False,
+        # Per-run model/tool-loop ceiling for unattended jobs.
+        "max_iterations": 30,
+        # Optional task-scoped terminal backend for cron agents.
+        "terminal": {},
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here

@@ -341,17 +341,32 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
                 "Cron origin captured thread_id=%s for %s:%s",
                 thread_id, origin_platform, origin_chat_id,
             )
+        session_key = get_session_env("HERMES_SESSION_KEY") or None
+        # SessionSource.chat_type is not exported as its own context variable,
+        # but it is a stable component of every gateway session key:
+        # agent:<namespace>:<platform>:<chat_type>:<chat_id>[:...]. Capture it
+        # now so a later synthetic cron completion re-enters the exact same
+        # session bucket (especially per-user groups and topic threads).
+        chat_type = None
+        if session_key:
+            parts = str(session_key).split(":")
+            if len(parts) >= 5 and parts[0] == "agent":
+                chat_type = parts[3] or None
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
+            "chat_type": chat_type,
+            "session_key": session_key,
+            "profile": get_session_env("HERMES_SESSION_PROFILE") or None,
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in
             # per-user-isolated group chats — parity with interactive
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "user_name": get_session_env("HERMES_SESSION_USER_NAME") or None,
             # Workspace/server scope (Slack team, Discord guild, Matrix
             # server). build_session_key embeds it in every Slack session key
             # (dm/group/thread alike), so a continuable cron seed built
@@ -364,6 +379,42 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
         }
     return None
+
+
+def _delivery_follows_stored_origin(job: Dict[str, Any]) -> bool:
+    """Whether a job's sole delivery target is its stored origin.
+
+    Older gateway-created jobs often persisted the concrete origin target
+    (for example ``discord:<channel_id>``) instead of ``origin``. Treat both
+    shapes as origin-following so a later live-session ``agent_respond`` opt-in
+    can move the response destination without leaving delivery pinned to the
+    old conversation. Fan-out targets deliberately return False.
+    """
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        return False
+    try:
+        from cron.scheduler import _resolve_delivery_targets, _target_matches_origin
+
+        targets = _resolve_delivery_targets(job)
+        if len(targets) != 1:
+            return False
+        target = targets[0]
+        return _target_matches_origin(
+            origin,
+            str(target.get("platform") or ""),
+            str(target.get("chat_id") or ""),
+            (
+                str(target["thread_id"])
+                if target.get("thread_id") is not None
+                else None
+            ),
+        )
+    except Exception:
+        # ``origin`` is the canonical origin-following spelling and needs no
+        # platform/config resolution. Keep this fallback narrow so a broken
+        # resolver cannot silently retarget an explicit destination.
+        return str(job.get("deliver") or "").strip().lower() == "origin"
 
 
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
@@ -667,6 +718,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_state"] = job["monitor_state"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("agent_respond"):
+        result["agent_respond"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -1214,6 +1267,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    agent_respond: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1320,6 +1374,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    agent_respond=agent_respond,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1590,6 +1645,22 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if agent_respond is not None:
+                updates["agent_respond"] = bool(agent_respond)
+                if agent_respond:
+                    response_origin = _origin_from_env()
+                    if response_origin:
+                        # Enabling active handoff from a live conversation is
+                        # also an explicit choice of where the main agent should
+                        # respond. Capture that conversation now. If the job's
+                        # sole delivery target followed its previous origin,
+                        # move delivery with it; otherwise preserve explicit
+                        # fan-out/local routing unless the caller supplied a new
+                        # ``deliver`` value in this same update.
+                        follows_old_origin = _delivery_follows_stored_origin(job)
+                        updates["origin"] = response_origin
+                        if deliver is None and follows_old_origin:
+                            updates["deliver"] = "origin"
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1760,6 +1831,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "agent_respond": {
+                "type": "boolean",
+                "description": "When True, the completed cron result re-enters the originating main-agent session as an internal turn, causing the main agent to review it and respond automatically. Use this when the user wants the main agent to act on a scheduled result, not merely receive a raw cron message. Requires a live gateway at fire time; otherwise Hermes falls back to normal cron delivery and mirrors the result into the origin transcript. Applies only to the origin conversation, never fan-out targets, and has no effect with deliver='local'. On update, pass False to disable."
+            },
         },
         "required": ["action"]
     }
@@ -1820,6 +1895,8 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        attach_to_session=args.get("attach_to_session"),
+        agent_respond=args.get("agent_respond"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

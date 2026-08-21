@@ -47,9 +47,70 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
     return f"codex_{item_type}_{digest}"
 
 
+def codex_item_identity(item: dict) -> tuple[str, str]:
+    """Return the projected Hermes tool name and stable call id."""
+    item_type = item.get("type") or ""
+    item_id = item.get("id") or ""
+    if item_type == "commandExecution":
+        return "exec_command", _deterministic_call_id("exec", item_id)
+    if item_type == "fileChange":
+        return "apply_patch", _deterministic_call_id("apply_patch", item_id)
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        name = tool if server == "agent-runtime" else f"mcp.{server}.{tool}"
+        # The call_id input mirrors the native MCP tool-name convention
+        # (mcp__server__tool), NOT the dotted display name, so ids stay
+        # consistent with registration names across live/history paths.
+        return name, _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+    if item_type == "dynamicToolCall":
+        tool = item.get("tool") or "unknown"
+        return tool, _deterministic_call_id(f"dyn_{tool}", item_id)
+    if item_type == "webSearch":
+        return "web_search", _deterministic_call_id("web_search", item_id)
+    name = item_type or "unknown"
+    return name, _deterministic_call_id(name, item_id)
+
+
 def _format_tool_args(d: dict) -> str:
     """Format a dict as JSON the way Hermes' existing tool_calls path does."""
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
+
+
+def append_projected_messages(target: list[dict], incoming: list[dict]) -> None:
+    """Append a projection while coalescing adjacent same-role turns.
+
+    Codex may emit multiple ``agentMessage`` items for one turn (and may emit
+    prose immediately before a tool item). Appending each item verbatim
+    creates assistant→assistant history that strict transports reject on the
+    next request. Coalescing at the projection seam preserves every text,
+    reasoning, and tool-call field without inventing a synthetic user turn.
+    """
+    for message in incoming:
+        if (
+            target
+            and target[-1].get("role") == message.get("role")
+            and message.get("role") in {"assistant", "user"}
+        ):
+            previous = target[-1]
+            old_content = previous.get("content")
+            new_content = message.get("content")
+            if new_content not in (None, ""):
+                if old_content not in (None, ""):
+                    previous["content"] = f"{old_content}\n\n{new_content}"
+                else:
+                    previous["content"] = new_content
+            for field_name in ("reasoning",):
+                new_value = message.get(field_name)
+                if new_value:
+                    old_value = previous.get(field_name)
+                    previous[field_name] = (
+                        f"{old_value}\n{new_value}" if old_value else new_value
+                    )
+            if message.get("tool_calls"):
+                previous.setdefault("tool_calls", []).extend(message["tool_calls"])
+            continue
+        target.append(message)
 
 
 @dataclass
@@ -140,7 +201,7 @@ class CodexEventProjector:
         )
 
     def _project_command(self, item: dict, item_id: str) -> ProjectionResult:
-        call_id = _deterministic_call_id("exec", item_id)
+        projected_name, call_id = codex_item_identity(item)
         args = {
             "command": item.get("command") or "",
             "cwd": item.get("cwd") or "",
@@ -153,7 +214,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": "exec_command",
+                        "name": projected_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -176,7 +237,7 @@ class CodexEventProjector:
         )
 
     def _project_file_change(self, item: dict, item_id: str) -> ProjectionResult:
-        call_id = _deterministic_call_id("apply_patch", item_id)
+        projected_name, call_id = codex_item_identity(item)
         # Reduce the codex changes array to a digest the agent loop will
         # find readable. We record per-file change kinds (Add/Update/Delete)
         # without inlining full file contents — those can be huge.
@@ -194,7 +255,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": "apply_patch",
+                        "name": projected_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -215,11 +276,7 @@ class CodexEventProjector:
         )
 
     def _project_mcp_tool_call(self, item: dict, item_id: str) -> ProjectionResult:
-        server = item.get("server") or "mcp"
-        tool = item.get("tool") or "unknown"
-        # Mirror the native MCP tool-name convention (mcp__server__tool) so the
-        # deterministic call_id input stays consistent with registration names.
-        call_id = _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+        projected_name, call_id = codex_item_identity(item)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
@@ -231,7 +288,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": f"mcp.{server}.{tool}",
+                        "name": projected_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -244,6 +301,8 @@ class CodexEventProjector:
         error = item.get("error")
         if error:
             content = f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+        elif isinstance(result, str):
+            content = result[:4000]
         elif result is not None:
             content = json.dumps(result, ensure_ascii=False)[:4000]
         else:
@@ -260,8 +319,7 @@ class CodexEventProjector:
     def _project_dynamic_tool_call(
         self, item: dict, item_id: str
     ) -> ProjectionResult:
-        tool = item.get("tool") or "unknown"
-        call_id = _deterministic_call_id(f"dyn_{tool}", item_id)
+        tool, call_id = codex_item_identity(item)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}

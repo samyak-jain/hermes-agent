@@ -1,7 +1,8 @@
-"""Sibling coverage for the embed-invisibility fix (send_exec_approval got it
-in the same PR): slash confirm, clarify, and update prompts must also mirror
-their payload into plain message content, since embeds don't render on some
-Discord clients (web/mobile)."""
+"""Interactive Discord prompts must remain self-contained in plain content.
+
+Clarify is content-only because mirroring the same question into an embed
+visibly duplicates it on normal clients.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,7 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord.adapter import (
+    DiscordAdapter,
+    ExecApprovalView,
+    SlashConfirmView,
+)
 
 
 def _capture_channel(adapter):
@@ -48,6 +53,82 @@ async def test_slash_confirm_mirrors_message_into_content():
 
 
 @pytest.mark.asyncio
+async def test_slash_confirm_truncates_long_message_in_content():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_slash_confirm(
+        chat_id="555",
+        title="Confirm",
+        message="y" * 5000,
+        session_key="discord:555",
+        confirm_id="c2",
+    )
+
+    assert result.success is True
+    assert len(sent["content"]) <= adapter.MAX_MESSAGE_LENGTH
+    assert "... [truncated]" in sent["content"]
+
+
+@pytest.mark.asyncio
+async def test_slash_confirm_routes_recovery_prompt_through_side_effect_guard():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    _capture_channel(adapter)
+    guarded_send = AsyncMock(
+        return_value=SimpleNamespace(id=444)
+    )
+    adapter._send_discord_interactive_prompt = guarded_send
+    metadata = {
+        "_gateway_receipt_ids": ["333"],
+        "reply_to_message_id": "333",
+        "_gateway_recovery_component_index": "interactive:0",
+    }
+
+    result = await adapter.send_slash_confirm(
+        chat_id="555",
+        title="Reset session?",
+        message="This will clear the current conversation history.",
+        session_key="discord:555",
+        confirm_id="c3",
+        metadata=metadata,
+    )
+
+    assert result.success is True
+    guarded_send.assert_awaited_once()
+    assert guarded_send.await_args.kwargs["metadata"] is metadata
+    assert guarded_send.await_args.kwargs["component"] == "slash-confirm"
+
+
+def test_replayed_interactive_views_keep_remote_component_ids():
+    approval_kwargs = {
+        "session_key": "discord:555",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_approval = ExecApprovalView(**approval_kwargs)
+    replayed_approval = ExecApprovalView(**approval_kwargs)
+    assert [
+        child.custom_id for child in first_approval.children
+    ] == [
+        child.custom_id for child in replayed_approval.children
+    ]
+
+    confirm_kwargs = {
+        "session_key": "discord:555",
+        "confirm_id": "stable-confirm",
+        "allowed_user_ids": {"42"},
+        "interaction_key": "stable-key",
+    }
+    first_confirm = SlashConfirmView(**confirm_kwargs)
+    replayed_confirm = SlashConfirmView(**confirm_kwargs)
+    assert [
+        child.custom_id for child in first_confirm.children
+    ] == [
+        child.custom_id for child in replayed_confirm.children
+    ]
+
+
+@pytest.mark.asyncio
 async def test_clarify_with_choices_mirrors_question_into_content():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent = _capture_channel(adapter)
@@ -65,5 +146,44 @@ async def test_clarify_with_choices_mirrors_question_into_content():
     assert "Hermes needs your input" in sent["content"]
     assert "Which environment should I deploy to?" in sent["content"]
     assert "Pick one below" in sent["content"]
+    assert sent.get("embed") is None
+    assert sent["content"].count("Hermes needs your input") == 1
+    assert sent["content"].count("Which environment should I deploy to?") == 1
+
+@pytest.mark.asyncio
+async def test_clarify_without_choices_mirrors_question_and_reply_hint():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_clarify(
+        chat_id="555",
+        question="What should the cron schedule be?",
+        choices=[],
+        clarify_id="cl2",
+        session_key="discord:555",
+    )
+
+    assert result.success is True
+    assert sent.get("view") is None
+    assert sent.get("embed") is None
+    assert "What should the cron schedule be?" in sent["content"]
+    assert "Reply in this channel" in sent["content"]
 
 
+@pytest.mark.asyncio
+async def test_update_prompt_mirrors_prompt_into_content():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_update_prompt(
+        chat_id="555",
+        prompt="Restore stashed changes?",
+        default="yes",
+        session_key="discord:555",
+    )
+
+    assert result.success is True
+    assert sent["view"] is not None
+    assert "Update Needs Your Input" in sent["content"]
+    assert "Restore stashed changes?" in sent["content"]
+    assert "(default: yes)" in sent["content"]

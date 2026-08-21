@@ -344,6 +344,51 @@ def test_progressing_runner_is_never_stalled(monkeypatch):
     assert evt["summary"] == "done"
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_persist_failure_releases_running_slot(monkeypatch, batch):
+    deleted = []
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda record: (_ for _ in ()).throw(OSError("sqlite unavailable")),
+    )
+    monkeypatch.setattr(
+        ad,
+        "_delete_durable_delegation",
+        lambda delegation_id: deleted.append(delegation_id),
+    )
+
+    if batch:
+        result = ad.dispatch_async_delegation_batch(
+            goals=["work"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"results": []},
+            delegation_id="deleg_persist_batch",
+        )
+        expected_id = "deleg_persist_batch"
+    else:
+        result = ad.dispatch_async_delegation(
+            goal="work",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"status": "completed"},
+            delegation_id="deleg_persist_single",
+        )
+        expected_id = "deleg_persist_single"
+
+    assert result["status"] == "rejected"
+    assert "sqlite unavailable" in result["error"]
+    assert ad.active_count() == 0
+    assert deleted == [expected_id]
+
+
 def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     """Interrupt-responsive children finalize through the NORMAL path.
 
@@ -555,6 +600,58 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_recover_preserves_spawn_result_type_and_label(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "sa_abandoned",
+        "completion_type": "spawn_result",
+        "label": "research",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL "
+            "WHERE delegation_id=?",
+            (99999999, "sa_abandoned"),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    event = restored.get_nowait()
+    assert event["type"] == "spawn_result"
+    assert event["label"] == "research"
+
+
+def test_spawn_result_uses_same_durable_delivery_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "spawn_claim",
+        "completion_type": "spawn_result",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    event = {
+        "type": "spawn_result",
+        "delegation_id": "spawn_claim",
+        "status": "completed",
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+    assert ad.get_durable_delegation("spawn_claim")["delivery_state"] == "delivered"
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -760,8 +857,6 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-
 def test_single_task_truncation_banner_when_max_iterations():
     """A single async subagent that hit its iteration cap (exit_reason=
     max_iterations) must surface a TRUNCATED marker in the formatted result,
@@ -824,4 +919,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-
