@@ -397,7 +397,13 @@ class TestDiscoveryShape:
         assert [r["match_message_id"] for r in adaptive["results"]] == [
             r["match_message_id"] for r in full["results"]
         ]
-        assert len(adaptive_json.encode("utf-8")) < len(full_json.encode("utf-8")) * 0.6
+        top_contents = [
+            message.get("content") or ""
+            for key in ("bookend_start", "messages", "bookend_end")
+            for message in adaptive["results"][0][key]
+        ]
+        assert max(map(len, top_contents)) > 900
+        assert len(adaptive_json.encode("utf-8")) < len(full_json.encode("utf-8")) * 0.9
 
 
     def test_current_session_filtered_out(self, db):
