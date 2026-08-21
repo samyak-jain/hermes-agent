@@ -905,9 +905,9 @@ def write_runtime_status(
     if active_agents is not _UNSET:
         payload["active_agents"] = parse_active_agents(active_agents)
     if served_profiles is not _UNSET:
-        # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
-        # for a single-profile gateway. Lets `hermes status` show per-profile
-        # coverage without a second probe.
+        # Complete profile set served by this gateway. Startup always supplies
+        # this in both single-profile and multiplex modes, replacing any stale
+        # list from a prior runtime topology.
         payload["served_profiles"] = list(served_profiles or [])
 
     if platform is not _UNSET:

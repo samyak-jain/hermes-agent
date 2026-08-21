@@ -9975,8 +9975,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
 
-        Returns the number of secondary adapters that connected. No-op (returns
-        0) unless ``gateway.multiplex_profiles`` is on.
+        Returns the number of secondary adapters that connected. In
+        single-profile mode, records the active profile and returns 0.
 
         Each profile's adapters are created and connected under that profile's
         HERMES_HOME + secret scope (``_profile_runtime_scope``), stored in
@@ -9987,15 +9987,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles polling the same bot token) are detected and refused here, the
         only point that sees every profile's resolved credentials together.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
-            return 0
-
         try:
             from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
         except Exception:
             return 0
 
         active = get_active_profile_name() or "default"
+        if not getattr(self.config, "multiplex_profiles", False):
+            # Runtime status is updated incrementally, so omitting this field
+            # would preserve a stale multiplex-era profile list. Always write
+            # the complete served set for the current startup mode.
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(served_profiles=[active])
+            except Exception:
+                logger.debug("could not record served_profiles", exc_info=True)
+            return 0
+
         connected = 0
         # (platform, token-fingerprint) -> profile that claimed it. Detects two
         # profiles trying to poll the same bot credential (impossible to do

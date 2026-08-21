@@ -1,4 +1,7 @@
 """Phase 4: lifecycle guard + per-profile observability."""
+import asyncio
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 
@@ -26,6 +29,39 @@ class TestServedProfilesStatus:
             status.write_runtime_status(gateway_state="running")
             rec = status.read_runtime_status()
             assert "served_profiles" not in rec
+        finally:
+            importlib.reload(status)
+
+    @pytest.mark.parametrize("active_profile", [None, "coder"])
+    def test_single_profile_startup_replaces_stale_served_profiles(
+        self, tmp_path, monkeypatch, active_profile
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import gateway.status as status
+        from gateway.run import GatewayRunner
+
+        importlib.reload(status)
+        try:
+            status.write_runtime_status(
+                gateway_state="running",
+                served_profiles=["default", "retired"],
+            )
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner.config = MagicMock(multiplex_profiles=False)
+
+            with patch(
+                "hermes_cli.profiles.get_active_profile_name",
+                return_value=active_profile,
+            ):
+                connected = asyncio.run(
+                    runner._start_secondary_profile_adapters()
+                )
+
+            assert connected == 0
+            assert status.read_runtime_status()["served_profiles"] == [
+                active_profile or "default"
+            ]
         finally:
             importlib.reload(status)
 
