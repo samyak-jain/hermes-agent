@@ -105,14 +105,17 @@ def test_refresh_cannot_add_mcp_tool_to_exact_allowlist(monkeypatch):
     assert "mcp__demo__new_tool" not in agent.valid_tool_names
 
 
-def test_incomplete_exact_refresh_publishes_available_authorized_subset(monkeypatch):
+def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypatch):
     from agent.tool_policy import ToolAccessPolicy
+    from tools.registry import registry
 
     allowed = {"discord", "memory"}
     agent = _agent(allowed, enabled=["hermes-discord", "mcp-demo"])
     agent.tool_policy = ToolAccessPolicy(
         mode="allowlist", allowed_names=frozenset(allowed), source="test"
     )
+    original_tools = agent.tools
+
     import model_tools
     monkeypatch.setattr(
         model_tools,
@@ -123,8 +126,9 @@ def test_incomplete_exact_refresh_publishes_available_authorized_subset(monkeypa
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert added == set()
-    assert agent.tools == [_tool("memory")]
-    assert agent.valid_tool_names == {"memory"}
+    assert agent.tools is original_tools
+    assert agent.valid_tool_names == allowed
+    assert agent._tool_snapshot_generation == registry._generation
 
 
 def test_incomplete_exact_refresh_replaces_invalid_existing_snapshot(monkeypatch):
@@ -146,6 +150,29 @@ def test_incomplete_exact_refresh_replaces_invalid_existing_snapshot(monkeypatch
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert added == set()
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
+
+
+def test_incomplete_exact_refresh_never_empties_successfully_filtered_subset(monkeypatch):
+    from agent.tool_policy import ToolAccessPolicy
+
+    allowed = {"discord", "memory"}
+    agent = _agent([], enabled=["hermes-discord"])
+    agent.tool_policy = ToolAccessPolicy(
+        mode="allowlist", allowed_names=frozenset(allowed), source="test"
+    )
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("memory"), _tool("unexpected")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == {"memory"}
     assert agent.tools == [_tool("memory")]
     assert agent.valid_tool_names == {"memory"}
 

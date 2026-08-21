@@ -7859,6 +7859,16 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
+        if incomplete_allowlist:
+            current_is_exact = (
+                tool_policy.allowed_names.issubset(current)
+                and all(tool_policy.allows(name) for name in current)
+            )
+            if current_is_exact:
+                agent._tool_snapshot_generation = max(
+                    published_gen, snapshot_generation
+                )
+                return set()
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
