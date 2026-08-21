@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -88,7 +89,13 @@ def test_spawn_toolset_can_replace_delegation_toolset():
     assert {item["function"]["name"] for item in definitions} == {"spawn_agent"}
 
 
-def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
+@pytest.mark.parametrize(
+    ("route_key", "expected_route"),
+    [("route-key", "route-key"), ("", "parent-session")],
+)
+def test_spawn_returns_compact_handle_and_dispatches_leaf(
+    monkeypatch, route_key, expected_route
+):
     parent = _parent()
     interrupt_reasons = []
     child = SimpleNamespace(
@@ -97,6 +104,15 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     )
     parent._active_children.append(child)
     captured = {}
+
+    class RecordingLock:
+        def __enter__(self):
+            captured["construction_lock_entries"] = (
+                captured.get("construction_lock_entries", 0) + 1
+            )
+
+        def __exit__(self, *_args):
+            return False
 
     def fake_build(**kwargs):
         captured["build"] = kwargs
@@ -125,7 +141,10 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     )
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", fake_build)
     monkeypatch.setattr(
-        "tools.approval.get_current_session_key", lambda default="": "route-key"
+        "tools.delegate_tool._CHILD_CONSTRUCTION_LOCK", RecordingLock()
+    )
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key", lambda default="": route_key
     )
 
     result = json.loads(
@@ -138,7 +157,7 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
 
     assert result["status"] == "running"
     assert result["id"].startswith("sa_")
-    assert len(result["id"]) == 9
+    assert len(result["id"]) == 11
     assert result["live_transcripts"] == [child._live_transcript_path]
     assert Path(result["live_transcripts"][0]).exists()
     assert "tail -f" in result["live_transcripts_hint"]
@@ -148,7 +167,8 @@ def test_spawn_returns_compact_handle_and_dispatches_leaf(monkeypatch):
     assert captured["build"]["emit_lifecycle_hooks"] is False
     assert captured["dispatch"]["completion_type"] == "spawn_result"
     assert captured["dispatch"]["label"] == "audit auth flow"
-    assert captured["dispatch"]["session_key"] == "route-key"
+    assert captured["dispatch"]["session_key"] == expected_route
+    assert captured["construction_lock_entries"] == 1
     assert child not in parent._active_children
     assert child._subagent_id is None
     assert parent.lines == [f"🔀 {result['id']} spawned: audit auth flow"]
@@ -226,6 +246,142 @@ def test_spawn_live_transcript_streams_and_finalizes(monkeypatch, tmp_path):
 
     manifest = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["tasks"][0]["status"] == "completed"
+
+
+def test_spawn_finalization_serializes_parent_cost_rollup(monkeypatch, tmp_path):
+    from tools import delegation_live_log as dll
+
+    class CostParent(SimpleNamespace):
+        def __init__(self, **kwargs):
+            self._cost_value = 0.1
+            self._cost_guard = threading.Lock()
+            self._cost_readers = 0
+            self.max_cost_readers = 0
+            super().__init__(**kwargs)
+
+        @property
+        def session_estimated_cost_usd(self):
+            with self._cost_guard:
+                self._cost_readers += 1
+                self.max_cost_readers = max(
+                    self.max_cost_readers, self._cost_readers
+                )
+            time.sleep(0.03)
+            with self._cost_guard:
+                self._cost_readers -= 1
+                return self._cost_value
+
+        @session_estimated_cost_usd.setter
+        def session_estimated_cost_usd(self, value):
+            self._cost_value = value
+
+    base = _parent()
+    parent = CostParent(**vars(base))
+    parent.session_cost_source = "none"
+    parent.session_cost_status = "unknown"
+    dispatches = []
+
+    monkeypatch.setattr(dll, "live_transcript_root", lambda: tmp_path / "live")
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
+    monkeypatch.setattr("tools.delegate_tool._get_max_concurrent_children", lambda: 3)
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda cfg, agent: {
+            "model": "child-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda **kw: SimpleNamespace(close=lambda: None, tool_progress_callback=None),
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *args, **kwargs: {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "duration_seconds": 0.1,
+            "_child_cost_usd": 0.25,
+            "_child_role": "leaf",
+        },
+    )
+
+    def fake_dispatch(**kwargs):
+        dispatches.append(kwargs)
+        return {"status": "dispatched", "delegation_id": kwargs["delegation_id"]}
+
+    monkeypatch.setattr("tools.async_delegation.dispatch_async_delegation", fake_dispatch)
+
+    spawn_agent("first", parent_agent=parent)
+    spawn_agent("second", parent_agent=parent)
+    threads = [threading.Thread(target=item["runner"]) for item in dispatches]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert parent.session_estimated_cost_usd == pytest.approx(0.6)
+    assert parent.max_cost_readers == 1
+    assert parent.session_cost_source == "subagent"
+    assert parent.session_cost_status == "estimated"
+
+
+def test_spawn_dispatch_exception_closes_child_and_finalizes_log(
+    monkeypatch, tmp_path
+):
+    from tools import delegation_live_log as dll
+
+    parent = _parent()
+    closed = []
+    child = SimpleNamespace(
+        close=lambda: closed.append(True),
+        tool_progress_callback=None,
+    )
+    parent._active_children.append(child)
+    monkeypatch.setattr(dll, "live_transcript_root", lambda: tmp_path / "live")
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
+    monkeypatch.setattr("tools.delegate_tool._get_max_concurrent_children", lambda: 3)
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda cfg, agent: {
+            "model": "child-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **kw: child)
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("sqlite unavailable")),
+    )
+
+    result = json.loads(spawn_agent("inspect", parent_agent=parent))
+
+    assert "sqlite unavailable" in result["error"]
+    assert closed == [True]
+    manifests = list((tmp_path / "live").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["tasks"][0]["status"] == "error"
 
 
 def test_cancel_requests_owned_spawn_by_returned_id(monkeypatch):
@@ -354,6 +510,44 @@ def test_result_retrieval_pages_owned_full_report_without_file_tool(
     assert final["content"] == "ijklmnopqrstuvwxyz"
     assert final["next_offset"] is None
     assert final["has_more"] is False
+
+
+def test_result_retrieval_redacts_before_page_slicing(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "route-key",
+    )
+    monkeypatch.setattr(
+        "agent.redact.redact_sensitive_text",
+        lambda text, force=False: text.replace("ABCDEF", "[REDACTED]"),
+    )
+    result_id = "sa_boundary"
+    report_dir = tmp_path / "cache" / "delegation" / "live" / result_id
+    report_dir.mkdir(parents=True)
+    report_path = report_dir / "subagent-summary-0-test.txt"
+    report_path.write_text("12ABCDEF34", encoding="utf-8")
+    _persist_spawn_result(
+        result_id=result_id,
+        owner="route-key",
+        result={
+            "status": "completed",
+            "summary": "truncated",
+            "summary_full_path": str(report_path),
+        },
+    )
+
+    page = json.loads(
+        spawn_agent(
+            result_id=result_id,
+            offset=0,
+            limit=4,
+            parent_agent=_parent(),
+        )
+    )
+
+    assert page["content"] == "12[R"
+    assert page["total_chars"] == len("12[REDACTED]34")
 
 
 def test_result_retrieval_fails_closed_for_foreign_or_wrong_tool_results(

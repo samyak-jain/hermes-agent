@@ -7,7 +7,6 @@ import pytest
 from tools import terminal_tool
 from tools.delegate_tool import (
     _get_child_terminal_overrides,
-    _get_profile_subagent_tool_grants,
     _seed_child_session_cwd,
 )
 from tools.environments import ssh as ssh_env
@@ -60,7 +59,7 @@ def test_child_ssh_config_fails_closed_without_runtime_host(tmp_path: Path):
         )
 
 
-def test_profile_child_terminal_overrides_shared_default(tmp_path: Path):
+def test_profile_child_terminal_is_ignored(tmp_path: Path):
     general_host = tmp_path / "general-ip"
     operator_host = tmp_path / "operator-ip"
     general_host.write_text("10.233.1.2\n", encoding="utf-8")
@@ -82,28 +81,10 @@ def test_profile_child_terminal_overrides_shared_default(tmp_path: Path):
         },
     }
 
-    vegapunk = _get_child_terminal_overrides(config, profile="vegapunk")
-    lena = _get_child_terminal_overrides(config, profile="default")
+    resolved = _get_child_terminal_overrides(config)
 
-    assert vegapunk["ssh_host"] == "10.233.2.2"
-    assert vegapunk["cwd"] == "/data"
-    assert lena["ssh_host"] == "10.233.1.2"
-
-
-def test_profile_subagent_tool_grants_only_allows_config(caplog):
-    grants = _get_profile_subagent_tool_grants(
-        {
-            "profile_subagent_tool_grants": {
-                "vegapunk": ["config", "memory", "spawn_agent", "terminal"]
-            }
-        },
-        profile="vegapunk",
-    )
-
-    assert grants == frozenset({"config"})
-    assert "memory" in caplog.text
-    assert "spawn_agent" in caplog.text
-    assert "terminal" in caplog.text
+    assert resolved["ssh_host"] == "10.233.1.2"
+    assert "cwd" not in resolved
 
 
 def test_child_ssh_file_sync_is_opt_in():

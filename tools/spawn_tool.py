@@ -113,22 +113,9 @@ def _detach_child(parent_agent, child) -> None:
 
 
 def _delivery_route(parent_agent) -> tuple[str, str, Optional[str]]:
-    from tools.approval import get_current_session_key
+    from tools.delegate_tool import resolve_async_delivery_route
 
-    session_key = get_current_session_key(default="")
-    origin_ui_session_id = ""
-    try:
-        from gateway.session_context import get_session_env
-
-        source = get_session_env("HERMES_SESSION_SOURCE", "")
-        origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
-        if source == "tui":
-            agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-            if agent_session_id:
-                session_key = agent_session_id
-    except Exception:
-        origin_ui_session_id = ""
-    return session_key, origin_ui_session_id, getattr(parent_agent, "session_id", None)
+    return resolve_async_delivery_route(parent_agent)
 
 
 def _owned_result_text(
@@ -223,17 +210,17 @@ def _owned_result_text(
                 exc,
             )
 
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True) or ""
+    except Exception:
+        logger.exception("Could not redact spawn result page for %s", result_id)
+        return tool_error("Result retrieval failed closed because redaction was unavailable.")
     total_chars = len(text)
     page = text[offset:offset + limit]
     next_offset = offset + len(page)
     has_more = next_offset < total_chars
-    try:
-        from agent.redact import redact_sensitive_text
-
-        page = redact_sensitive_text(page, force=True) or ""
-    except Exception:
-        logger.exception("Could not redact spawn result page for %s", result_id)
-        return tool_error("Result retrieval failed closed because redaction was unavailable.")
 
     payload: Dict[str, Any] = {
         "id": result_id,
@@ -348,11 +335,12 @@ def spawn_agent(
     from tools.async_delegation import active_count, dispatch_async_delegation
     from tools.delegate_tool import (
         DEFAULT_MAX_ITERATIONS,
-        _build_child_agent,
+        _build_child_preserving_parent_tools,
         _get_max_concurrent_children,
         _load_config,
         _resolve_delegation_credentials,
         _run_single_child,
+        finalize_single_child_result,
     )
 
     max_children = _get_max_concurrent_children()
@@ -370,7 +358,7 @@ def spawn_agent(
 
     clean_prompt = prompt.strip()
     display_label = _display_label(clean_prompt, label)
-    spawn_id = f"sa_{uuid.uuid4().hex[:6]}"
+    spawn_id = f"sa_{uuid.uuid4().hex[:8]}"
 
     # Match delegate_task's live-view contract: pre-create the append-only
     # transcript before dispatch so callers can attach `tail -f` immediately.
@@ -388,41 +376,34 @@ def spawn_agent(
     )
     live_writer = live_writers[0] if live_writers else None
 
-    import model_tools
-
-    parent_tool_names = list(model_tools._last_resolved_tool_names)
-    try:
-        child = _build_child_agent(
-            task_index=0,
-            goal=clean_prompt,
-            context=None,
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
-            task_count=1,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role="leaf",
-            relay_progress=False,
-            emit_lifecycle_hooks=False,
+    child = _build_child_preserving_parent_tools(
+        task_index=0,
+        goal=clean_prompt,
+        context=None,
+        toolsets=None,
+        model=creds["model"],
+        max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+        task_count=1,
+        parent_agent=parent_agent,
+        override_provider=creds["provider"],
+        override_base_url=creds["base_url"],
+        override_api_key=creds["api_key"],
+        override_api_mode=creds["api_mode"],
+        override_request_overrides=creds.get("request_overrides"),
+        override_max_tokens=creds.get("max_output_tokens"),
+        override_acp_command=creds.get("command"),
+        override_acp_args=creds.get("args"),
+        role="leaf",
+        relay_progress=False,
+        emit_lifecycle_hooks=False,
+    )
+    if live_writer is not None:
+        child.tool_progress_callback = wrap_progress_callback(
+            getattr(child, "tool_progress_callback", None),
+            live_writer,
         )
-        child._delegate_saved_tool_names = parent_tool_names
-        if live_writer is not None:
-            child.tool_progress_callback = wrap_progress_callback(
-                getattr(child, "tool_progress_callback", None),
-                live_writer,
-            )
-            if live_paths:
-                child._live_transcript_path = live_paths[0]
-    finally:
-        model_tools._last_resolved_tool_names = parent_tool_names
+        if live_paths:
+            child._live_transcript_path = live_paths[0]
 
     # spawn_agent intentionally does not populate the delegate_task /agents
     # tree.  The async registry still owns and interrupts the live child.
@@ -430,24 +411,15 @@ def spawn_agent(
     _detach_child(parent_agent, child)
 
     def runner() -> Dict[str, Any]:
-        from tools.delegate_tool import _apply_summary_budget
-
         try:
             result = _run_single_child(0, clean_prompt, child, parent_agent)
-            _apply_summary_budget(
-                [result],
+            finalize_single_child_result(
+                result,
+                clean_prompt,
+                child,
                 parent_agent,
                 retrieval_id=spawn_id,
             )
-            result.pop("_child_role", None)
-            child_cost = result.pop("_child_cost_usd", 0.0)
-            try:
-                parent_cost = float(
-                    getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0
-                )
-                parent_agent.session_estimated_cost_usd = parent_cost + float(child_cost or 0.0)
-            except (TypeError, ValueError):
-                pass
             if live_paths:
                 result["live_transcript"] = live_paths[0]
                 result["live_transcripts"] = list(live_paths)
@@ -473,22 +445,26 @@ def spawn_agent(
             child._interrupt_requested = True
 
     session_key, origin_ui_session_id, parent_session_id = _delivery_route(parent_agent)
-    dispatch = dispatch_async_delegation(
-        goal=clean_prompt,
-        context=None,
-        toolsets=None,
-        role="leaf",
-        model=creds["model"],
-        session_key=session_key,
-        origin_ui_session_id=origin_ui_session_id,
-        parent_session_id=parent_session_id,
-        runner=runner,
-        interrupt_fn=interrupt,
-        max_async_children=max_children,
-        delegation_id=spawn_id,
-        completion_type="spawn_result",
-        label=display_label,
-    )
+    try:
+        dispatch = dispatch_async_delegation(
+            goal=clean_prompt,
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model=creds["model"],
+            session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
+            parent_session_id=parent_session_id,
+            runner=runner,
+            interrupt_fn=interrupt,
+            max_async_children=max_children,
+            delegation_id=spawn_id,
+            completion_type="spawn_result",
+            label=display_label,
+        )
+    except Exception as exc:
+        logger.exception("spawn_agent dispatch failed")
+        dispatch = {"status": "rejected", "error": f"Failed to spawn: {exc}"}
     if dispatch.get("status") != "dispatched":
         failed = {
             "task_index": 0,
