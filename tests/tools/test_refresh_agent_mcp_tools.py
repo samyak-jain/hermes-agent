@@ -105,8 +105,7 @@ def test_refresh_cannot_add_mcp_tool_to_exact_allowlist(monkeypatch):
     assert "mcp__demo__new_tool" not in agent.valid_tool_names
 
 
-def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypatch):
-    """A transient service gate cannot erase a valid exact tool surface."""
+def test_incomplete_exact_refresh_publishes_available_authorized_subset(monkeypatch):
     from agent.tool_policy import ToolAccessPolicy
 
     allowed = {"discord", "memory"}
@@ -114,8 +113,6 @@ def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypat
     agent.tool_policy = ToolAccessPolicy(
         mode="allowlist", allowed_names=frozenset(allowed), source="test"
     )
-    original_tools = agent.tools
-
     import model_tools
     monkeypatch.setattr(
         model_tools,
@@ -126,12 +123,11 @@ def test_incomplete_exact_refresh_retains_complete_authorized_snapshot(monkeypat
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert added == set()
-    assert agent.tools is original_tools
-    assert agent.valid_tool_names == allowed
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
 
 
-def test_incomplete_exact_refresh_denies_invalid_existing_snapshot(monkeypatch):
-    """Retention never preserves a partial or over-broad current surface."""
+def test_incomplete_exact_refresh_replaces_invalid_existing_snapshot(monkeypatch):
     from agent.tool_policy import ToolAccessPolicy
 
     allowed = {"discord", "memory"}
@@ -150,8 +146,8 @@ def test_incomplete_exact_refresh_denies_invalid_existing_snapshot(monkeypatch):
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert added == set()
-    assert agent.tools == []
-    assert agent.valid_tool_names == set()
+    assert agent.tools == [_tool("memory")]
+    assert agent.valid_tool_names == {"memory"}
 
 
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):

@@ -7827,7 +7827,7 @@ def refresh_agent_mcp_tools(
             missing_allowlist_names = tool_policy.allowed_names - new_names
             logger.error(
                 "MCP refresh could not satisfy exact tool allowlist (%s); "
-                "refusing incomplete refresh",
+                "publishing the available authorized subset",
                 ", ".join(sorted(missing_allowlist_names)),
             )
     except Exception:
@@ -7859,28 +7859,6 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
-        if incomplete_allowlist:
-            # A registry refresh is not an authorization boundary change. If
-            # a service-gated exact tool is transiently unavailable while the
-            # registry is rebuilt (for example because a profile-local secret
-            # scope is absent in a background refresh), do not destroy the
-            # complete policy-filtered snapshot that this agent already owns.
-            #
-            # Retention is allowed only when the existing surface still
-            # satisfies the exact policy in both directions. A partial or
-            # unexpectedly broad current snapshot remains fail-closed.
-            current_is_exact = (
-                tool_policy.allowed_names.issubset(current)
-                and all(tool_policy.allows(name) for name in current)
-            )
-            if current_is_exact:
-                agent._tool_snapshot_generation = max(
-                    published_gen, snapshot_generation
-                )
-                return set()
-            new_defs = []
-            new_names = set()
-            staged_engine_names.clear()
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
