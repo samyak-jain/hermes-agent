@@ -21,7 +21,6 @@ def _event(
     *,
     profile: str | None = "default",
     message_id: str = "message-1",
-    ambient: bool = False,
 ) -> MessageEvent:
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -40,7 +39,7 @@ def _event(
         reply_to_message_id="previous",
         reply_to_text="context",
         channel_context="recent room context",
-        metadata={"ambient_room_id": "roundtable"} if ambient else {},
+        metadata={},
         timestamp=datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc),
     )
 
@@ -76,26 +75,13 @@ def test_drain_inbox_round_trips_normalized_event_across_instances(tmp_path):
     assert event.timestamp == datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 
 
-def test_shared_room_profiles_are_distinct_but_acknowledged_once(tmp_path):
+def test_profiles_are_distinct_but_message_is_acknowledged_once(tmp_path):
     store = DrainInbox(tmp_path / "drain.db")
 
-    assert store.enqueue(_event(profile="default", ambient=True)) == (True, True)
-    assert store.enqueue(_event(profile="vegapunk", ambient=True)) == (True, False)
-    assert store.enqueue(_event(profile="vegapunk", ambient=True)) == (False, False)
+    assert store.enqueue(_event(profile="default")) == (True, True)
+    assert store.enqueue(_event(profile="vegapunk")) == (True, False)
+    assert store.enqueue(_event(profile="vegapunk")) == (False, False)
     assert store.count() == 2
-
-
-@pytest.mark.asyncio
-async def test_ambient_queue_acknowledges_with_one_reaction_not_bot_text(tmp_path):
-    runner = object.__new__(GatewayRunner)
-    runner._drain_inbox_store = DrainInbox(tmp_path / "drain.db")
-    event = _event(ambient=True)
-    event.raw_message = SimpleNamespace(add_reaction=AsyncMock())
-
-    result = await runner._queue_external_drain_event(event)
-
-    assert result is None
-    event.raw_message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio
@@ -177,3 +163,88 @@ async def test_replay_waits_for_turn_then_deletes_durable_row(tmp_path):
     assert len(received) == 1
     assert received[0].source.profile == "vegapunk"
     assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_prepares_adapter_before_dispatch_and_delete(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    store = DrainInbox(tmp_path / "drain.db")
+    store.enqueue(_event(profile="vegapunk"))
+    runner._drain_inbox_store = store
+    runner._external_drain_active = False
+    runner._draining = False
+    calls = []
+
+    class Adapter:
+        config = SimpleNamespace(
+            extra={
+                "group_sessions_per_user": True,
+                "thread_sessions_per_user": False,
+            }
+        )
+        _session_tasks = {}
+        _pending_messages = {}
+
+        async def _prepare_external_drain_replay(self, event):
+            calls.append(("prepare", event.message_id))
+            return True
+
+        async def handle_message(self, event):
+            calls.append(("dispatch", event.message_id))
+
+    runner._adapter_for_source = lambda _source: Adapter()
+
+    assert await runner._replay_external_drain_inbox() == 1
+    assert calls == [
+        ("prepare", "message-1"),
+        ("dispatch", "message-1"),
+    ]
+    assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_keeps_row_when_adapter_cannot_prepare(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    store = DrainInbox(tmp_path / "drain.db")
+    store.enqueue(_event())
+    runner._drain_inbox_store = store
+    runner._external_drain_active = False
+    runner._draining = False
+
+    class Adapter:
+        config = SimpleNamespace(extra={})
+        _session_tasks = {}
+        _pending_messages = {}
+
+        async def _prepare_external_drain_replay(self, _event):
+            return False
+
+        async def handle_message(self, _event):
+            raise AssertionError("unprepared replay was dispatched")
+
+    runner._adapter_for_source = lambda _source: Adapter()
+
+    assert await runner._replay_external_drain_inbox() == 0
+    assert store.count() == 1
+
+
+def test_malformed_drain_row_is_flagged_after_first_parse(tmp_path):
+    store = DrainInbox(tmp_path / "drain.db")
+    assert store.pending() == []
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO drain_inbox "
+            "(dedup_key, message_key, payload, created_at) "
+            "VALUES ('bad', 'bad', '{', 1)"
+        )
+
+    assert store.pending() == []
+    assert store.pending() == []
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT invalid_at, invalid_error FROM drain_inbox "
+            "WHERE dedup_key='bad'"
+        ).fetchone()
+
+    assert row[0] is not None
+    assert row[1]

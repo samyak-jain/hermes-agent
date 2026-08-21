@@ -9565,6 +9565,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 try:
                     setattr(event, "_hermes_external_drain_replay", True)
+                    prepare_replay = getattr(
+                        adapter,
+                        "_prepare_external_drain_replay",
+                        None,
+                    )
+                    if callable(prepare_replay):
+                        prepared = await prepare_replay(event)
+                        if prepared is False:
+                            raise RuntimeError(
+                                "adapter could not prepare drain replay"
+                            )
                     await adapter.handle_message(event)
                     session_key = build_session_key(
                         source,

@@ -71,12 +71,18 @@ def test_recovery_stream_failed_new_send_reuses_chunk_index():
         metadata={"_gateway_receipt_ids": ["456"]},
     )
 
-    first = consumer._metadata_for_new_send(final=False)
+    first = consumer._metadata_for_new_send(
+        content="same logical message",
+        final=False,
+    )
     consumer._mark_new_send_delivered(
         first,
         SimpleNamespace(success=False),
     )
-    retry = consumer._metadata_for_new_send(final=True)
+    retry = consumer._metadata_for_new_send(
+        content="same logical message",
+        final=True,
+    )
     consumer._mark_new_send_delivered(
         retry,
         SimpleNamespace(success=True),
@@ -86,6 +92,31 @@ def test_recovery_stream_failed_new_send_reuses_chunk_index():
     assert first["_gateway_recovery_text_chunk_index"] == 0
     assert retry["_gateway_recovery_text_chunk_index"] == 0
     assert next_segment["_gateway_recovery_text_chunk_index"] == 1
+
+
+def test_recovery_stream_failed_interim_does_not_reuse_nonce_for_final():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+        metadata={"_gateway_receipt_ids": ["456"]},
+    )
+
+    interim = consumer._metadata_for_new_send(
+        content="interim status",
+        final=False,
+    )
+    consumer._mark_new_send_delivered(
+        interim,
+        SimpleNamespace(success=False),
+    )
+    final = consumer._metadata_for_new_send(
+        content="final answer",
+        final=True,
+    )
+
+    assert interim["_gateway_recovery_text_chunk_index"] == 0
+    assert final["_gateway_recovery_text_chunk_index"] == 1
 
 
 @pytest.mark.asyncio
