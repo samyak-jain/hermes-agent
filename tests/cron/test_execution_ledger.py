@@ -254,6 +254,63 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
+def test_shutdown_submit_race_releases_claim_without_recording_error(monkeypatch):
+    import cron.scheduler as scheduler
+
+    class ShuttingDownPool:
+        def submit(self, _callable):
+            raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+    job = {
+        "id": "shutdown-race",
+        "name": "shutdown-race",
+        "schedule": {"kind": "once"},
+        "run_claim": {"at": "2026-08-21T00:00:00+00:00", "by": "test"},
+    }
+    finished = []
+    marked = []
+    cleared = []
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-shutdown-race"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_dispatch_error",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "clear_run_claim",
+        lambda job_id: cleared.append(job_id),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_interpreter_shutting_down",
+        lambda exc=None: exc is not None,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_parallel_pool",
+        lambda _workers: ShuttingDownPool(),
+    )
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert finished == []
+    assert marked == []
+    assert cleared == ["shutdown-race"]
+    assert "shutdown-race" not in scheduler.get_running_job_ids()
+
+
 def test_rejected_oneshot_is_due_next_tick_and_attempt_ledger_stays_consistent(
     monkeypatch,
     tmp_path,

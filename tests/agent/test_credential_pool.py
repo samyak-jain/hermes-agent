@@ -1973,6 +1973,18 @@ def _fresh_entry(pool):
     return dc_replace(pool.entries()[0], id="cred-new")
 
 
+def test_entry_for_lease_uses_lease_identity(tmp_path, monkeypatch):
+    pool = _load_two_ok_pool(tmp_path, monkeypatch)
+
+    first_lease = pool.acquire_lease()
+    second_lease = pool.acquire_lease()
+
+    assert first_lease == "cred-1"
+    assert second_lease == "cred-2"
+    assert pool.current().id == "cred-2"
+    assert pool.entry_for_lease(first_lease).id == "cred-1"
+
+
 class TestCredentialPoolQueryLocking:
     """Public pool-state methods must run under ``self._lock``.
 

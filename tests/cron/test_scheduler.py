@@ -834,6 +834,68 @@ cron:
             "memory toolset must not be policy-denied in cron"
         )
 
+    def test_explicit_null_cron_max_iterations_is_unlimited(self, tmp_path):
+        from hermes_cli.config import TURN_LIMIT_UNLIMITED
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: test-model\ncron:\n  max_iterations: null\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "unlimited-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["max_iterations"] == TURN_LIMIT_UNLIMITED
+
+    def test_run_job_resolves_credential_from_lease_id(self, tmp_path):
+        leased_entry = MagicMock(
+            runtime_api_key="leased-key",
+            runtime_base_url="https://leased.invalid/v1",
+        )
+        other_entry = MagicMock(
+            runtime_api_key="other-key",
+            runtime_base_url="https://other.invalid/v1",
+        )
+        pool = MagicMock()
+        pool.acquire_lease.return_value = "leased-id"
+        pool.entry_for_lease.return_value = leased_entry
+        pool.current.return_value = other_entry
+        runtime = {
+            "api_key": "resolver-key",
+            "base_url": "https://resolver.invalid/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "credential_pool": pool,
+        }
+        job = {
+            "id": "lease-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+
+        extra = (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+        )
+        with self._run_job_patches(tmp_path, extra=extra) as (
+            _fake_db,
+            mock_agent_cls,
+        ):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["api_key"] == "leased-key"
+        assert kwargs["base_url"] == "https://leased.invalid/v1"
+        pool.entry_for_lease.assert_called_once_with("leased-id")
+        pool.current.assert_not_called()
+
     def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
         """A per-job enabled_toolsets naming memory keeps it."""
         job = {

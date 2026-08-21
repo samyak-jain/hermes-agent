@@ -2276,6 +2276,18 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
+    def entry_for_lease(self, credential_id: Optional[str]) -> Optional[PooledCredential]:
+        """Return the credential identified by an active lease."""
+        if not credential_id:
+            return None
+        with self._lock:
+            if self._active_leases.get(credential_id, 0) <= 0:
+                return None
+            return next(
+                (entry for entry in self._entries if entry.id == credential_id),
+                None,
+            )
+
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._try_refresh_current_unlocked()

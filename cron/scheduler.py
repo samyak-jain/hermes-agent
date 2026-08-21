@@ -5581,7 +5581,6 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     origin = _resolve_origin(job)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -5888,15 +5887,19 @@ def run_job(
         # cron.max_iterations takes precedence when configured.
         from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
         _cron_cfg = _cfg.get("cron") or {}
-        if isinstance(_cron_cfg, dict) and "max_iterations" in _cron_cfg:
+        _cron_limit_configured = (
+            isinstance(_cron_cfg, dict) and "max_iterations" in _cron_cfg
+        )
+        if _cron_limit_configured:
             _mt = _cron_cfg.get("max_iterations")
         else:
             _mt = _cfg.get("agent", {}).get("max_turns")
-        if _mt is None and not (
-            isinstance(_cron_cfg, dict) and "max_iterations" in _cron_cfg
-        ):
+        if _mt is None and not _cron_limit_configured:
             _mt = _cfg.get("max_turns")
-        max_iterations = _resolve_turn_limit(_mt, default=30)
+        if _cron_limit_configured:
+            max_iterations = _resolve_turn_limit(_mt)
+        else:
+            max_iterations = _resolve_turn_limit(_mt, default=30)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -6219,7 +6222,9 @@ def run_job(
         if credential_pool is not None:
             try:
                 _cron_credential_lease_id = credential_pool.acquire_lease()
-                leased_entry = credential_pool.current()
+                leased_entry = credential_pool.entry_for_lease(
+                    _cron_credential_lease_id
+                )
                 if _cron_credential_lease_id and leased_entry is not None:
                     runtime = dict(runtime)
                     # Never replace a credential already selected by runtime
@@ -7794,6 +7799,16 @@ def tick(
                 fut = pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
+                if (
+                    isinstance(submit_err, RuntimeError)
+                    and _interpreter_shutting_down(submit_err)
+                ):
+                    _clear_run_claim_best_effort()
+                    logger.warning(
+                        "Job '%s' not dispatched — interpreter is shutting down",
+                        job.get("name", job_id),
+                    )
+                    return None
                 dispatch_error = f"Executor dispatch failed: {submit_err}"
                 finish_execution(
                     execution["id"],
@@ -7830,14 +7845,6 @@ def tick(
                         "run claim will expire at TTL",
                         job.get("name", job_id),
                     )
-                # Interpreter began finalizing between the guard above and the
-                # submit — release the in-flight claim we just took and skip.
-                if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
-                    logger.warning(
-                        "Job '%s' not dispatched — interpreter is shutting down",
-                        job.get("name", job_id),
-                    )
-                    return None
                 logger.error(
                     "Job '%s' not dispatched: %s",
                     job.get("name", job_id),
