@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -27,7 +34,7 @@ test("skills use the durable real home when Hermes virtualizes subprocess HOME",
   }
 });
 
-test("a dangling Claude skills symlink does not crash startup", () => {
+test("a dangling Claude skills symlink is repaired without crashing startup", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-skills-dangling-"));
   try {
     const runtimeHome = join(root, "runtime");
@@ -44,7 +51,8 @@ test("a dangling Claude skills symlink does not crash startup", () => {
         HOME: join(runtimeHome, "home"),
       }),
     );
-    assert.equal(existsSync(destination), false);
+    assert.equal(existsSync(destination), true);
+    assert.equal(readlinkSync(destination), join(runtimeHome, "skills"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

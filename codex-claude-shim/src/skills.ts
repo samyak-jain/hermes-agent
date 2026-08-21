@@ -1,4 +1,10 @@
-import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 type RuntimeEnvironment = Record<string, string | undefined>;
@@ -22,8 +28,13 @@ export function ensureRuntimeSkillsVisible(
   if (!existsSync(source)) return;
   try {
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    lstatSync(destination);
-    return;
+    const destinationEntry = lstatSync(destination);
+    if (!destinationEntry.isSymbolicLink() || existsSync(destination)) return;
+    try {
+      unlinkSync(destination);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return;
+    }
   } catch (error: any) {
     if (error?.code !== "ENOENT") return;
   }
