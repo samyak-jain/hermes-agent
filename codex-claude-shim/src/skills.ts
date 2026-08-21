@@ -20,10 +20,16 @@ export function ensureRuntimeSkillsVisible(
   const source = join(runtimeHome, "skills");
   const destination = join(claudeHome, ".claude", "skills");
   if (!existsSync(source)) return;
-  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-  if (existsSync(destination)) {
-    if (lstatSync(destination).isSymbolicLink()) return;
+  try {
+    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+    lstatSync(destination);
+    return;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") return;
+  }
+  try {
+    symlinkSync(source, destination, "dir");
+  } catch {
     return;
   }
-  symlinkSync(source, destination, "dir");
 }
