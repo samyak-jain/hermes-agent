@@ -2723,7 +2723,7 @@ async def test_processing_failure_stops_channel_and_does_not_advance_cursor(
 
 
 @pytest.mark.asyncio
-async def test_silent_ambient_decision_advances_only_after_routing_finishes(
+async def test_silent_routing_decision_advances_only_after_routing_finishes(
     adapter,
 ):
     message_id = _recent_snowflakes(1)[0]
@@ -3300,7 +3300,7 @@ async def test_live_silent_decision_cannot_skip_unregistered_backfill(
     live = make_message(
         message_id=live_id,
         channel=channel,
-        content="unmentioned ambient chatter",
+        content="unmentioned channel chatter",
     )
     routed_live = asyncio.Event()
 

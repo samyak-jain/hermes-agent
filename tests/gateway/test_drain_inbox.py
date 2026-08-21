@@ -21,7 +21,6 @@ def _event(
     *,
     profile: str | None = "default",
     message_id: str = "message-1",
-    ambient: bool = False,
 ) -> MessageEvent:
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -40,7 +39,7 @@ def _event(
         reply_to_message_id="previous",
         reply_to_text="context",
         channel_context="recent room context",
-        metadata={"ambient_room_id": "roundtable"} if ambient else {},
+        metadata={},
         timestamp=datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc),
     )
 
@@ -76,26 +75,13 @@ def test_drain_inbox_round_trips_normalized_event_across_instances(tmp_path):
     assert event.timestamp == datetime(2026, 7, 27, 12, 0, tzinfo=timezone.utc)
 
 
-def test_shared_room_profiles_are_distinct_but_acknowledged_once(tmp_path):
+def test_profiles_are_distinct_but_message_is_acknowledged_once(tmp_path):
     store = DrainInbox(tmp_path / "drain.db")
 
-    assert store.enqueue(_event(profile="default", ambient=True)) == (True, True)
-    assert store.enqueue(_event(profile="vegapunk", ambient=True)) == (True, False)
-    assert store.enqueue(_event(profile="vegapunk", ambient=True)) == (False, False)
+    assert store.enqueue(_event(profile="default")) == (True, True)
+    assert store.enqueue(_event(profile="vegapunk")) == (True, False)
+    assert store.enqueue(_event(profile="vegapunk")) == (False, False)
     assert store.count() == 2
-
-
-@pytest.mark.asyncio
-async def test_ambient_queue_acknowledges_with_one_reaction_not_bot_text(tmp_path):
-    runner = object.__new__(GatewayRunner)
-    runner._drain_inbox_store = DrainInbox(tmp_path / "drain.db")
-    event = _event(ambient=True)
-    event.raw_message = SimpleNamespace(add_reaction=AsyncMock())
-
-    result = await runner._queue_external_drain_event(event)
-
-    assert result is None
-    event.raw_message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio

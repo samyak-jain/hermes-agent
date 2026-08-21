@@ -44,7 +44,6 @@ def _event_payload(event: MessageEvent) -> dict[str, Any]:
         "source_local": {
             "is_bot": bool(source.is_bot),
             "role_authorized": bool(source.role_authorized),
-            "ambient_authorized_bot": bool(source.ambient_authorized_bot),
         },
         "message_id": event.message_id,
         "platform_update_id": event.platform_update_id,
@@ -68,9 +67,6 @@ def _event_from_payload(payload: dict[str, Any]) -> MessageEvent:
     source_local = payload.get("source_local") or {}
     source.is_bot = bool(source_local.get("is_bot"))
     source.role_authorized = bool(source_local.get("role_authorized"))
-    source.ambient_authorized_bot = bool(
-        source_local.get("ambient_authorized_bot")
-    )
     raw_timestamp = payload.get("timestamp")
     try:
         timestamp = datetime.fromisoformat(str(raw_timestamp))
