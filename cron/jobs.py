@@ -136,8 +136,6 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 # OUTPUT_DIR — the documented escape hatch existing tests/embedders use)
 # is distinguishable from the constants merely being stale.
 _IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
-_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
-_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
 
 
 def _current_cron_store() -> _CronStorePaths:
@@ -191,20 +189,6 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
-
-
-def _current_ticker_file(*, success: bool) -> Path:
-    """Resolve a profile-local ticker marker without breaking test overrides."""
-    configured = TICKER_SUCCESS_FILE if success else TICKER_HEARTBEAT_FILE
-    imported = (
-        _IMPORT_TICKER_SUCCESS_FILE
-        if success
-        else _IMPORT_TICKER_HEARTBEAT_FILE
-    )
-    # Preserve the long-standing module-constant monkeypatch surface.
-    if configured != imported:
-        return configured
-    return _current_cron_store().cron_dir / configured.name
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -1156,13 +1140,14 @@ def record_ticker_heartbeat(success: bool = False) -> None:
 
     Best-effort: a write failure must never disrupt the tick loop.
     """
+    store = _current_cron_store()
     try:
-        _atomic_write_epoch(_current_ticker_file(success=False))
+        _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(_current_ticker_file(success=True))
+            _atomic_write_epoch(store.cron_dir / "ticker_last_success")
         except Exception:
             pass
 
@@ -1185,7 +1170,8 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     scoped to the active profile — critical under multiplex_profiles where
     ``hermes cron status`` must report per-profile liveness (#69377).
     """
-    return _epoch_file_age(_current_ticker_file(success=False))
+    store = _current_cron_store()
+    return _epoch_file_age(store.cron_dir / "ticker_heartbeat")
 
 
 def get_ticker_success_age() -> Optional[float]:
@@ -1195,7 +1181,8 @@ def get_ticker_success_age() -> Optional[float]:
     scoped to the active profile — critical under multiplex_profiles where
     ``hermes cron status`` must report per-profile liveness (#69377).
     """
-    return _epoch_file_age(_current_ticker_file(success=True))
+    store = _current_cron_store()
+    return _epoch_file_age(store.cron_dir / "ticker_last_success")
 
 
 def record_catch_up_occurrence() -> None:
@@ -1652,40 +1639,31 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
-def _load_effective_snapshot_config() -> Dict[str, Any]:
-    """Load agent-owned plus managed config for cron inference snapshots."""
-    from hermes_cli.config import load_config_readonly
-
-    cfg = load_config_readonly()
-    return cfg if isinstance(cfg, dict) else {}
-
-
-def _resolve_profile_snapshot_config() -> Dict[str, Any]:
-    """Return the active profile's shared main-model override, if any."""
-    from hermes_cli.model_routing import resolve_profile_model_config
-    from hermes_cli.profiles import get_active_profile_name
-
-    return resolve_profile_model_config(
-        _load_effective_snapshot_config(),
-        get_active_profile_name() or "default",
-    )
-
-
 def _resolve_default_model_snapshot() -> Optional[str]:
-    """Resolve the effective profile/default model the same way cron does.
+    """Resolve the global default model the same way the cron ticker does.
 
     Mirrors the unpinned-model resolution in ``cron/scheduler.py`` ``run_job``:
-    prefer the active profile's ``agent.profile_models`` entry, then read
-    ``model.default`` (or the ``model`` alias / bare string form), applying the
-    managed-scope overlay and env expansion. Used by ``create_job`` to snapshot
-    the effective model for unpinned jobs so a later swap is detected at fire
-    time (#44585).
+    read ``config.yaml`` ``model.default`` (or the ``model`` alias / bare string
+    form), applying the managed-scope overlay and env expansion. Used by
+    ``create_job`` to snapshot the default model for unpinned jobs so a later
+    swap of the global default is detected at fire time (#44585).
 
     Returns the resolved model string, or ``None`` if config is missing/empty
     or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
     """
     try:
-        cfg = _load_effective_snapshot_config()
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return None
+        cfg = read_user_config_raw(cfg_path)
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+        cfg = _expand_env_vars(cfg)
         # Mirror run_job's precedence: the explicit cron-fleet default
         # (cron.model) beats the global chat model for unpinned cron jobs.
         cron_cfg = cfg.get("cron") or {}
@@ -1693,9 +1671,6 @@ def _resolve_default_model_snapshot() -> Optional[str]:
             cron_model = cron_cfg.get("model")
             if isinstance(cron_model, str) and cron_model.strip():
                 return cron_model.strip()
-        profile = _resolve_profile_snapshot_config()
-        if profile.get("model"):
-            return str(profile["model"])
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             return model_cfg.strip() or None
@@ -1781,18 +1756,9 @@ def _compute_provider_model_snapshots(
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            profile = _resolve_profile_snapshot_config()
-            runtime_kwargs = {
-                "requested": profile.get("provider"),
-                "target_model": (
-                    profile.get("model")
-                    or _resolve_default_model_snapshot()
-                ),
-            }
+            runtime_kwargs = {"requested": None}
             if normalized_base_url:
                 runtime_kwargs["explicit_base_url"] = normalized_base_url
-            elif profile.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = profile["base_url"]
             snap = resolve_runtime_provider(**runtime_kwargs)
             snap_provider = str(snap.get("provider") or "").strip().lower()
             provider_snapshot = snap_provider or None

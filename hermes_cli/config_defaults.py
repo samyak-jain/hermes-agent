@@ -2556,10 +2556,6 @@ DEFAULT_CONFIG = {
         # Inference provider paired with cron.model (NOT the scheduler
         # provider below). Empty string = resolve from global config.
         "model_provider": "",
-        # Optional per-profile terminal backends for a multiplexed scheduler.
-        # A matching profile replaces cron.terminal for that profile's jobs;
-        # other profiles retain the default backend and credentials.
-        "profile_terminal": {},
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or

@@ -427,37 +427,10 @@ def _cron_archive_prompt(prompt: str, cfg: dict) -> str:
         return "[omitted because redaction failed]"
 
 
-def _resolve_cron_terminal(cfg: dict) -> dict | None:
-    """Resolve the active profile's trusted cron terminal backend.
-
-    ``cron.terminal`` remains the default for ordinary and single-profile
-    schedulers. A multiplexed secondary profile may select a distinct backend
-    through ``cron.profile_terminal.<profile>`` without repointing every cron
-    job or sharing that profile's credentials with the default profile.
-    """
-    cron_cfg = (cfg or {}).get("cron") or {}
-    if not isinstance(cron_cfg, dict):
-        return None
-
-    raw = cron_cfg.get("terminal")
-    profile_terminals = cron_cfg.get("profile_terminal")
-    if isinstance(profile_terminals, dict):
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-
-            profile = get_active_profile_name() or "default"
-        except Exception:
-            profile = "default"
-        profile_raw = profile_terminals.get(profile)
-        if isinstance(profile_raw, dict):
-            raw = profile_raw
-
-    return raw if isinstance(raw, dict) else None
-
-
 def _register_cron_terminal(session_id: str, cfg: dict) -> bool:
-    """Apply the trusted profile-aware cron terminal to this session only."""
-    raw = _resolve_cron_terminal(cfg)
+    """Apply trusted cron.terminal settings to this cron session only."""
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw = cron_cfg.get("terminal") if isinstance(cron_cfg, dict) else None
     if raw in (None, {}):
         return False
 
@@ -5804,9 +5777,8 @@ def run_job(
             )
 
         # Model resolution precedence: per-job override > cron.model (the
-        # cron-fleet default) > active-profile
-        # ``agent.profile_models`` override > HERMES_MODEL env > config.yaml
-        # ``model:`` (string or ``{default: ...}`). The per-job value is
+        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
+        # (string or ``{default: ...}`). The per-job value is
         # re-read from storage every tick so a ``hermes cron edit --model``
         # after a failed run takes effect on the next tick — there is no
         # in-memory cache.
@@ -5822,7 +5794,6 @@ def run_job(
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
         _model_cfg = {}
-        _profile_model_cfg = {}
         try:
             from hermes_cli.config import read_user_config_raw
             _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -5848,17 +5819,9 @@ def run_job(
                 _cron_default_provider = str(
                     _cron_cfg_for_model.get("model_provider") or ""
                 ).strip()
-            from hermes_cli.model_routing import resolve_profile_model_config
-            from hermes_cli.profiles import get_active_profile_name
-
-            _profile_model_cfg = resolve_profile_model_config(
-                _cfg, get_active_profile_name() or "default"
-            )
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
-                elif _profile_model_cfg.get("model"):
-                    model = _profile_model_cfg["model"]
                 else:
                     # Shared with Desktop's post-save impact summary so both
                     # paths compare snapshots against the same global model.
@@ -6022,15 +5985,11 @@ def run_job(
             return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
         primary_model_for_drift = model
-        configured_provider_for_drift = str(
-            _profile_model_cfg.get("provider")
-            or (
-                _model_cfg.get("provider")
-                if isinstance(_model_cfg, dict)
-                else ""
-            )
-            or ""
-        ).strip().lower()
+        configured_provider_for_drift = (
+            str(_model_cfg.get("provider") or "").strip().lower()
+            if isinstance(_model_cfg, dict)
+            else ""
+        )
         primary_provider_for_drift = (
             str(job.get("provider") or "").strip().lower()
             or configured_provider_for_drift
@@ -6044,12 +6003,9 @@ def run_job(
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
                 # Per-job user pin wins; otherwise the cron-fleet default
-                # provider, then the active profile's main provider.
-                "requested": (
-                    job.get("provider")
-                    or _cron_default_provider
-                    or _profile_model_cfg.get("provider")
-                ),
+                # provider (cron.model_provider); otherwise resolve from
+                # persisted global config.
+                "requested": job.get("provider") or _cron_default_provider or None,
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -6059,10 +6015,6 @@ def run_job(
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
-            if not job.get("provider"):
-                for key in ("api_mode", "base_url", "max_tokens"):
-                    if _profile_model_cfg.get(key) not in (None, ""):
-                        runtime[key] = _profile_model_cfg[key]
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
                 or primary_provider_for_drift

@@ -229,39 +229,6 @@ class TestCreateJobSnapshot:
 
         assert job["provider_snapshot"] is None
 
-    def test_unpinned_profile_job_snapshots_effective_override(
-        self, monkeypatch, tmp_path
-    ):
-        jobs = self._isolate_storage(monkeypatch)
-        monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
-        managed = {
-            "model": {"default": "claude-fable-5", "provider": "anthropic"},
-            "agent": {
-                "profile_models": {
-                    "vegapunk": {
-                        "provider": "anthropic",
-                        "model": "claude-opus-5",
-                    }
-                }
-            },
-        }
-        with patch(
-            "hermes_cli.managed_scope.apply_managed_overlay",
-            return_value=managed,
-        ), patch(
-            "hermes_cli.profiles.get_active_profile_name",
-            return_value="vegapunk",
-        ), patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={"provider": "anthropic"},
-        ) as resolver:
-            job = jobs.create_job(prompt="do a thing", schedule="every 1 hour")
-
-        assert job["provider_snapshot"] == "anthropic"
-        assert job["model_snapshot"] == "claude-opus-5"
-        assert resolver.call_args.kwargs["requested"] == "anthropic"
-        assert resolver.call_args.kwargs["target_model"] == "claude-opus-5"
-
 
 def _run_with_current_provider_and_model(
     job,

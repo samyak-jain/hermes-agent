@@ -4037,9 +4037,9 @@ def _resolve_tool_policy_for_source(
                     "Ignoring unmanaged Discord tool policy override for channel %s",
                     key,
                 )
-                return base_policy
+                return global_policy
         except Exception:
-            return base_policy
+            return global_policy
     resolved = parse_tool_policy(
         channel_override.tool_policy,
         source=policy_path,
@@ -8331,9 +8331,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        ``agent.profile_models`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider
-        resolution).
+        global config/env (``_resolve_gateway_model(user_config)`` and default
+        provider resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -8400,46 +8399,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
-
-        # A multiplexed gateway serves independent agents from one process.
-        # Their primary inference runtimes must therefore be selectable by
-        # profile without relying on a session-local /model override or
-        # duplicating the whole gateway.  Keep this below session overrides
-        # and channel overrides, but above the process-global default.
-        if source is not None and isinstance(user_config, dict):
-            profile_name = str(
-                source.profile or self._active_profile_name() or "default"
-            )
-            from hermes_cli.model_routing import resolve_profile_model_config
-
-            profile_model = resolve_profile_model_config(
-                user_config, profile_name
-            )
-            if profile_model:
-                profile_provider = str(
-                    profile_model.get("provider") or ""
-                ).strip()
-                profile_model_name = str(
-                    profile_model.get("model") or ""
-                ).strip()
-                if profile_provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        profile_provider
-                    )
-                    provider_default_model = runtime_kwargs.pop("model", None)
-                    if provider_default_model and not profile_model_name:
-                        model = provider_default_model
-                if profile_model_name:
-                    model = profile_model_name
-                for key in ("api_mode", "base_url", "max_tokens"):
-                    if profile_model.get(key) not in (None, ""):
-                        runtime_kwargs[key] = profile_model[key]
-                logger.info(
-                    "Profile model override: profile=%s provider=%s model=%s",
-                    profile_name,
-                    runtime_kwargs.get("provider") or profile_provider or "",
-                    model,
-                )
 
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
@@ -29165,46 +29124,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
-        _profile_terminal_registered = False
-        _profile_name = str(source.profile or self._active_profile_name() or "default")
-        _profile_terminal_cfg = (
-            (user_config.get("agent") or {}).get("profile_terminal") or {}
-        )
-        _profile_terminal_raw = (
-            _profile_terminal_cfg.get(_profile_name)
-            if isinstance(_profile_terminal_cfg, dict)
-            else None
-        )
-        if isinstance(_profile_terminal_raw, dict):
-            try:
-                from tools.delegate_tool import _get_child_terminal_overrides
-                from tools.terminal_tool import register_task_env_overrides
-
-                _profile_terminal_overrides = _get_child_terminal_overrides(
-                    {"child_terminal": _profile_terminal_raw}
-                )
-                if _profile_terminal_overrides:
-                    register_task_env_overrides(
-                        session_id, _profile_terminal_overrides
-                    )
-                    _profile_terminal_registered = True
-            except Exception:
-                logger.error(
-                    "Could not register terminal sandbox for profile %s",
-                    _profile_name,
-                    exc_info=True,
-                )
-                return {
-                    "final_response": (
-                        "The managed terminal sandbox for this agent is "
-                        "unavailable, so this turn was stopped safely."
-                    ),
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-                    "session_id": session_id,
-                }
-
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
@@ -30621,18 +30540,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "background turn task failed during cleanup",
                             exc_info=True,
                         )
-            if _profile_terminal_registered:
-                try:
-                    from tools.terminal_tool import clear_task_env_overrides
-
-                    clear_task_env_overrides(session_id)
-                except Exception:
-                    logger.warning(
-                        "Could not clear terminal sandbox for profile %s",
-                        _profile_name,
-                        exc_info=True,
-                    )
-
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
         # BUT: never suppress delivery when the agent failed — the error

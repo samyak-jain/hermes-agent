@@ -17,7 +17,6 @@ from cron.scheduler import (
     _cron_archive_prompt,
     _attach_cron_memory_store,
     _register_cron_terminal,
-    _resolve_cron_terminal,
     _resolve_cron_enabled_toolsets,
     _resolve_cron_tool_policy,
     _resolve_delivery_target,
@@ -199,39 +198,6 @@ class TestCronToolPolicy:
         assert overrides["env_type"] == "ssh"
         assert overrides["cwd"] == "/data"
         assert overrides["ssh_sync_files"] is False
-
-    def test_secondary_profile_terminal_replaces_shared_cron_default(self):
-        cfg = {
-            "cron": {
-                "terminal": {
-                    "backend": "ssh",
-                    "ssh_host_file": "/run/secrets/sandbox-ip",
-                },
-                "profile_terminal": {
-                    "vegapunk": {
-                        "backend": "ssh",
-                        "ssh_host_file": "/run/secrets/operator-ip",
-                    },
-                },
-            },
-        }
-
-        with patch(
-            "hermes_cli.profiles.get_active_profile_name",
-            return_value="vegapunk",
-        ):
-            assert _resolve_cron_terminal(cfg) == {
-                "backend": "ssh",
-                "ssh_host_file": "/run/secrets/operator-ip",
-            }
-        with patch(
-            "hermes_cli.profiles.get_active_profile_name",
-            return_value="default",
-        ):
-            assert _resolve_cron_terminal(cfg) == {
-                "backend": "ssh",
-                "ssh_host_file": "/run/secrets/sandbox-ip",
-            }
 
     def test_cron_script_uses_registered_terminal_and_cleans_it_up(self):
         import cron.scheduler as scheduler
@@ -1286,152 +1252,6 @@ class TestRunJobConfigEnvVarExpansion:
         "provider": "openrouter",
         "api_mode": "chat_completions",
     }
-
-    def test_null_model_uses_profile_override_without_local_config(
-        self, tmp_path, monkeypatch
-    ):
-        """A named profile with no config.yaml inherits its managed main route."""
-        monkeypatch.delenv("HERMES_MODEL", raising=False)
-        managed = {
-            "model": {
-                "default": "claude-fable-5",
-                "provider": "anthropic",
-                "agent_runtime": "codex_app_server",
-            },
-            "agent": {
-                "profile_models": {
-                    "vegapunk": {
-                        "provider": "anthropic",
-                        "model": "claude-opus-5",
-                    }
-                }
-            },
-        }
-        runtime = {
-            "api_key": None,
-            "base_url": None,
-            "provider": "anthropic",
-            "api_mode": "codex_app_server",
-        }
-        job = {
-            "id": "profile-null-model",
-            "name": "profile null model",
-            "prompt": "hi",
-            "model": None,
-            "provider": None,
-        }
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_cli.managed_scope.apply_managed_overlay",
-                   return_value=managed), \
-             patch("hermes_cli.profiles.get_active_profile_name",
-                   return_value="vegapunk"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=runtime) as resolve_runtime, \
-             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        assert resolve_runtime.call_args_list[-1] == call(
-            requested="anthropic",
-            target_model="claude-opus-5",
-        )
-        kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["model"] == "claude-opus-5"
-        assert kwargs["provider"] == "anthropic"
-        assert kwargs["api_mode"] == "codex_app_server"
-
-    @pytest.mark.parametrize(
-        ("profile_name", "expected_model", "token"),
-        [
-            ("default", "claude-fable-5", "LENA_SUBSCRIPTION_CRON_OK"),
-            ("vegapunk", "claude-opus-5", "VEGAPUNK_SUBSCRIPTION_CRON_OK"),
-        ],
-    )
-    def test_null_model_executes_with_profile_subscription_credential(
-        self, tmp_path, monkeypatch, profile_name, expected_model, token
-    ):
-        """Both profile routes execute through the resolved OAuth credential."""
-        monkeypatch.delenv("HERMES_MODEL", raising=False)
-        managed = {
-            "model": {
-                "default": "claude-fable-5",
-                "provider": "anthropic",
-                "agent_runtime": "codex_app_server",
-                "codex_app_server": {"adapter": "claude_agent_sdk"},
-            },
-            "agent": {
-                "profile_models": {
-                    "vegapunk": {
-                        "provider": "anthropic",
-                        "model": "claude-opus-5",
-                    }
-                }
-            },
-        }
-        oauth_token = "sk-ant-oat-test-subscription-token"
-        runtime = {
-            "api_key": oauth_token,
-            "base_url": "https://api.anthropic.com",
-            "provider": "anthropic",
-            "api_mode": "codex_app_server",
-            "credential_pool": None,
-        }
-        job = {
-            "id": f"{profile_name}-subscription-null-model",
-            "name": f"{profile_name} subscription null model",
-            "prompt": f"Return exactly {token}",
-            "model": None,
-            "provider": None,
-        }
-        fake_db = MagicMock()
-
-        class ExecutingAgent:
-            def __init__(self, *args, **kwargs):
-                assert kwargs["model"] == expected_model
-                assert kwargs["provider"] == "anthropic"
-                assert kwargs["api_mode"] == "codex_app_server"
-                assert kwargs["api_key"] == oauth_token
-
-            def run_conversation(self, prompt, **kwargs):
-                assert job["prompt"] in prompt
-                return {
-                    "final_response": token,
-                    "completed": True,
-                    "failed": False,
-                }
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_cli.managed_scope.apply_managed_overlay",
-                   return_value=managed), \
-             patch("hermes_cli.profiles.get_active_profile_name",
-                   return_value=profile_name), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=runtime), \
-             patch("agent.credential_pool.load_pool") as load_pool, \
-             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
-             patch("run_agent.AIAgent", ExecutingAgent):
-            success, output, final_response, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        assert final_response == token
-        assert token in output
-        load_pool.assert_not_called()
 
     def test_null_model_uses_bare_global_config(
         self, tmp_path, monkeypatch
