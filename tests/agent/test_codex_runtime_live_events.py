@@ -25,6 +25,7 @@ def _recording_agent():
         "tool_progress": [],
         "tool_start": [],
         "tool_complete": [],
+        "external": [],
     }
     agent = SimpleNamespace(
         _fire_stream_delta=lambda text: calls["stream"].append(text),
@@ -42,6 +43,9 @@ def _recording_agent():
             "tool_complete"
         ].append((call_id, name, args, result)),
         _emit_interim_assistant_message=None,
+        _external_event_sink=lambda event, payload: calls["external"].append(
+            (event, payload)
+        ),
         show_commentary=True,
     )
     return agent, calls
@@ -57,6 +61,67 @@ def test_agent_message_and_reasoning_deltas_are_forwarded_live():
 
     assert calls["stream"] == ["Working"]
     assert calls["reasoning"] == ["Thinking", "Summary"]
+    assert calls["external"] == [
+        ("thinking.delta", {"delta": "Thinking"}),
+        ("thinking.delta", {"delta": "Summary"}),
+    ]
+
+
+def test_provider_tool_lifecycle_is_forwarded_with_exact_call_id():
+    agent, calls = _recording_agent()
+    bridge = make_codex_app_server_event_bridge(agent)
+    bridge({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "type": "mcpToolCall",
+                "id": "toolu_provider_123",
+                "providerCallId": "toolu_provider_123",
+                "server": "agent-runtime",
+                "tool": "workshop_write",
+                "arguments": {},
+            }
+        },
+    })
+    bridge({
+        "method": "item/toolCall/argumentsDelta",
+        "params": {
+            "callId": "toolu_provider_123",
+            "name": "workshop_write",
+            "delta": '{"path":',
+        },
+    })
+    bridge({
+        "method": "item/toolCall/argumentsCompleted",
+        "params": {
+            "callId": "toolu_provider_123",
+            "name": "workshop_write",
+            "arguments": {"path": "README.md"},
+        },
+    })
+
+    assert calls["external"] == [
+        (
+            "tool_call.start",
+            {"call_id": "toolu_provider_123", "name": "workshop_write"},
+        ),
+        (
+            "tool_call.arguments.delta",
+            {
+                "call_id": "toolu_provider_123",
+                "name": "workshop_write",
+                "delta": '{"path":',
+            },
+        ),
+        (
+            "tool_call.end",
+            {
+                "call_id": "toolu_provider_123",
+                "name": "workshop_write",
+                "arguments": {"path": "README.md"},
+            },
+        ),
+    ]
 
 
 def test_command_start_and_complete_fire_both_callback_contracts():

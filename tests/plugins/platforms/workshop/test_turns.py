@@ -10,6 +10,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import build_session_key
+from agent.codex_runtime import make_codex_app_server_event_bridge
 from plugins.platforms.workshop.adapter import WorkshopAdapter
 from plugins.platforms.workshop.auth import WorkshopAuthenticator
 from plugins.platforms.workshop.http import WorkshopHTTPController
@@ -212,6 +213,84 @@ async def test_after_seq_replays_only_later_semantic_events(tmp_path):
 
     assert [item["event"] for item in replay_records] == ["usage", "turn.end"]
     assert [item["seq"] for item in replay_records] == [4, 5]
+
+
+@pytest.mark.asyncio
+async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(tmp_path):
+    async def handler(event):
+        bridge = make_codex_app_server_event_bridge(
+            SimpleNamespace(
+                _external_event_sink=event.metadata["_gateway_event_sink"],
+                _fire_reasoning_delta=None,
+                tool_progress_callback=None,
+                tool_start_callback=None,
+            )
+        )
+        bridge({
+            "method": "item/reasoning/delta",
+            "params": {"delta": "private thought"},
+        })
+        bridge({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "mcpToolCall",
+                    "id": "toolu_exact_123",
+                    "providerCallId": "toolu_exact_123",
+                    "server": "agent-runtime",
+                    "tool": "workshop_write",
+                    "arguments": {},
+                }
+            },
+        })
+        bridge({
+            "method": "item/toolCall/argumentsDelta",
+            "params": {
+                "callId": "toolu_exact_123",
+                "name": "workshop_write",
+                "delta": '{"path":',
+            },
+        })
+        bridge({
+            "method": "item/toolCall/argumentsCompleted",
+            "params": {
+                "callId": "toolu_exact_123",
+                "name": "workshop_write",
+                "arguments": {"path": "README.md"},
+            },
+        })
+        return {"final_response": "done"}
+
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        records = _sse_records(await response.text())
+
+    turn_id = records[0]["turn_id"]
+    assert [record["event"] for record in records] == [
+        "turn.started",
+        "message.start",
+        "thinking.delta",
+        "tool_call.start",
+        "tool_call.arguments.delta",
+        "tool_call.end",
+        "text.delta",
+        "usage",
+        "turn.end",
+    ]
+    assert records[3]["call_id"] == "toolu_exact_123"
+    assert records[5]["arguments"] == {"path": "README.md"}
+    assert [item.event for item in adapter.ledger.list_events(turn_id)] == [
+        "turn.started",
+        "message.start",
+        "tool_call.start",
+        "tool_call.end",
+        "text.delta",
+        "usage",
+        "turn.end",
+    ]
 
 
 @pytest.mark.asyncio

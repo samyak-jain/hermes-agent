@@ -504,6 +504,29 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _fire_external_event(event_type: str, payload: dict) -> None:
+        callback = getattr(agent, "_external_event_sink", None)
+        if callback is None:
+            return
+        try:
+            callback(event_type, payload)
+        except Exception:
+            logger.debug(
+                "external runtime event callback raised for %s",
+                event_type,
+                exc_info=True,
+            )
+
+    def _provider_tool_identity(item: dict) -> tuple[str, str] | None:
+        call_id = item.get("providerCallId")
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        if item.get("type") == "mcpToolCall" and item.get("server") == "agent-runtime":
+            name = item.get("tool") or "unknown"
+        else:
+            name = _codex_item_to_tool_name(item)
+        return call_id, str(name)
+
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
@@ -552,6 +575,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 logger.debug(
                     "tool_start_callback raised for %s", name, exc_info=True,
                 )
+        provider_identity = _provider_tool_identity(item)
+        if provider_identity is not None:
+            call_id, provider_name = provider_identity
+            _fire_external_event(
+                "tool_call.start",
+                {"call_id": call_id, "name": provider_name},
+            )
 
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
@@ -605,12 +635,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(text, str) or not text:
             return
         fn = getattr(agent, "_fire_reasoning_delta", None)
-        if fn is None:
-            return
-        try:
-            fn(text)
-        except Exception:
-            logger.debug("_fire_reasoning_delta raised", exc_info=True)
+        if fn is not None:
+            try:
+                fn(text)
+            except Exception:
+                logger.debug("_fire_reasoning_delta raised", exc_info=True)
+        _fire_external_event("thinking.delta", {"delta": text})
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
@@ -643,6 +673,32 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
+            return
+        if method == "item/toolCall/argumentsDelta":
+            call_id = params.get("callId")
+            name = params.get("name")
+            delta = params.get("delta")
+            if all(isinstance(value, str) and value for value in (call_id, name)) and isinstance(delta, str):
+                _fire_external_event(
+                    "tool_call.arguments.delta",
+                    {"call_id": call_id, "name": name, "delta": delta},
+                )
+            return
+        if method == "item/toolCall/argumentsCompleted":
+            call_id = params.get("callId")
+            name = params.get("name")
+            arguments = params.get("arguments")
+            if (
+                isinstance(call_id, str)
+                and call_id
+                and isinstance(name, str)
+                and name
+                and isinstance(arguments, dict)
+            ):
+                _fire_external_event(
+                    "tool_call.end",
+                    {"call_id": call_id, "name": name, "arguments": arguments},
+                )
             return
         item = params.get("item")
         if not isinstance(item, dict):

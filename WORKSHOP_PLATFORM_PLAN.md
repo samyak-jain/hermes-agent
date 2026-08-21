@@ -33,7 +33,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | 1. Protocol, ledger, auth, route seam | Complete | Strict fixture-backed protocol, shared-state ledger/recovery, separate bearer auth, plugin skeleton, and collision-fatal `api_route_factory` seam implemented. Focused suite: 53 passed. |
 | B6 provider tool-use-ID spike | Complete | Claude Agent SDK 0.3.207 passes the provider ID as `extra._meta["claudecode/toolUseId"]`; the shim forwards it exactly. No FIFO/name correlation. Shim suite: 18 passed. |
 | 2. Stateful adapter and text stream | Complete | Deterministic workspace/chat lanes, execution-epoch session pinning, independent turn tasks, durable ordered SSE text/usage/end events, replay/reattach, disconnect survival, same-lane serialization, cross-lane concurrency, atomic capacity admission, and managed platform-wide tool policy are implemented. Focused phase suite: 262 passed. |
-| 3-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
+| 3. Raw runtime event bridge | Complete | Claude SDK partial events now preserve live thinking, exact provider `tool_use` IDs, raw argument fragments, and complete parsed arguments through the Codex shim into workshop SSE. Semantic events remain replayable while thinking/argument fragments remain live-only. |
+| 4-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
 
 Phase-1 verification notes:
 
@@ -52,6 +53,18 @@ Phase-2 verification notes:
 - The focused phase suite is green: 262 tests passed across workshop protocol/storage/auth/HTTP/turn coordination, API route registration, platform configuration, and managed tool-policy resolution. The Claude shim suite is also green at 18 tests, including exact provider tool-use-ID propagation. Ruff and `git diff --check` pass on every changed Python surface.
 - The repository-wide runner completed all 2,138 files with 43,589 passing tests. It encountered a host `/tmp` quota during the run; all 238 affected tests pass when rerun with a worktree-local temp directory. Two unrelated long-running `run_agent` files exceeded the runner's 300-second per-file timeout under the loaded host; an isolated retry of `test_provider_fallback.py` reproduced the pre-existing hang after its first 12 tests and was stopped after confirming it was outside workshop execution.
 - Five genuine assertions remain, and all five reproduce from a clean archive of production starting commit `db5281cade17b6292f22768ce26123cec7956093`: one AWS-region default assertion in `tests/agent/test_bedrock_integration.py`, two model-catalog assertions in `tests/hermes_cli/test_models.py`, and two restricted-PATH SSH fixture assertions in `tests/tools/test_ssh_environment.py`. Phase 2 introduces no new full-suite assertion failure.
+
+Phase-3 implementation notes:
+
+- The Claude shim projects SDK `content_block_start`, `thinking_delta`, `input_json_delta`, and `content_block_stop` messages into the Codex app-server protocol. The provider's `toolu_...` identifier is carried unchanged on the tool item and every argument event; no name or FIFO correlation exists.
+- `make_codex_app_server_event_bridge()` forwards runtime-native thinking and tool events through a volatile per-turn sink. `GatewayRunner` resets that sink on every cached-agent turn so a later non-workshop turn cannot inherit an old subscriber.
+- The workshop stream persists `tool_call.start` and `tool_call.end` (with complete arguments), but does not persist `thinking.delta` or `tool_call.arguments.delta`. An end-to-end bridge/HTTP/ledger test proves both the live order and the privacy boundary.
+- That test exposed and fixed an SSE merge race: observing a higher live-only sequence could previously advance the cursor past a lower SQLite event. Each active turn now retains a bounded 512 KiB recent window of all events and merges it by sequence with durable replay; persistent rows remain recoverable after the window evicts them.
+
+Phase-3 verification notes:
+
+- Claude shim: 19 passed. Focused Python event/workshop suite: 106 passed. After the ordering-race fix, the broader repository Codex plus workshop suite is green at 816 passed, including all 7 turn-stream tests. Ruff and `git diff --check` pass.
+- The repository-wide runner completed all 2,138 test files on the phase-3 source before the final localized stream-merge fix: 43,687 tests passed. The five known production-base assertions remained unchanged. Twelve failures were host temporary-storage quota artifacts and all 95 affected tests passed in isolated retries. `tests/run_agent/test_run_agent.py` exceeded the per-file timeout because a baseline model-metadata test attempts DNS access to `proxy.example`; a faulthandler trace confirmed the block is outside workshop execution.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 

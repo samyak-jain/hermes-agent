@@ -6,7 +6,9 @@ import test from "node:test";
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "@anthropic-ai/claude-agent-sdk";
 import { ThreadStore, type ThreadState } from "./threads.js";
 import {
+  createPartialStreamState,
   handleSystemMessage,
+  handlePartialStreamEvent,
   mcpServer,
   promptForTurn,
   systemPromptForThread,
@@ -133,6 +135,89 @@ test("provider tool_use ID extraction fails closed on malformed metadata", () =>
     }),
     "toolu_provider_identity_123",
   );
+});
+
+test("partial SDK events preserve thinking and provider tool-call identity", () => {
+  const notifications: Array<{
+    method: string;
+    params: Record<string, any>;
+  }> = [];
+  const rpc = {
+    notify(method: string, params: Record<string, any>) {
+      notifications.push({ method, params });
+    },
+  };
+  const state = createPartialStreamState();
+  const toolItems = new Map();
+  const emit = (event: Record<string, unknown>) =>
+    handlePartialStreamEvent({
+      rpc: rpc as never,
+      threadId: "thr_test",
+      turnId: "turn-1",
+      event,
+      state,
+      toolItems,
+    });
+
+  emit({
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "thinking", thinking: "" },
+  });
+  emit({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "thinking_delta", thinking: "reason" },
+  });
+  emit({ type: "content_block_stop", index: 0 });
+  emit({
+    type: "content_block_start",
+    index: 1,
+    content_block: {
+      type: "tool_use",
+      id: "toolu_provider_123",
+      name: "workshop_write",
+      input: {},
+    },
+  });
+  emit({
+    type: "content_block_delta",
+    index: 1,
+    delta: { type: "input_json_delta", partial_json: '{"path":' },
+  });
+  emit({
+    type: "content_block_delta",
+    index: 1,
+    delta: { type: "input_json_delta", partial_json: '"README.md"}' },
+  });
+  emit({ type: "content_block_stop", index: 1 });
+
+  assert.deepEqual(
+    notifications.map(({ method }) => method),
+    [
+      "item/started",
+      "item/reasoning/delta",
+      "item/completed",
+      "item/started",
+      "item/toolCall/argumentsDelta",
+      "item/toolCall/argumentsDelta",
+      "item/toolCall/argumentsCompleted",
+    ],
+  );
+  assert.equal(notifications[1].params.delta, "reason");
+  assert.equal(
+    notifications[3].params.item.providerCallId,
+    "toolu_provider_123",
+  );
+  assert.deepEqual(notifications[6].params, {
+    threadId: "thr_test",
+    turnId: "turn-1",
+    itemId: "toolu_provider_123",
+    callId: "toolu_provider_123",
+    name: "workshop_write",
+    arguments: { path: "README.md" },
+    argumentsJson: '{"path":"README.md"}',
+  });
 });
 
 test("new SDK sessions skip automatic model-generated titles", () => {

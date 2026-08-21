@@ -10,22 +10,22 @@ import logging
 import threading
 from typing import Any, Awaitable, Callable
 
-from .protocol import LIVE_ONLY_EVENT_TYPES, WorkshopEvent, WorkshopEventType
+from .protocol import WorkshopEvent, WorkshopEventType
 from .storage import TERMINAL_TURN_STATES, WorkshopLedger
 
 
 logger = logging.getLogger(__name__)
 
 _SSE_KEEPALIVE_SECONDS = 15.0
-_MAX_LIVE_PREVIEW_BYTES = 512 * 1024
+_MAX_RECENT_EVENT_BYTES = 512 * 1024
 
 
 @dataclass
 class _LiveTurn:
     loop: asyncio.AbstractEventLoop
     changed: asyncio.Event = field(default_factory=asyncio.Event)
-    preview_events: deque[tuple[WorkshopEvent, int]] = field(default_factory=deque)
-    preview_bytes: int = 0
+    recent_events: deque[tuple[WorkshopEvent, int]] = field(default_factory=deque)
+    recent_bytes: int = 0
     subscribers: int = 0
     task: asyncio.Task | None = None
     text_parts: list[str] = field(default_factory=list)
@@ -37,25 +37,28 @@ class _LiveTurn:
             if isinstance(delta, str):
                 with self.lock:
                     self.text_parts.append(delta)
-        if event.event in LIVE_ONLY_EVENT_TYPES:
-            size = len(
-                json.dumps(
-                    event.to_wire(), ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
-            )
-            with self.lock:
-                self.preview_events.append((event, size))
-                self.preview_bytes += size
-                while (
-                    self.preview_events and self.preview_bytes > _MAX_LIVE_PREVIEW_BYTES
-                ):
-                    _old, old_size = self.preview_events.popleft()
-                    self.preview_bytes -= old_size
+        # Keep a bounded recent window of every event, not just live-only
+        # previews. A subscriber reads SQLite and this window independently;
+        # retaining persistent events here closes the race where a higher live
+        # sequence is observed before the preceding SQLite row and advances the
+        # cursor past it. Persistent events remain recoverable after eviction;
+        # thinking and raw argument fragments remain live-only.
+        size = len(
+            json.dumps(
+                event.to_wire(), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        )
+        with self.lock:
+            self.recent_events.append((event, size))
+            self.recent_bytes += size
+            while self.recent_events and self.recent_bytes > _MAX_RECENT_EVENT_BYTES:
+                _old, old_size = self.recent_events.popleft()
+                self.recent_bytes -= old_size
         self.loop.call_soon_threadsafe(self.changed.set)
 
-    def previews_after(self, seq: int) -> list[WorkshopEvent]:
+    def recent_after(self, seq: int) -> list[WorkshopEvent]:
         with self.lock:
-            return [event for event, _size in self.preview_events if event.seq > seq]
+            return [event for event, _size in self.recent_events if event.seq > seq]
 
     def emitted_text(self) -> str:
         with self.lock:
@@ -186,7 +189,7 @@ class WorkshopTurnCoordinator:
                 durable = await asyncio.to_thread(
                     self.ledger.list_events, turn_id, after_seq=cursor
                 )
-                previews = live.previews_after(cursor) if live is not None else []
+                previews = live.recent_after(cursor) if live is not None else []
                 pending = {item.seq: item for item in durable}
                 pending.update({item.seq: item for item in previews})
                 for seq in sorted(pending):
@@ -216,7 +219,7 @@ class WorkshopTurnCoordinator:
                 # live-only previews remain in the bounded in-memory deque.
                 if await asyncio.to_thread(
                     self.ledger.list_events, turn_id, after_seq=cursor
-                ) or live.previews_after(cursor):
+                ) or live.recent_after(cursor):
                     continue
                 try:
                     await asyncio.wait_for(

@@ -21266,6 +21266,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stream_delta_cb,
                 external_event_sink,
             )
+            # Volatile per-turn bridge for runtime-native event granularity
+            # (thinking and tool argument fragments). The cached agent must
+            # never retain a prior workshop turn's sink.
+            agent._external_event_sink = external_event_sink
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
