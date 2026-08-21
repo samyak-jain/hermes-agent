@@ -177,3 +177,66 @@ async def test_replay_waits_for_turn_then_deletes_durable_row(tmp_path):
     assert len(received) == 1
     assert received[0].source.profile == "vegapunk"
     assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_prepares_adapter_before_dispatch_and_delete(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    store = DrainInbox(tmp_path / "drain.db")
+    store.enqueue(_event(profile="vegapunk"))
+    runner._drain_inbox_store = store
+    runner._external_drain_active = False
+    runner._draining = False
+    calls = []
+
+    class Adapter:
+        config = SimpleNamespace(
+            extra={
+                "group_sessions_per_user": True,
+                "thread_sessions_per_user": False,
+            }
+        )
+        _session_tasks = {}
+        _pending_messages = {}
+
+        async def _prepare_external_drain_replay(self, event):
+            calls.append(("prepare", event.message_id))
+            return True
+
+        async def handle_message(self, event):
+            calls.append(("dispatch", event.message_id))
+
+    runner._adapter_for_source = lambda _source: Adapter()
+
+    assert await runner._replay_external_drain_inbox() == 1
+    assert calls == [
+        ("prepare", "message-1"),
+        ("dispatch", "message-1"),
+    ]
+    assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_keeps_row_when_adapter_cannot_prepare(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    store = DrainInbox(tmp_path / "drain.db")
+    store.enqueue(_event())
+    runner._drain_inbox_store = store
+    runner._external_drain_active = False
+    runner._draining = False
+
+    class Adapter:
+        config = SimpleNamespace(extra={})
+        _session_tasks = {}
+        _pending_messages = {}
+
+        async def _prepare_external_drain_replay(self, _event):
+            return False
+
+        async def handle_message(self, _event):
+            raise AssertionError("unprepared replay was dispatched")
+
+    runner._adapter_for_source = lambda _source: Adapter()
+
+    assert await runner._replay_external_drain_inbox() == 0
+    assert store.count() == 1

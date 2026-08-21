@@ -4421,6 +4421,12 @@ class DiscordAdapter(BasePlatformAdapter):
     def _is_down_notice_content(self, content: str) -> bool:
         """Recognize only explicit Hermes/gateway outage notices."""
         text = (content or "").lower()
+        if (
+            "maintenance is queued" in text
+            and "saved your message" in text
+            and "gateway is back" in text
+        ):
+            return True
         subject = r"(?:hermes|the agent|agent|the gateway|gateway|bmo)"
         state = r"(?:is|was|appears to be|is currently|was currently)"
         condition = r"(?:down|offline|unavailable|not running)"
@@ -4603,7 +4609,12 @@ class DiscordAdapter(BasePlatformAdapter):
         finally:
             self._discord_recovery_store.release_claim_guard(channel_guard)
 
-    def _claim_live_discord_message(self, message: Any) -> Optional[str]:
+    def _claim_live_discord_message(
+        self,
+        message: Any,
+        *,
+        force_takeover: bool = False,
+    ) -> Optional[str]:
         """Atomically claim live ingress or identify its durable owner.
 
         Returns ``"claimed"`` for new/retryable work, ``"active"`` while a
@@ -4677,6 +4688,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if (
                     status in {"queued", "processing"}
                     and updated_at >= active_cutoff
+                    and not force_takeover
                 ):
                     return "active"
                 if status == "processed" or (
@@ -4730,6 +4742,57 @@ class DiscordAdapter(BasePlatformAdapter):
             self._discord_recovery_claim_epochs[message_id] = int(result[1])
             return "claimed"
         return result
+
+    async def _prepare_external_drain_replay(
+        self,
+        event: MessageEvent,
+    ) -> bool:
+        """Rebuild this adapter's durable ownership before drain replay."""
+        receipt_ids = self._discord_event_receipt_ids(event)
+        if not receipt_ids or not self._missed_message_backfill_enabled():
+            return True
+        source = event.source
+        channel_id = str(source.thread_id or source.chat_id or "")
+        channel = SimpleNamespace(
+            id=channel_id,
+            parent_id=(
+                str(source.parent_chat_id)
+                if source.parent_chat_id
+                else None
+            ),
+        )
+        for message_id in receipt_ids:
+            self._register_discord_recovery_receipt(
+                channel_id,
+                message_id,
+            )
+            if message_id in self._discord_recovery_claim_epochs:
+                continue
+            message = SimpleNamespace(
+                id=message_id,
+                channel=channel,
+                author=SimpleNamespace(id=source.user_id),
+                created_at=event.timestamp,
+            )
+            claim = await asyncio.to_thread(
+                self._claim_live_discord_message,
+                message,
+                force_takeover=True,
+            )
+            if claim == "complete":
+                await self._set_discord_recovery_receipts(
+                    [message_id],
+                    ProcessingOutcome.SUCCESS,
+                )
+                continue
+            if claim != "claimed":
+                logger.error(
+                    "[%s] Could not reclaim drain-replayed Discord receipt %s",
+                    self.name,
+                    message_id,
+                )
+                return False
+        return True
 
     def _record_recovery_attempt(self, message: Any, *, status: str, error: Optional[str] = None) -> None:
         if not self._missed_message_backfill_enabled():

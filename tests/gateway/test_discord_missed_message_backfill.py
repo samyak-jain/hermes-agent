@@ -218,6 +218,65 @@ async def test_backfills_when_only_down_notice_exists(adapter):
 
 
 @pytest.mark.asyncio
+async def test_backfills_when_only_drain_ack_exists(adapter):
+    drain_ack = SimpleNamespace(
+        id=2,
+        content=(
+            "⏳ Maintenance is queued. I saved your message and will pick "
+            "it up automatically when the gateway is back."
+        ),
+        author=SimpleNamespace(id=999, bot=True),
+        reference=SimpleNamespace(message_id=1),
+        created_at=datetime.now(timezone.utc),
+    )
+    channel = FakeChannel(history_messages=[drain_ack])
+    message = make_message(message_id=1, channel=channel)
+
+    assert await adapter._should_backfill_discord_message(message) is True
+
+
+@pytest.mark.asyncio
+async def test_drain_replay_reclaims_receipt_for_replacement_adapter(
+    adapter,
+):
+    message_id = str(_recent_snowflakes(1)[0])
+    message = make_message(message_id=int(message_id))
+    assert adapter._claim_live_discord_message(message) == "claimed"
+
+    replacement = DiscordAdapter(
+        PlatformConfig(enabled=True, token="replacement")
+    )
+    event = MessageEvent(
+        text=message.content,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="channel",
+            user_id="42",
+            message_id=message_id,
+        ),
+        message_id=message_id,
+        metadata={"_gateway_receipt_ids": [message_id]},
+        timestamp=message.created_at,
+    )
+
+    assert await replacement._prepare_external_drain_replay(event) is True
+    assert message_id in replacement._discord_recovery_claim_epochs
+    row = replacement._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT claim_owner, claim_epoch FROM discord_messages "
+            "WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+    )
+    assert row == (
+        replacement._discord_recovery_claim_owner,
+        replacement._discord_recovery_claim_epochs[message_id],
+    )
+
+
+@pytest.mark.asyncio
 async def test_generic_unavailable_response_counts_as_completed(adapter):
     bot_reply = SimpleNamespace(
         id=2,
