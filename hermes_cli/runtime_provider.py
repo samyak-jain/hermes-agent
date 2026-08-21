@@ -443,6 +443,7 @@ def _maybe_apply_codex_app_server_runtime(
     provider: str,
     api_mode: str,
     model_cfg: Optional[Dict[str, Any]],
+    requested: Optional[str] = None,
 ) -> str:
     """Optionally rewrite ``api_mode`` to ``codex_app_server``.
 
@@ -457,14 +458,17 @@ def _maybe_apply_codex_app_server_runtime(
     runtime = str(model_cfg.get("agent_runtime") or "").strip().lower()
     if runtime == "codex_app_server":
         configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        requested_provider = str(requested or "").strip().lower()
         # ``agent_runtime`` belongs to the configured main model. Explicit
         # side-task providers (delegation, compression, background review,
         # etc.) resolve through this same function and must retain their own
-        # native transport. An absent/auto provider keeps the historical
-        # provider-neutral behavior because the selected main provider is not
-        # known until credential resolution completes.
+        # native transport. With no configured main provider, only implicit
+        # resolution may inherit the provider-neutral runtime.
         if configured_provider not in {"", "auto"} and provider != configured_provider:
             return api_mode
+        if requested_provider not in {"", "auto"}:
+            if configured_provider in {"", "auto"}:
+                return api_mode
         return "codex_app_server"
     if provider not in {"openai", "openai-codex"}:
         return api_mode
@@ -2445,6 +2449,7 @@ def resolve_runtime_provider(
         provider=str(runtime.get("provider") or ""),
         api_mode=str(runtime.get("api_mode") or "chat_completions"),
         model_cfg=_get_model_config(),
+        requested=requested,
     )
     return runtime
 
