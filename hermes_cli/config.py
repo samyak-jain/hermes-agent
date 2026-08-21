@@ -2126,14 +2126,6 @@ def _fork_validation_issues(
                 f"{override_path}.tool_policy",
                 _TOOL_POLICY_FIELDS,
             )
-            profile_policies = override.get("profile_tool_policies")
-            if isinstance(profile_policies, dict):
-                for profile, policy in profile_policies.items():
-                    check_mapping(
-                        policy,
-                        f"{override_path}.profile_tool_policies.{profile}",
-                        _TOOL_POLICY_FIELDS,
-                    )
 
     platforms = config.get("platforms")
     if isinstance(platforms, dict):

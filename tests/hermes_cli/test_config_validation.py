@@ -177,24 +177,18 @@ class TestExactToolPolicyValidation:
             for issue in issues
         )
 
-    def test_profile_policy_in_channel_override_is_retained_typed_config(self):
-        """The deployed profile-scoped channel policy is a supported field."""
-        from gateway.config import ChannelOverride
-
-        raw_override = {
-            "profile_tool_policies": {
-                "vegapunk": {
-                    "mode": "denylist",
-                    "tools": ["delegate_task"],
-                }
-            }
-        }
+    def test_removed_profile_policy_key_is_flagged_unknown(self):
+        """profile_tool_policies was removed with multi-profile support."""
         issues = validate_config_structure(
             {
                 "platforms": {
                     "discord": {
                         "channel_overrides": {
-                            "operator-room": raw_override,
+                            "operator-room": {
+                                "profile_tool_policies": {
+                                    "vegapunk": {"mode": "denylist"},
+                                }
+                            }
                         }
                     }
                 }
@@ -203,31 +197,23 @@ class TestExactToolPolicyValidation:
             unknown_severity="error",
         )
 
-        assert not [
-            issue
+        assert any(
+            issue.severity == "error"
+            and issue.path.endswith("operator-room.profile_tool_policies")
             for issue in issues
-            if "profile_tool_policies.vegapunk" in issue.path
-        ]
-        assert ChannelOverride.from_dict(raw_override).profile_tool_policies == {
-            "vegapunk": {
-                "mode": "denylist",
-                "tools": ["delegate_task"],
-            }
-        }
+        )
 
-    def test_unknown_profile_policy_key_surfaces_source_and_dotted_path(self):
+    def test_unknown_tool_policy_key_surfaces_source_and_dotted_path(self):
         issues = validate_config_structure(
             {
                 "platforms": {
                     "discord": {
                         "channel_overrides": {
                             "operator-room": {
-                                "profile_tool_policies": {
-                                    "vegapunk": {
-                                        "mode": "denylist",
-                                        "tools": ["delegate_task"],
-                                        "toolsets": ["terminal"],
-                                    }
+                                "tool_policy": {
+                                    "mode": "denylist",
+                                    "tools": ["delegate_task"],
+                                    "toolsets": ["terminal"],
                                 }
                             }
                         }
@@ -243,7 +229,7 @@ class TestExactToolPolicyValidation:
         assert issue.source == "managed:/nix/store/kumo-config.yaml"
         assert issue.path == (
             "platforms.discord.channel_overrides.operator-room."
-            "profile_tool_policies.vegapunk.toolsets"
+            "tool_policy.toolsets"
         )
         assert issue.source in issue.message
         assert issue.path in issue.message
@@ -299,12 +285,10 @@ def test_managed_config_validate_command_is_ci_strict_and_value_free(
                     "discord": {
                         "channel_overrides": {
                             "operator-room": {
-                                "profile_tool_policies": {
-                                    "vegapunk": {
-                                        "mode": "denylist",
-                                        "tools": ["delegate_task"],
-                                        "ignored_typo": "private-value-must-not-print",
-                                    }
+                                "tool_policy": {
+                                    "mode": "denylist",
+                                    "tools": ["delegate_task"],
+                                    "ignored_typo": "private-value-must-not-print",
                                 }
                             }
                         }
@@ -330,7 +314,7 @@ def test_managed_config_validate_command_is_ci_strict_and_value_free(
     assert payload["success"] is False
     assert payload["issues"][0]["severity"] == "error"
     assert payload["issues"][0]["path"].endswith(
-        "profile_tool_policies.vegapunk.ignored_typo"
+        "tool_policy.ignored_typo"
     )
     assert "private-value-must-not-print" not in output
 
