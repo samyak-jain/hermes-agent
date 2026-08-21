@@ -4299,6 +4299,29 @@ def _parse_env_value(raw_value: str) -> str:
     return value
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Strip a dotenv-style inline comment from a raw value."""
+    value = value.strip()
+    if not value:
+        return value
+    quote = value[0]
+    if quote in ("'", '"'):
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                remainder = value[index + 1:].lstrip()
+                if remainder.startswith("#"):
+                    return value[: index + 1]
+                return value
+            index += 1
+        return value
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
 def load_env() -> Dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
 

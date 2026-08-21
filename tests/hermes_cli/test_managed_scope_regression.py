@@ -14,9 +14,7 @@ def hermes_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    # No managed dir: point the override at a guaranteed-absent path so a real
-    # /etc/hermes on the dev/CI box can't influence the test.
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "no_such_managed_dir"))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
     # Clear caches so each test re-reads from disk.
     import hermes_cli.config as cfg
 
@@ -73,5 +71,4 @@ def test_user_env_overrides_shell(tmp_path, monkeypatch):
     monkeypatch.setenv("FOO_TOKEN", "from_shell")
     load_hermes_dotenv(hermes_home=str(home))
     assert os.environ["FOO_TOKEN"] == "from_user_env"
-
 
