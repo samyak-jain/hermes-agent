@@ -293,10 +293,7 @@ over ones that create new jobs each run.
 
 ## How it works
 
-**Cron execution is handled by the gateway daemon.** The gateway ticks the
-scheduler every 60 seconds, running any due jobs in isolated agent sessions. A
-multiplexed gateway runs one independently scoped scheduler per served profile;
-it never combines profile stores.
+**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
 
 ```bash
 hermes gateway install     # Install as a user service

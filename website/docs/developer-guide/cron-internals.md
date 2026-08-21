@@ -103,24 +103,10 @@ tick()
 ### Gateway Integration
 
 In gateway mode, the cron **trigger** (the part that decides *when* a due job
-fires — "Axis B") is selected through a pluggable `CronScheduler` provider.
-For a single-profile gateway, `_start_profile_cron_schedulers()` calls
-`profiles_to_serve(multiplex=False)`. For a multiplex gateway it calls
-`profiles_to_serve(multiplex=True)` and starts one
-`_ProfileCronSchedulerRuntime` thread per returned profile.
-
-Each thread enters `_profile_runtime_scope(profile_home)` before it calls
-`resolve_cron_scheduler()` (`cron/scheduler_provider.py`) and before the
-provider's `start()`. This is load-bearing: provider config, credentials,
-`jobs.json`, `.tick.lock`, ticker heartbeats, and `executions.db` must all
-resolve within the same profile context. The default runtime receives
-`runner.adapters`; named runtimes receive
-`runner._profile_adapters[profile_name]`.
-
-Gateway housekeeping remains one process-level thread. Shutdown sets every
-profile runtime's stop event, invokes every provider's `stop()` inside its
-profile scope, and cooperatively awaits every scheduler thread so the asyncio
-loop can finish in-flight deliveries.
+fires — "Axis B") is selected through a pluggable `CronScheduler` provider. The
+gateway calls `resolve_cron_scheduler()` (`cron/scheduler_provider.py`) and runs
+the resolved provider's `start()` in a dedicated background thread, alongside a
+separate gateway-housekeeping thread.
 
 The active provider is chosen by the `cron.provider` config key:
 
