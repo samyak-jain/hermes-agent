@@ -371,11 +371,17 @@ def _key_has_secret_keyword(key: str) -> bool:
 
     Post-match validator for _CFG_DOTTED_RE / _CFG_ANCHORED_RE /
     _YAML_ASSIGN_RE hits — rejects prose words that merely embed a keyword
-    (``secretary``, ``tokenizer``, ``authored``). Safe to call with the
-    _ENV_ASSIGN_RE key too: all-caps keys short-circuit to the legacy
-    embedded-match behavior.
+    (``secretary``, ``tokenizer``, ``authored``).
     """
-    return is_secret_config_key(key)
+    canonical = _canonicalize_config_key(key)
+    words = tuple(
+        word[:-1] if word in {"keys", "secrets", "tokens"} else word
+        for word in canonical.split("_")
+        if word
+    )
+    return is_secret_config_key(key) or any(
+        word in _SECRET_CONFIG_KEY_WORDS for word in words
+    )
 
 _JSON_FIELD_RE = re.compile(
     r'("[A-Za-z][A-Za-z0-9_. -]*")\s*:\s*"([^"]+)"',
