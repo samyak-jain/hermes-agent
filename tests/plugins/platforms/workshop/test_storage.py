@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from plugins.platforms.workshop.storage import (
+    WorkshopBacklogExceeded,
+    WorkshopConflictError,
+    WorkshopLedger,
+)
+
+
+def _ledger(tmp_path, **kwargs):
+    return WorkshopLedger(tmp_path / "state.db", **kwargs)
+
+
+def _turn(ledger: WorkshopLedger, **overrides):
+    values = {
+        "client_turn_id": "client-1",
+        "workspace_id": "workspace-1",
+        "chat_id": "chat-1",
+        "session_key": "agent:main:workshop:thread:workspace-1:chat-1",
+        "session_id": "session-1",
+        "catalog_version": "catalog-a",
+        "request_digest": "request-a",
+    }
+    values.update(overrides)
+    return ledger.create_turn(**values)
+
+
+def test_schema_lives_in_shared_state_db(tmp_path):
+    ledger = _ledger(tmp_path)
+    with sqlite3.connect(ledger.db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'workshop_%'"
+            )
+        }
+    assert {
+        "workshop_turns",
+        "workshop_events",
+        "workshop_tool_calls",
+        "workshop_wakes",
+        "workshop_deltas",
+    }.issubset(tables)
+
+
+def test_turn_creation_is_idempotent_but_conflicting_reuse_fails(tmp_path):
+    ledger = _ledger(tmp_path)
+    created, is_new = _turn(ledger)
+    repeated, repeated_is_new = _turn(ledger)
+
+    assert is_new is True
+    assert repeated_is_new is False
+    assert repeated.turn_id == created.turn_id
+
+    with pytest.raises(WorkshopConflictError):
+        _turn(ledger, request_digest="different")
+
+
+def test_delta_record_is_idempotent_and_bound_to_one_turn(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+
+    assert ledger.record_delta(
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        delta_id="delta-1",
+        payload_digest="payload-a",
+        turn_id=turn.turn_id,
+    ) is True
+    assert ledger.record_delta(
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        delta_id="delta-1",
+        payload_digest="payload-a",
+        turn_id=turn.turn_id,
+    ) is False
+    record = ledger.get_delta("workspace-1", "chat-1", "delta-1")
+    assert record is not None
+    assert record.turn_id == turn.turn_id
+
+    with pytest.raises(WorkshopConflictError):
+        ledger.record_delta(
+            workspace_id="workspace-1",
+            chat_id="chat-1",
+            delta_id="delta-1",
+            payload_digest="payload-b",
+            turn_id=turn.turn_id,
+        )
+
+
+def test_wake_delivery_state_is_durable_and_idempotent(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+
+    assert ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        turn_id=turn.turn_id,
+    ) is True
+    assert ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        turn_id=turn.turn_id,
+    ) is False
+
+    ledger.mark_wake_retryable(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        error="temporary",
+    )
+    pending = ledger.get_wake("spawn_result", "delegation-1")
+    assert pending is not None
+    assert (pending.state, pending.attempts, pending.last_error) == (
+        "pending",
+        1,
+        "temporary",
+    )
+
+    ledger.mark_wake_delivered(
+        producer_type="spawn_result", producer_id="delegation-1"
+    )
+    delivered = ledger.get_wake("spawn_result", "delegation-1")
+    assert delivered is not None
+    assert (delivered.state, delivered.attempts, delivered.last_error) == (
+        "delivered",
+        2,
+        None,
+    )
+
+
+def test_dead_letter_wake_is_counted_for_health(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.record_wake(
+        producer_type="cron_result", producer_id="execution-1", turn_id=turn.turn_id
+    )
+    ledger.mark_wake_dead_letter(
+        producer_type="cron_result", producer_id="execution-1", error="HTTP 403"
+    )
+
+    wake = ledger.get_wake("cron_result", "execution-1")
+    assert wake is not None
+    assert wake.state == "dead_letter"
+    assert wake.attempts == 1
+    assert ledger.dead_letter_wake_count() == 1
+
+
+def test_replay_persists_text_and_complete_args_but_not_live_only_deltas(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+
+    started = ledger.append_event(
+        turn_id=turn.turn_id,
+        event="turn.started",
+        payload={"catalog_version": "catalog-a"},
+    )
+    thinking = ledger.append_event(
+        turn_id=turn.turn_id,
+        event="thinking.delta",
+        payload={"delta": "secret thought"},
+    )
+    text = ledger.append_event(
+        turn_id=turn.turn_id,
+        event="text.delta",
+        payload={"delta": "hello"},
+    )
+    arguments = ledger.append_event(
+        turn_id=turn.turn_id,
+        event="tool_call.arguments.delta",
+        payload={"call_id": "call-1", "delta": '{"pa'},
+    )
+    complete = ledger.append_event(
+        turn_id=turn.turn_id,
+        event="tool_call.end",
+        payload={"call_id": "call-1", "arguments": {"path": "README.md"}},
+    )
+
+    replay = ledger.list_events(turn.turn_id)
+    assert [event.seq for event in replay] == [started.seq, text.seq, complete.seq]
+    assert thinking.seq not in {event.seq for event in replay}
+    assert arguments.seq not in {event.seq for event in replay}
+    assert replay[-1].payload["arguments"] == {"path": "README.md"}
+
+
+def test_finish_turn_is_atomic_and_idempotent(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    terminal = ledger.finish_turn(
+        turn_id=turn.turn_id,
+        state="completed",
+        stop_reason="complete",
+        payload={"final_text": "done"},
+    )
+    repeated = ledger.finish_turn(
+        turn_id=turn.turn_id,
+        state="completed",
+        stop_reason="complete",
+        payload={"final_text": "done"},
+    )
+
+    assert repeated == terminal
+    record = ledger.get_turn(turn.turn_id)
+    assert record is not None
+    assert record.state == "completed"
+    assert record.stop_reason == "complete"
+    assert ledger.count_active_turns() == 0
+
+    with pytest.raises(WorkshopConflictError):
+        ledger.finish_turn(
+            turn_id=turn.turn_id,
+            state="completed",
+            stop_reason="different",
+            payload={"final_text": "done"},
+        )
+
+
+def test_backlog_limit_fails_without_advancing_sequence(tmp_path):
+    ledger = _ledger(tmp_path, max_event_backlog_bytes=250)
+    turn, _ = _turn(ledger)
+
+    with pytest.raises(WorkshopBacklogExceeded):
+        ledger.append_event(
+            turn_id=turn.turn_id,
+            event="text.delta",
+            payload={"delta": "x" * 1000},
+        )
+    record = ledger.get_turn(turn.turn_id)
+    assert record is not None
+    assert record.next_seq == 1
+    assert record.event_bytes == 0
+
+
+def test_backlog_exhaustion_terminal_pair_has_a_bounded_quota_bypass(tmp_path):
+    ledger = _ledger(tmp_path, max_event_backlog_bytes=250)
+    turn, _ = _turn(ledger)
+
+    error, terminal = ledger.fail_backlog_exhausted(
+        turn_id=turn.turn_id,
+        message="durable stream limit reached",
+    )
+
+    assert error.event == "error"
+    assert error.payload["code"] == "event_backlog_exceeded"
+    assert terminal.event == "turn.end"
+    assert terminal.payload == {
+        "status": "error",
+        "stop_reason": "event_backlog_exceeded",
+    }
+    record = ledger.get_turn(turn.turn_id)
+    assert record is not None and record.state == "error"
+    assert [item.event for item in ledger.list_events(turn.turn_id)] == [
+        "error",
+        "turn.end",
+    ]
+    assert record.event_bytes > ledger.max_event_backlog_bytes
+
+
+def test_pending_tool_calls_are_bounded_and_results_are_idempotent(tmp_path):
+    ledger = _ledger(tmp_path, max_pending_calls=2)
+    turn, _ = _turn(ledger)
+    assert ledger.register_tool_call(
+        turn_id=turn.turn_id, call_id="call-1", name="writeFile", arguments={"a": 1}
+    )
+    assert ledger.register_tool_call(
+        turn_id=turn.turn_id, call_id="call-2", name="readFile", arguments={"b": 2}
+    )
+    with pytest.raises(WorkshopConflictError):
+        ledger.register_tool_call(
+            turn_id=turn.turn_id, call_id="call-3", name="editFile", arguments={}
+        )
+
+    assert ledger.resolve_tool_call(
+        turn_id=turn.turn_id, call_id="call-1", result={"ok": True}, is_error=False
+    )
+    assert not ledger.resolve_tool_call(
+        turn_id=turn.turn_id, call_id="call-1", result={"ok": True}, is_error=False
+    )
+    with pytest.raises(WorkshopConflictError):
+        ledger.resolve_tool_call(
+            turn_id=turn.turn_id, call_id="call-1", result={"ok": False}, is_error=False
+        )
+
+    first = ledger.get_tool_call(turn.turn_id, "call-1")
+    assert first is not None
+    assert first.state == "resolved"
+    assert first.result == {"ok": True}
+    assert first.is_error is False
+
+
+def test_pending_tool_call_timeout_is_terminal_and_rejects_late_result(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.register_tool_call(
+        turn_id=turn.turn_id,
+        call_id="call-timeout",
+        name="readFile",
+        arguments={"path": "README.md"},
+    )
+
+    assert ledger.expire_tool_call(
+        turn_id=turn.turn_id, call_id="call-timeout"
+    )
+    assert not ledger.expire_tool_call(
+        turn_id=turn.turn_id, call_id="call-timeout"
+    )
+    with pytest.raises(WorkshopConflictError):
+        ledger.resolve_tool_call(
+            turn_id=turn.turn_id,
+            call_id="call-timeout",
+            result={"ok": True},
+            is_error=False,
+        )
+
+
+def test_turn_control_is_idempotent_and_immediate_cancel_is_atomic(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.register_tool_call(
+        turn_id=turn.turn_id,
+        call_id="call-controlled",
+        name="writeFile",
+        arguments={"path": "README.md"},
+    )
+
+    controlled, created, affected = ledger.request_turn_control(
+        turn_id=turn.turn_id,
+        signal="end_turn",
+        mode="immediate",
+        reason="approval_required",
+    )
+    repeated, repeated_created, _ = ledger.request_turn_control(
+        turn_id=turn.turn_id,
+        signal="end_turn",
+        mode="immediate",
+        reason="approval_required",
+    )
+
+    assert created is True and repeated_created is False
+    assert affected == 1
+    assert controlled.control_reason == repeated.control_reason == "approval_required"
+    call = ledger.get_tool_call(turn.turn_id, "call-controlled")
+    assert call is not None and call.state == "cancelled"
+    assert call.result["error"]["code"] == "workshop_turn_controlled"
+    with pytest.raises(WorkshopConflictError):
+        ledger.request_turn_control(
+            turn_id=turn.turn_id,
+            signal="abort",
+            mode="immediate",
+            reason="different",
+        )
+
+
+def test_dead_letter_and_retention_are_durable(tmp_path):
+    ledger = _ledger(tmp_path, completed_retention_seconds=10)
+    turn, _ = _turn(ledger)
+    assert ledger.record_wake(
+        producer_type="spawn_result", producer_id="child-1", turn_id=turn.turn_id
+    )
+    ledger.mark_wake_dead_letter(
+        producer_type="spawn_result", producer_id="child-1", error="HTTP 401"
+    )
+    assert ledger.dead_letter_wake_count() == 1
+
+    ledger.finish_turn(
+        turn_id=turn.turn_id,
+        state="error",
+        stop_reason="wake_rejected",
+        timestamp=100,
+    )
+    assert ledger.prune_completed(now=109) == 0
+    assert ledger.prune_completed(now=111) == 0
+    assert ledger.get_turn(turn.turn_id) is not None
+    assert ledger.dead_letter_wake_count() == 1
+
+    ordinary, _ = _turn(
+        ledger,
+        client_turn_id="ordinary-1",
+        request_digest="ordinary-request-1",
+        turn_id="wturn_ordinary",
+    )
+    ledger.finish_turn(
+        turn_id=ordinary.turn_id,
+        state="completed",
+        stop_reason="end_turn",
+        timestamp=100,
+    )
+    assert ledger.prune_completed(now=111) == 1
+    assert ledger.get_turn(ordinary.turn_id) is None
+    assert ledger.get_turn(turn.turn_id) is not None
+
+
+def test_restart_recovery_durably_interrupts_active_turns(tmp_path):
+    ledger = _ledger(tmp_path)
+    first, _ = _turn(ledger)
+    second, _ = _turn(
+        ledger,
+        client_turn_id="client-2",
+        request_digest="request-2",
+        turn_id="wturn_second",
+    )
+    ledger.set_turn_state(second.turn_id, "running")
+
+    assert ledger.recover_active_turns() == 2
+    assert ledger.recover_active_turns() == 0
+    for turn_id in (first.turn_id, second.turn_id):
+        record = ledger.get_turn(turn_id)
+        assert record is not None
+        assert record.state == "interrupted"
+        terminal = ledger.list_events(turn_id)[-1]
+        assert terminal.event == "turn.end"
+        assert terminal.payload["stop_reason"] == "gateway_restart"

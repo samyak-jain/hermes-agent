@@ -23,6 +23,43 @@ interface TurnResult {
 interface ToolItem {
   itemId: string;
   item: Record<string, unknown>;
+  argumentsComplete: boolean;
+}
+
+interface ToolStreamBlock {
+  kind: "tool";
+  callId: string;
+  itemId: string;
+  name: string;
+  rawArguments: string;
+}
+
+interface ReasoningStreamBlock {
+  kind: "reasoning";
+  itemId: string;
+  text: string;
+}
+
+type StreamBlock = ToolStreamBlock | ReasoningStreamBlock;
+
+export interface PartialStreamState {
+  blocks: Map<number, StreamBlock>;
+  currentMessageItem?: string;
+  completedReasoningBlocks: number;
+}
+
+const CLAUDE_CODE_TOOL_USE_ID_META = "claudecode/toolUseId";
+
+export function toolCallIdFromMcpExtra(extra: unknown): string | undefined {
+  if (typeof extra !== "object" || extra === null) return undefined;
+  const meta = (extra as { _meta?: unknown })._meta;
+  if (typeof meta !== "object" || meta === null) return undefined;
+  const toolUseId = (meta as Record<string, unknown>)[
+    CLAUDE_CODE_TOOL_USE_ID_META
+  ];
+  return typeof toolUseId === "string" && toolUseId.length > 0
+    ? toolUseId
+    : undefined;
 }
 
 export function titleForThread(thread: ThreadState): string | undefined {
@@ -69,13 +106,22 @@ function hostToolDefinition(
     definition.name,
     definition.description ?? "",
     jsonSchemaShape(definition.inputSchema ?? {}),
-    async (arguments_: Record<string, unknown>) => {
+    async (arguments_: Record<string, unknown>, extra: unknown) => {
+      // Claude Code attaches the provider's tool_use block ID to the MCP
+      // request metadata. Preserve it across the host callback so streamed
+      // tool-use events and execution/results share one unambiguous identity.
+      const toolCallId = toolCallIdFromMcpExtra(extra);
+      if (!toolCallId) {
+        throw new Error(
+          `Host tool ${definition.name} is missing the provider tool_use ID`,
+        );
+      }
       const response = await rpc.request<{ content?: string; isError?: boolean }>(
         "agent/tool/call",
         {
           threadId: thread.threadId,
           turnId,
-          toolCallId: `tool_${randomUUID()}`,
+          toolCallId,
           name: definition.name,
           arguments: arguments_,
         },
@@ -104,14 +150,191 @@ function parseMcpTool(name: string): { server: string; tool: string } {
   return match ? { server: match[1], tool: match[2] } : { server: "mcp", tool: name };
 }
 
-function toolItem(name: string, input: unknown): Record<string, unknown> {
+function toolItem(
+  name: string,
+  input: unknown,
+  providerCallId?: string,
+): Record<string, unknown> {
   const { server, tool: toolName } = parseMcpTool(name);
   return {
     type: "mcpToolCall",
     server,
     tool: toolName,
     arguments: input ?? {},
+    ...(providerCallId ? { providerCallId } : {}),
   };
+}
+
+export function createPartialStreamState(): PartialStreamState {
+  return { blocks: new Map(), completedReasoningBlocks: 0 };
+}
+
+function notifyToolArgumentsCompleted(
+  rpc: RpcConnection,
+  threadId: string,
+  turnId: string,
+  mapped: ToolItem,
+  callId: string,
+  name: string,
+  arguments_: unknown,
+  rawArguments: string,
+): void {
+  mapped.item = toolItem(name, arguments_, callId);
+  mapped.argumentsComplete = true;
+  rpc.notify("item/toolCall/argumentsCompleted", {
+    threadId,
+    turnId,
+    itemId: mapped.itemId,
+    callId,
+    name,
+    arguments: arguments_,
+    argumentsJson: rawArguments,
+  });
+}
+
+export function handlePartialStreamEvent(options: {
+  rpc: RpcConnection;
+  threadId: string;
+  turnId: string;
+  event: any;
+  state: PartialStreamState;
+  toolItems: Map<string, ToolItem>;
+}): boolean {
+  const { rpc, threadId, turnId, event, state, toolItems } = options;
+  const index = Number(event?.index);
+
+  if (event?.type === "content_block_start" && Number.isInteger(index)) {
+    const block = event.content_block;
+    if (block?.type === "tool_use") {
+      const callId = typeof block.id === "string" ? block.id : "";
+      const name = typeof block.name === "string" ? block.name : "";
+      if (!callId || !name) return true;
+      const itemId = callId;
+      const item = toolItem(name, block.input ?? {}, callId);
+      toolItems.set(callId, { itemId, item, argumentsComplete: false });
+      state.blocks.set(index, {
+        kind: "tool",
+        callId,
+        itemId,
+        name,
+        rawArguments: "",
+      });
+      rpc.notify("item/started", {
+        threadId,
+        turnId,
+        item: { id: itemId, status: "inProgress", ...item },
+      });
+      return true;
+    }
+    if (block?.type === "thinking") {
+      const itemId = `item_${randomUUID()}`;
+      state.blocks.set(index, { kind: "reasoning", itemId, text: "" });
+      rpc.notify("item/started", {
+        threadId,
+        turnId,
+        item: { id: itemId, type: "reasoning", summary: [], content: [] },
+      });
+      return true;
+    }
+  }
+
+  if (event?.type === "content_block_delta" && Number.isInteger(index)) {
+    if (event.delta?.type === "text_delta") {
+      if (!state.currentMessageItem) {
+        state.currentMessageItem = `item_${randomUUID()}`;
+        rpc.notify("item/started", {
+          threadId,
+          turnId,
+          item: { id: state.currentMessageItem, type: "agentMessage", text: "" },
+        });
+      }
+      rpc.notify("item/agentMessage/delta", {
+        threadId,
+        turnId,
+        itemId: state.currentMessageItem,
+        delta: event.delta.text,
+      });
+      return true;
+    }
+
+    const streamed = state.blocks.get(index);
+    if (event.delta?.type === "thinking_delta") {
+      if (!streamed || streamed.kind !== "reasoning") return true;
+      const delta = String(event.delta.thinking ?? "");
+      streamed.text += delta;
+      rpc.notify("item/reasoning/delta", {
+        threadId,
+        turnId,
+        itemId: streamed.itemId,
+        delta,
+      });
+      return true;
+    }
+    if (event.delta?.type === "input_json_delta") {
+      if (!streamed || streamed.kind !== "tool") return true;
+      const delta = String(event.delta.partial_json ?? "");
+      streamed.rawArguments += delta;
+      rpc.notify("item/toolCall/argumentsDelta", {
+        threadId,
+        turnId,
+        itemId: streamed.itemId,
+        callId: streamed.callId,
+        name: streamed.name,
+        delta,
+      });
+      return true;
+    }
+  }
+
+  if (event?.type === "content_block_stop" && Number.isInteger(index)) {
+    const streamed = state.blocks.get(index);
+    if (!streamed) return false;
+    state.blocks.delete(index);
+    if (streamed.kind === "reasoning") {
+      rpc.notify("item/completed", {
+        threadId,
+        turnId,
+        item: {
+          id: streamed.itemId,
+          type: "reasoning",
+          summary: [streamed.text],
+          content: [],
+        },
+      });
+      state.completedReasoningBlocks += 1;
+      return true;
+    }
+
+    const mapped = toolItems.get(streamed.callId);
+    if (!mapped) return true;
+    try {
+      const parsed = JSON.parse(streamed.rawArguments || "{}");
+      notifyToolArgumentsCompleted(
+        rpc,
+        threadId,
+        turnId,
+        mapped,
+        streamed.callId,
+        streamed.name,
+        parsed,
+        streamed.rawArguments || "{}",
+      );
+    } catch (error: any) {
+      rpc.notify("item/toolCall/argumentsCompleted", {
+        threadId,
+        turnId,
+        itemId: streamed.itemId,
+        callId: streamed.callId,
+        name: streamed.name,
+        arguments: null,
+        argumentsJson: streamed.rawArguments,
+        error: { message: error?.message ?? "invalid tool arguments" },
+      });
+    }
+    return true;
+  }
+
+  return false;
 }
 
 function renderToolResult(content: unknown): string {
@@ -161,7 +384,7 @@ export async function runTurn(options: {
   const turnPrompt = promptForTurn(thread, userText);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
-  let currentMessageItem: string | undefined;
+  const partialStream = createPartialStreamState();
 
   const sdkOptions: Options = {
     cwd: thread.cwd,
@@ -202,32 +425,21 @@ export async function runTurn(options: {
           break;
         case "stream_event": {
           const event: any = (message as any).event;
-          if (
-            event?.type === "content_block_delta" &&
-            event.delta?.type === "text_delta"
-          ) {
-            if (!currentMessageItem) {
-              currentMessageItem = `item_${randomUUID()}`;
-              rpc.notify("item/started", {
-                threadId,
-                turnId,
-                item: { id: currentMessageItem, type: "agentMessage", text: "" },
-              });
-            }
-            rpc.notify("item/agentMessage/delta", {
-              threadId,
-              turnId,
-              itemId: currentMessageItem,
-              delta: event.delta.text,
-            });
-          }
+          handlePartialStreamEvent({
+            rpc,
+            threadId,
+            turnId,
+            event,
+            state: partialStream,
+            toolItems,
+          });
           break;
         }
         case "assistant":
           for (const block of (message as any).message?.content ?? []) {
             if (block.type === "text") {
-              const itemId = currentMessageItem ?? `item_${randomUUID()}`;
-              if (!currentMessageItem) {
+              const itemId = partialStream.currentMessageItem ?? `item_${randomUUID()}`;
+              if (!partialStream.currentMessageItem) {
                 rpc.notify("item/started", {
                   threadId,
                   turnId,
@@ -239,8 +451,12 @@ export async function runTurn(options: {
                 turnId,
                 item: { id: itemId, type: "agentMessage", text: block.text },
               });
-              currentMessageItem = undefined;
+              partialStream.currentMessageItem = undefined;
             } else if (block.type === "thinking") {
+              if (partialStream.completedReasoningBlocks > 0) {
+                partialStream.completedReasoningBlocks -= 1;
+                continue;
+              }
               rpc.notify("item/completed", {
                 threadId,
                 turnId,
@@ -252,14 +468,43 @@ export async function runTurn(options: {
                 },
               });
             } else if (block.type === "tool_use") {
-              const itemId = `item_${randomUUID()}`;
-              const item = toolItem(block.name, block.input);
-              toolItems.set(block.id, { itemId, item });
+              const prior = toolItems.get(block.id);
+              if (prior) {
+                if (!prior.argumentsComplete) {
+                  notifyToolArgumentsCompleted(
+                    rpc,
+                    threadId,
+                    turnId,
+                    prior,
+                    block.id,
+                    block.name,
+                    block.input,
+                    JSON.stringify(block.input ?? {}),
+                  );
+                } else {
+                  prior.item = toolItem(block.name, block.input, block.id);
+                }
+                continue;
+              }
+              const itemId = block.id;
+              const item = toolItem(block.name, block.input, block.id);
+              const mapped = { itemId, item, argumentsComplete: false };
+              toolItems.set(block.id, mapped);
               rpc.notify("item/started", {
                 threadId,
                 turnId,
                 item: { id: itemId, status: "inProgress", ...item },
               });
+              notifyToolArgumentsCompleted(
+                rpc,
+                threadId,
+                turnId,
+                mapped,
+                block.id,
+                block.name,
+                block.input,
+                JSON.stringify(block.input ?? {}),
+              );
             }
           }
           break;

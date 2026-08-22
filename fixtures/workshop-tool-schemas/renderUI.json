@@ -1,0 +1,22 @@
+{
+  "name": "renderUI",
+  "description": "Render an ephemeral interface in the chat. Pass one JavaScript expression containing JSX and an optional JSON `state` object. Use only this strict catalog: Stack(gap); Row(gap,align,justify,wrap); Card(title,subtitle/description); Text(label,tone,size,strong,mono); Heading(label,level); Badge(label,tone); Divider(); Button(action,label,variant,disabled); Input(value,label,placeholder,description/hint,type); Select(value,options,label,placeholder); Checkbox(checked,label,description); Slider(value,min,max,step,label,valueLabel); Table(columns,rows/data/items); ProgressBar(value,max,label,valueLabel,showValue); Callout(label,title,tone); KeyValue(items/entries/pairs). Image and HTML tags are unavailable. Variant values are case-insensitive and numeric props may be numeric strings. Select options are strings or `{value,label}`; Table columns are strings or `{key,label,align}`; KeyValue items are `{label,value}`. Only Button.action is required.\n\nFor interactive values use `bind(\"path.to.value\")`, where the path names a primitive leaf supplied in `state` (numeric segments address arrays). Bind is allowed only on Input/Select `value`, Checkbox `checked`, and Slider `value`. Buttons require a stable non-empty `action` string and submit the whole state once. Example: `<Stack gap=\"md\"><Input label=\"Name\" value={bind(\"form.name\")} /><Button action=\"submit\">Submit</Button></Stack>` with `state: {form:{name:\"\"}}`. JSX may use arrays, map, and conditionals, but imports, require, spread props, functions in props, event handlers, dangerouslySetInnerHTML, and browser code are forbidden. Return one root component. Prefer KeyValue over a two-column Table, use at most one primary Button and one Callout, and avoid repeating prose directly above the card.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "jsx"
+    ],
+    "properties": {
+      "jsx": {
+        "type": "string",
+        "description": "One JavaScript expression containing JSX against the renderUI catalog."
+      },
+      "state": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true,
+        "description": "Initial JSON defaults for every state path referenced by bind()."
+      }
+    }
+  }
+}

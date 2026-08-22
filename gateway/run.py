@@ -485,6 +485,38 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _stamp_gateway_turn_outcome(
+    event: Any,
+    *,
+    response: Optional[str],
+    agent_result: Optional[Dict[str, Any]] = None,
+    failed: bool = False,
+) -> None:
+    """Publish structured turn facts without changing the handler return type.
+
+    Platform handlers historically return ``Optional[str]``.  Streaming API
+    adapters still need failure and usage facts that cannot be reconstructed
+    from that string, so the gateway writes a private per-event sidecar after
+    the real agent result is known.
+    """
+
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    result = agent_result if isinstance(agent_result, dict) else {}
+    is_failed = bool(failed or result.get("failed"))
+    metadata["_gateway_turn_outcome"] = {
+        "failed": is_failed,
+        "interrupted": bool(result.get("interrupted")),
+        "interrupt_message": str(result.get("interrupt_message") or ""),
+        "error_message": str(response or "") if is_failed else "",
+        "input_tokens": int(result.get("input_tokens") or 0),
+        "output_tokens": int(result.get("output_tokens") or 0),
+        "last_prompt_tokens": int(result.get("last_prompt_tokens") or 0),
+        "model": result.get("model"),
+    }
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -2552,6 +2584,22 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _compose_external_text_event_sink(
+    native_callback: Optional[Callable[[str], None]],
+    external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> Optional[Callable[[str], None]]:
+    """Fan model text deltas into the platform stream without replacing UI delivery."""
+    if external_event_sink is None:
+        return native_callback
+
+    def combined(delta: str) -> None:
+        if native_callback is not None:
+            native_callback(delta)
+        external_event_sink("text.delta", {"delta": delta})
+
+    return combined
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -2815,6 +2863,58 @@ def _resolve_tool_policy_for_source(
             logger.warning(
                 "Ignoring unmanaged profile tool policy for %s",
                 profile,
+            )
+
+    platform_name = _platform_config_key(source.platform)
+    raw_platform_policy = None
+    if gateway_config is not None:
+        typed_platform = gateway_config.platforms.get(source.platform)
+        if typed_platform is not None:
+            raw_platform_policy = typed_platform.tool_policy
+    else:
+        raw_platforms = user_config.get("platforms")
+        raw_platform = (
+            raw_platforms.get(platform_name)
+            if isinstance(raw_platforms, dict)
+            else None
+        )
+        if not isinstance(raw_platform, dict):
+            legacy_platform = user_config.get(platform_name)
+            raw_platform = legacy_platform if isinstance(legacy_platform, dict) else None
+        if isinstance(raw_platform, dict):
+            raw_platform_policy = raw_platform.get("tool_policy")
+
+    if raw_platform_policy is not None:
+        platform_policy_path = f"platforms.{platform_name}.tool_policy"
+        platform_authorized = authority == "any"
+        if not platform_authorized:
+            try:
+                from hermes_cli import managed_scope
+
+                legacy_path = platform_policy_path.removeprefix("platforms.")
+                platform_authorized = any(
+                    managed_scope.is_key_managed(path)
+                    for path in (
+                        platform_policy_path,
+                        f"{platform_policy_path}.mode",
+                        legacy_path,
+                        f"{legacy_path}.mode",
+                    )
+                )
+            except Exception:
+                platform_authorized = False
+        if platform_authorized:
+            resolved_platform = parse_tool_policy(
+                raw_platform_policy,
+                source=platform_policy_path,
+                fallback=base_policy,
+            )
+            if resolved_platform.valid:
+                base_policy = resolved_platform
+        else:
+            logger.warning(
+                "Ignoring unmanaged %s platform tool policy override",
+                platform_name,
             )
 
     if source.platform != Platform.DISCORD:
@@ -10700,7 +10800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-        if is_internal:
+        if is_internal or bool(getattr(event, "transport_authorized", False)):
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -13601,6 +13701,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _event_metadata = event.metadata or {}
+            _external_tool_schemas = _event_metadata.get("workshop_tools")
+            _external_tool_catalog_version = str(
+                _event_metadata.get("workshop_catalog_version") or ""
+            )
+            _external_tool_callback = _event_metadata.get(
+                "_workshop_tool_callback"
+            )
+            _source_platform = str(
+                getattr(source.platform, "value", source.platform) or ""
+            )
+            if _source_platform != "workshop" and (
+                _external_tool_schemas
+                or _external_tool_catalog_version
+                or _external_tool_callback is not None
+            ):
+                raise PermissionError(
+                    "External tool authority is restricted to the workshop platform"
+                )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -13617,6 +13736,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 automated_trigger=str(
                     (event.metadata or {}).get("automated_trigger") or ""
                 ),
+                external_event_sink=(event.metadata or {}).get(
+                    "_gateway_event_sink"
+                ),
+                external_tool_schemas=_external_tool_schemas,
+                external_tool_catalog_version=_external_tool_catalog_version,
+                external_tool_callback=_external_tool_callback,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -14201,8 +14326,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                _stamp_gateway_turn_outcome(
+                    event,
+                    response=response,
+                    agent_result=agent_result,
+                )
                 return None
 
+            _stamp_gateway_turn_outcome(
+                event,
+                response=response,
+                agent_result=agent_result,
+            )
             return response
             
         except Exception as e:
@@ -14307,17 +14442,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # 500 with a large session often means the payload is too large
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
-                    return (
+                    _error_response = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
                         "/reset to start fresh."
                     )
+                    _stamp_gateway_turn_outcome(
+                        event, response=_error_response, failed=True
+                    )
+                    return _error_response
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
-            return (
+            _error_response = (
                 f"Sorry, I encountered an unexpected error.{status_hint}\n"
                 "Try again or use /reset to start a fresh session."
             )
+            _stamp_gateway_turn_outcome(
+                event, response=_error_response, failed=True
+            )
+            return _error_response
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
@@ -17616,6 +17759,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            identity = self._completion_delivery_identity(evt)
+            if identity is not None:
+                producer_type, producer_id, producer_epoch = identity
+                if producer_epoch not in {"", None}:
+                    epoch_digest = __import__("hashlib").sha256(
+                        str(producer_epoch).encode("utf-8")
+                    ).hexdigest()[:16]
+                    producer_id = f"{producer_id}.{epoch_digest}"
+                # Internal-only routing metadata lets asynchronous adapters
+                # persist their own delivery boundary before this gateway
+                # acknowledges the authoritative producer record.
+                metadata["_completion_producer_type"] = producer_type
+                metadata["_completion_producer_id"] = producer_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -18110,6 +18266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         tool_policy=None,
+        external_tool_catalog_version: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -18164,6 +18321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 str(user_id or ""),
                 str(user_id_alt or ""),
                 getattr(tool_policy, "fingerprint", "legacy"),
+                str(external_tool_catalog_version or ""),
             ],
             sort_keys=True,
             default=str,
@@ -19493,6 +19651,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
+        external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        external_tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        external_tool_catalog_version: str = "",
+        external_tool_callback: Optional[
+            Callable[[str, Dict[str, Any], str], Any]
+        ] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19512,6 +19676,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
+                external_event_sink=external_event_sink,
+                external_tool_schemas=external_tool_schemas,
+                external_tool_catalog_version=external_tool_catalog_version,
+                external_tool_callback=external_tool_callback,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19524,6 +19692,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
+                external_event_sink=external_event_sink,
+                external_tool_schemas=external_tool_schemas,
+                external_tool_catalog_version=external_tool_catalog_version,
+                external_tool_callback=external_tool_callback,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19646,6 +19818,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
+        external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        external_tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        external_tool_catalog_version: str = "",
+        external_tool_callback: Optional[
+            Callable[[str, Dict[str, Any], str], Any]
+        ] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19660,6 +19838,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
+        _source_platform = str(
+            getattr(source.platform, "value", source.platform) or ""
+        )
+        if _source_platform != "workshop" and (
+            external_tool_schemas
+            or external_tool_catalog_version
+            or external_tool_callback is not None
+        ):
+            raise PermissionError(
+                "External tool authority is restricted to the workshop platform"
+            )
+
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message,
@@ -19683,16 +19873,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         tool_policy = _resolve_tool_policy_for_source(user_config, source)
-        if automated_trigger == "cron_result":
+        if automated_trigger in {"cron_result", "workshop_delta"}:
             from agent.tool_policy import deny_tools
 
-            # A routed cron completion is untrusted automation entering an
-            # otherwise interactive session. It may perform useful follow-up
-            # work, but it must not mutate the scheduler that invoked it.
+            denied_names = (
+                {"cronjob"}
+                if automated_trigger == "cron_result"
+                else {"spawn_agent"}
+            )
+            policy_source = f"gateway.{automated_trigger}"
+            # Untrusted automation may perform useful local follow-up work,
+            # but it cannot recursively invoke its own producer class. A
+            # workspace delta also receives an empty external-tool catalog at
+            # ingress, so no remote workshop mutation tool reaches this turn.
             tool_policy = deny_tools(
                 tool_policy,
-                {"cronjob"},
-                source="gateway.cron_result",
+                denied_names,
+                source=policy_source,
             )
         _profile_terminal_registered = False
         _profile_name = str(source.profile or self._active_profile_name() or "default")
@@ -20913,6 +21110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
                 tool_policy=tool_policy,
+                external_tool_catalog_version=external_tool_catalog_version,
             )
             agent = None
             reused_cached_agent = False
@@ -20968,10 +21166,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+            _signature_evicted_agent = None
             _xproc_evicted_agent = None
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
+                    if cached and cached[1] != _sig:
+                        # A config-signature miss replaces the cached agent.
+                        # Retire the superseded clients explicitly instead of
+                        # overwriting the tuple and leaking its app-server
+                        # subprocess. Workshop catalog changes intentionally
+                        # take this path once per real digest change.
+                        evicted = _cache.pop(session_key, None)
+                        _ev_agent = (
+                            evicted[0]
+                            if isinstance(evicted, tuple) and evicted
+                            else None
+                        )
+                        if (
+                            _ev_agent
+                            and _ev_agent is not _AGENT_PENDING_SENTINEL
+                        ):
+                            _signature_evicted_agent = _ev_agent
+                        cached = None
                     if cached and cached[1] == _sig:
                         # cached[2] is the message_count at cache time;
                         # stale when a second process appended rows.
@@ -21093,6 +21310,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent, self._refresh_fallback_model(),
                 )
 
+            # A signature miss is an intentional in-session replacement (for
+            # workshop, one real client catalog change). Close the retired
+            # app-server synchronously on this already-off-loop worker before
+            # constructing its replacement so both processes never coexist
+            # against the shared Claude thread store.
+            if _signature_evicted_agent is not None:
+                self._release_evicted_agent_soft(_signature_evicted_agent)
+
             # Lock released — now schedule cleanup of any cross-process-evicted
             # agent on a daemon thread so memory-provider shutdown / socket
             # teardown never blocks the gateway event loop or the cache lock
@@ -21187,7 +21412,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
-            agent.stream_delta_callback = _stream_delta_cb
+            agent.stream_delta_callback = _compose_external_text_event_sink(
+                _stream_delta_cb,
+                external_event_sink,
+            )
+            # Volatile per-turn bridge for runtime-native event granularity
+            # (thinking and tool argument fragments). The cached agent must
+            # never retain a prior workshop turn's sink.
+            agent._external_event_sink = external_event_sink
+            # Workshop client tools are a separate authority from Hermes-local
+            # tools. Their canonical catalog digest participates in the cache
+            # signature above; these volatile callback bindings are refreshed
+            # every turn on both new and cached agents.
+            agent._external_tool_schemas = list(external_tool_schemas or [])
+            agent._external_tool_names = frozenset(
+                str(schema.get("name") or "")
+                for schema in (external_tool_schemas or [])
+                if isinstance(schema, dict) and schema.get("name")
+            )
+            agent._external_tool_callback = external_tool_callback
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).

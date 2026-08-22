@@ -1,0 +1,16 @@
+{
+  "name": "giveUp",
+  "description": "Gives up on handling the current callbacks, rejecting all outstanding callbacks with an error. Use this if you cannot fulfill the callbacks after attempting to do so.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "error"
+    ],
+    "properties": {
+      "error": {
+        "type": "string",
+        "description": "Error message explaining why the callbacks cannot be fulfilled."
+      }
+    }
+  }
+}

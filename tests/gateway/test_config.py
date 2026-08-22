@@ -117,6 +117,17 @@ class TestPlatformConfigRoundtrip:
         # None must not serialize — keeps existing config files byte-stable.
         assert "typing_status_text" not in PlatformConfig().to_dict()
 
+    def test_platform_tool_policy_roundtrip(self):
+        policy = {
+            "mode": "allowlist",
+            "tools": ["clarify", "spawn_agent", "memory"],
+        }
+        restored = PlatformConfig.from_dict(
+            PlatformConfig(enabled=True, tool_policy=policy).to_dict()
+        )
+
+        assert restored.tool_policy == policy
+
     def test_channel_overrides_roundtrip(self):
         pc = PlatformConfig(
             enabled=True,
@@ -1583,6 +1594,28 @@ class TestLoadGatewayConfig:
         assert ov.model == "openrouter/healer-alpha"
         assert ov.provider == "openrouter"
         assert ov.system_prompt == "Daily news summarizer"
+
+    def test_loads_workshop_platform_tool_policy(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  workshop:\n"
+            "    enabled: true\n"
+            "    tool_policy:\n"
+            "      mode: allowlist\n"
+            "      tools: [clarify, spawn_agent, memory]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        workshop = config.platforms[Platform("workshop")]
+        assert workshop.tool_policy == {
+            "mode": "allowlist",
+            "tools": ["clarify", "spawn_agent", "memory"],
+        }
 
     def test_bridges_discord_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"

@@ -36,9 +36,12 @@ from gateway.session import SessionSource
 
 class _CapturingAgent:
     last_init = None
+    lifecycle_events = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        if type(self).lifecycle_events is not None:
+            type(self).lifecycle_events.append("init")
         self.tools = []
 
     def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
@@ -308,3 +311,96 @@ async def test_cron_result_turn_cannot_mutate_cron_jobs(monkeypatch, tmp_path):
     assert policy.allows("terminal")
     assert not policy.allows("cronjob")
     assert policy.source == "gateway.cron_result"
+
+
+@pytest.mark.asyncio
+async def test_non_workshop_platform_cannot_install_external_tool_authority():
+    runner = _make_runner()
+
+    with pytest.raises(PermissionError, match="restricted to the workshop platform"):
+        await runner._run_agent(
+            message="ordinary Discord input",
+            context_prompt="",
+            history=[],
+            source=_make_source(),
+            session_id="session-1",
+            session_key="agent:main:discord:thread:12345",
+            external_tool_schemas=[
+                {
+                    "name": "writeFile",
+                    "description": "remote mutation",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+            external_tool_catalog_version="attacker-catalog",
+            external_tool_callback=lambda *_args: None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_workshop_delta_turn_cannot_spawn_children(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"tool_policy": {"mode": "unrestricted"}}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {"core", "spawn", "memory"},
+    )
+    source = SessionSource(
+        platform=Platform("workshop"),
+        chat_type="thread",
+        chat_id="workspace-1",
+        thread_id="chat-1",
+    )
+
+    lifecycle = []
+    session_key = "agent:main:workshop:thread:workspace-1:chat-1"
+    runner._agent_cache[session_key] = (object(), "retired-catalog", None, "session-1")
+    runner._release_evicted_agent_soft = lambda _agent: lifecycle.append("release")
+    _CapturingAgent.lifecycle_events = lifecycle
+    _CapturingAgent.last_init = None
+    try:
+        result = await runner._run_agent(
+            message="workspace changed",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+            automated_trigger="workshop_delta",
+            external_tool_schemas=[],
+            external_tool_catalog_version="established-catalog",
+        )
+    finally:
+        _CapturingAgent.lifecycle_events = None
+
+    assert result["final_response"] == "ok"
+    assert lifecycle == ["release", "init"]
+    policy = _CapturingAgent.last_init["tool_policy"]
+    assert policy.allows("memory")
+    assert not policy.allows("spawn_agent")
+    assert policy.source == "gateway.workshop_delta"

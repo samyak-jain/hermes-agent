@@ -29,6 +29,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -87,6 +88,21 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+
+
+@dataclass(frozen=True)
+class HostToolResult:
+    """Structured result returned by an in-process MCP host tool.
+
+    Most Hermes-local tools return ordinary Python values and therefore keep
+    the legacy success behavior. External tool bridges can use this wrapper to
+    preserve the caller's explicit tool-error bit without raising an exception
+    (and without logging a normal remote tool failure as a host crash).
+    """
+
+    content: Any
+    is_error: bool = False
+    end_turn: bool = False
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -216,6 +232,8 @@ class CodexAppServerSession:
         system_prompt_identity: Optional[str] = None,
         tool_schemas: Optional[list[dict[str, Any]]] = None,
         tool_callback: Optional[Callable[[str, dict[str, Any], str], Any]] = None,
+        concurrent_tool_names: Optional[set[str] | frozenset[str]] = None,
+        max_concurrent_tools: int = 8,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -237,6 +255,11 @@ class CodexAppServerSession:
         self._system_prompt_identity = system_prompt_identity or ""
         self._tool_schemas = list(tool_schemas or [])
         self._tool_callback = tool_callback
+        self._concurrent_tool_names = frozenset(concurrent_tool_names or ())
+        self._tool_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_concurrent_tools)),
+            thread_name_prefix="app-server-host-tool",
+        )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -245,6 +268,9 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        self._host_tool_state_lock = threading.Lock()
+        self._host_tool_inflight = 0
+        self._host_tool_end_turn = False
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
         # bridge when codex sends item/fileChange/requestApproval. The
@@ -330,6 +356,7 @@ class CodexAppServerSession:
         if self._closed:
             return
         self._closed = True
+        self._tool_executor.shutdown(wait=False, cancel_futures=True)
         if self._client is not None:
             try:
                 self._client.close()
@@ -399,6 +426,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        interrupt_check: Optional[Callable[[], bool]] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -430,6 +458,9 @@ class CodexAppServerSession:
         result.thread_id = self._thread_id
 
         self._interrupt_event.clear()
+        if interrupt_check is not None and interrupt_check():
+            result.interrupted = True
+            return result
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
@@ -869,30 +900,11 @@ class CodexAppServerSession:
 
         if method == "agent/tool/call":
             name = str(params.get("name") or "")
-            arguments = params.get("arguments") or {}
-            tool_call_id = str(params.get("toolCallId") or "")
-            if not isinstance(arguments, dict):
-                arguments = {}
-            if self._tool_callback is None:
-                self._client.respond(
-                    rid,
-                    {"content": "Host tool bridge is unavailable", "isError": True},
-                )
-                return
-            try:
-                output = self._tool_callback(name, arguments, tool_call_id)
-                if not isinstance(output, str):
-                    output = json.dumps(output, ensure_ascii=False, default=str)
-                self._client.respond(
-                    rid,
-                    {"content": output, "isError": False},
-                )
-            except Exception as exc:
-                logger.exception("app-server host tool %s failed", name)
-                self._client.respond(
-                    rid,
-                    {"content": f"Tool {name} failed: {exc}", "isError": True},
-                )
+            if name in self._concurrent_tool_names:
+                self._tool_executor.submit(self._respond_host_tool, req)
+            else:
+                self._respond_host_tool(req)
+            return
         elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
@@ -932,6 +944,69 @@ class CodexAppServerSession:
             self._client.respond_error(
                 rid, code=-32601, message=f"Unsupported method: {method}"
             )
+
+    def _respond_host_tool(self, req: dict) -> None:
+        """Execute and answer one host-tool request.
+
+        Workshop-origin tools use the bounded executor so multiple provider
+        calls can be pending at once. Hermes-local tools remain synchronous to
+        preserve their existing per-turn execution semantics.
+        """
+
+        client = self._client
+        if client is None:
+            return
+        rid = req.get("id")
+        params = req.get("params") or {}
+        name = str(params.get("name") or "")
+        arguments = params.get("arguments") or {}
+        tool_call_id = str(params.get("toolCallId") or "")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if self._tool_callback is None:
+            client.respond(
+                rid,
+                {"content": "Host tool bridge is unavailable", "isError": True},
+            )
+            return
+        with self._host_tool_state_lock:
+            self._host_tool_inflight += 1
+        try:
+            output = self._tool_callback(name, arguments, tool_call_id)
+            is_error = False
+            end_turn = False
+            if isinstance(output, HostToolResult):
+                is_error = output.is_error
+                end_turn = output.end_turn
+                output = output.content
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False, default=str)
+            client.respond(
+                rid,
+                {"content": output, "isError": is_error},
+            )
+            if end_turn:
+                with self._host_tool_state_lock:
+                    self._host_tool_end_turn = True
+        except Exception as exc:
+            logger.exception("app-server host tool %s failed", name)
+            client.respond(
+                rid,
+                {"content": f"Tool {name} failed: {exc}", "isError": True},
+            )
+        finally:
+            with self._host_tool_state_lock:
+                self._host_tool_inflight -= 1
+                interrupt = (
+                    self._host_tool_inflight == 0 and self._host_tool_end_turn
+                )
+                if interrupt:
+                    self._host_tool_end_turn = False
+            if interrupt:
+                # Every in-flight MCP response must cross JSON-RPC before the
+                # provider turn is interrupted. This covers parallel workshop
+                # calls as well as the single after-current-call case.
+                self.request_interrupt()
 
     def _decide_exec_approval(self, params: dict) -> str:
         if self._routing.auto_approve_exec:

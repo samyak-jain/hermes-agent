@@ -1,0 +1,18 @@
+name: workshop-platform
+label: Workshop (Cloudflare OS)
+kind: platform
+version: 0.1.0
+description: >
+  Stateful turn API for a Cloudflare OS workshop. Hermes owns the durable
+  agent session while workshop-scoped tools execute in the caller's Durable
+  Object through authenticated remote callbacks.
+author: Samyak Jain
+requires_env:
+  - name: WORKSHOP_API_KEY
+    description: "Inbound bearer key (at least 64 hexadecimal characters)"
+    prompt: "Workshop inbound API key"
+    password: true
+  - name: WORKSHOP_WAKE_TOKEN
+    description: "Distinct outbound bearer token for autonomous turn wake calls"
+    prompt: "Workshop outbound wake token"
+    password: true

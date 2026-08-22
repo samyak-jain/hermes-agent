@@ -44,9 +44,20 @@ def _codex_app_server_config() -> dict[str, Any]:
 
 
 def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
-    """Convert the agent's policy-filtered OpenAI tools to bridge schemas."""
+    """Merge local policy-filtered tools with a turn's external catalog.
+
+    External tools remain a distinct dispatch authority. Any collision with
+    the actual local surface fails closed before the SDK thread starts.
+    """
     allowed = set(getattr(agent, "valid_tool_names", set()) or set())
     schemas: list[dict[str, Any]] = []
+    known_local_names: set[str] = set()
+    from tools.registry import registry
+
+    # A partial snapshot would let an external catalog impersonate the name of
+    # a policy-denied Hermes tool. Registry failure is therefore fatal to tool
+    # surface construction, not a reason to weaken the collision boundary.
+    known_local_names.update(registry.get_all_tool_names())
     for raw_tool in getattr(agent, "tools", None) or []:
         if not isinstance(raw_tool, dict):
             continue
@@ -54,6 +65,8 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
         if not isinstance(function, dict):
             continue
         name = str(function.get("name") or "")
+        if name:
+            known_local_names.add(name)
         if not name or name not in allowed:
             continue
         parameters = function.get("parameters") or {"type": "object", "properties": {}}
@@ -64,7 +77,76 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
                 "inputSchema": parameters,
             }
         )
+    external_names: set[str] = set()
+    for raw_schema in getattr(agent, "_external_tool_schemas", None) or []:
+        if not isinstance(raw_schema, dict):
+            raise ValueError("External tool schema must be an object")
+        name = str(raw_schema.get("name") or "")
+        if not name:
+            raise ValueError("External tool schema is missing a name")
+        if name in known_local_names:
+            raise PermissionError(
+                f"External tool name collides with a Hermes-local tool: {name}"
+            )
+        if name in external_names:
+            raise ValueError(f"Duplicate external tool name: {name}")
+        input_schema = raw_schema.get("inputSchema")
+        if not isinstance(input_schema, dict):
+            raise ValueError(f"External tool {name} has no object inputSchema")
+        external_names.add(name)
+        schemas.append(
+            {
+                "name": name,
+                "description": str(raw_schema.get("description") or ""),
+                "inputSchema": input_schema,
+            }
+        )
     return schemas
+
+
+def _dispatch_app_server_host_tool(
+    agent: Any,
+    name: str,
+    arguments: dict[str, Any],
+    tool_call_id: str,
+) -> Any:
+    """Dispatch one in-process MCP call across the local/remote authority split."""
+
+    from agent.transports.codex_app_server_session import HostToolResult
+
+    external_names = (
+        getattr(agent, "_external_tool_names", frozenset()) or frozenset()
+    )
+    if name in external_names:
+        callback = getattr(agent, "_external_tool_callback", None)
+        if not callable(callback):
+            raise RuntimeError(
+                f"External tool callback is unavailable for this turn: {name}"
+            )
+        remote = callback(name, arguments, tool_call_id)
+        if isinstance(remote, HostToolResult):
+            return remote
+        # Keep the callback protocol small: workshop returns a
+        # content/is_error object; other external bridges may return a legacy
+        # value and receive success semantics.
+        if hasattr(remote, "content") and hasattr(remote, "is_error"):
+            return HostToolResult(
+                content=remote.content,
+                is_error=bool(remote.is_error),
+                end_turn=bool(getattr(remote, "end_turn", False)),
+            )
+        return remote
+
+    if name not in (getattr(agent, "valid_tool_names", set()) or set()):
+        raise PermissionError(f"Tool is not enabled for this session: {name}")
+    context = getattr(agent, "_codex_host_tool_context", {}) or {}
+    return agent._invoke_tool(
+        name,
+        arguments,
+        context.get("effective_task_id") or "",
+        tool_call_id=tool_call_id or None,
+        messages=context.get("messages"),
+    )
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -504,6 +586,29 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _fire_external_event(event_type: str, payload: dict) -> None:
+        callback = getattr(agent, "_external_event_sink", None)
+        if callback is None:
+            return
+        try:
+            callback(event_type, payload)
+        except Exception:
+            logger.debug(
+                "external runtime event callback raised for %s",
+                event_type,
+                exc_info=True,
+            )
+
+    def _provider_tool_identity(item: dict) -> tuple[str, str] | None:
+        call_id = item.get("providerCallId")
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        if item.get("type") == "mcpToolCall" and item.get("server") == "agent-runtime":
+            name = item.get("tool") or "unknown"
+        else:
+            name = _codex_item_to_tool_name(item)
+        return call_id, str(name)
+
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
@@ -552,6 +657,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 logger.debug(
                     "tool_start_callback raised for %s", name, exc_info=True,
                 )
+        provider_identity = _provider_tool_identity(item)
+        if provider_identity is not None:
+            call_id, provider_name = provider_identity
+            _fire_external_event(
+                "tool_call.start",
+                {"call_id": call_id, "name": provider_name},
+            )
 
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
@@ -605,12 +717,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(text, str) or not text:
             return
         fn = getattr(agent, "_fire_reasoning_delta", None)
-        if fn is None:
-            return
-        try:
-            fn(text)
-        except Exception:
-            logger.debug("_fire_reasoning_delta raised", exc_info=True)
+        if fn is not None:
+            try:
+                fn(text)
+            except Exception:
+                logger.debug("_fire_reasoning_delta raised", exc_info=True)
+        _fire_external_event("thinking.delta", {"delta": text})
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
@@ -643,6 +755,32 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
+            return
+        if method == "item/toolCall/argumentsDelta":
+            call_id = params.get("callId")
+            name = params.get("name")
+            delta = params.get("delta")
+            if all(isinstance(value, str) and value for value in (call_id, name)) and isinstance(delta, str):
+                _fire_external_event(
+                    "tool_call.arguments.delta",
+                    {"call_id": call_id, "name": name, "delta": delta},
+                )
+            return
+        if method == "item/toolCall/argumentsCompleted":
+            call_id = params.get("callId")
+            name = params.get("name")
+            arguments = params.get("arguments")
+            if (
+                isinstance(call_id, str)
+                and call_id
+                and isinstance(name, str)
+                and name
+                and isinstance(arguments, dict)
+            ):
+                _fire_external_event(
+                    "tool_call.end",
+                    {"call_id": call_id, "name": name, "arguments": arguments},
+                )
             return
         item = params.get("item")
         if not isinstance(item, dict):
@@ -735,15 +873,8 @@ def run_codex_app_server_turn(
             arguments: dict[str, Any],
             tool_call_id: str,
         ) -> Any:
-            if name not in (getattr(agent, "valid_tool_names", set()) or set()):
-                raise PermissionError(f"Tool is not enabled for this session: {name}")
-            context = getattr(agent, "_codex_host_tool_context", {}) or {}
-            return agent._invoke_tool(
-                name,
-                arguments,
-                context.get("effective_task_id") or "",
-                tool_call_id=tool_call_id or None,
-                messages=context.get("messages"),
+            return _dispatch_app_server_host_tool(
+                agent, name, arguments, tool_call_id
             )
 
         app_server_prompt_parts = (
@@ -778,6 +909,11 @@ def run_codex_app_server_turn(
             system_prompt_identity=system_prompt_static,
             tool_schemas=(_app_server_tool_schemas(agent) if use_host_bridge else None),
             tool_callback=(_invoke_host_tool if use_host_bridge else None),
+            concurrent_tool_names=(
+                set(getattr(agent, "_external_tool_names", frozenset()) or ())
+                if use_host_bridge
+                else None
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -810,6 +946,9 @@ def run_codex_app_server_turn(
         turn = agent._codex_session.run_turn(
             user_input=user_message,
             post_tool_quiet_timeout=quiet_timeout,
+            interrupt_check=lambda: bool(
+                getattr(agent, "_interrupt_requested", False)
+            ),
         )
     except Exception as exc:
         logger.exception("codex app-server turn failed")

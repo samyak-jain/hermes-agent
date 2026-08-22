@@ -1,0 +1,8 @@
+{
+  "name": "listBlueprints",
+  "description": "List the blueprints available to the user: their own published blueprints, their blueprint library, and this deployment's featured blueprints. A blueprint is a shareable snapshot of a Gadget's code; instantiate one as a new Gadget by passing its `blueprintId` to `createGadget`. There is no search — read the list and pick the best match yourself.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

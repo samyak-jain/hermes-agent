@@ -1,0 +1,31 @@
+{
+  "name": "editFile",
+  "description": "Edit content of a file. If you need to edit multiple places in a file or across multiple files, you should issue multiple tool calls simultaneously, rather than in series.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "workpiece",
+      "filename",
+      "textToReplace",
+      "replacement"
+    ],
+    "properties": {
+      "workpiece": {
+        "type": "string",
+        "description": "Env binding name of the workpiece (e.g. gadget) that owns the file, as listed in the system prompt or chosen in createGadget."
+      },
+      "filename": {
+        "type": "string",
+        "description": "Name of the file to edit."
+      },
+      "textToReplace": {
+        "type": "string",
+        "description": "Exact existing text which is to be replaced. This string must match exactly one location in the file, or the edit will fail."
+      },
+      "replacement": {
+        "type": "string",
+        "description": "Text which should be inserted, replacing the matched text."
+      }
+    }
+  }
+}

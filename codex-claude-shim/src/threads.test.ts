@@ -37,6 +37,26 @@ test("host sessions resume their Claude session and original prompt snapshot", (
   assert.equal(JSON.parse(readFileSync(persistence, "utf8")).version, 4);
 });
 
+test("host-session rebind updates tools without losing the Claude session", () => {
+  const root = mkdtempSync(join(tmpdir(), "claude-bridge-tools-"));
+  const persistence = join(root, "threads.json");
+  const firstStore = new ThreadStore(persistence);
+  const first = firstStore.create({
+    hostSessionId: "session-tools",
+    tools: [{ name: "readFile", inputSchema: { type: "object" } }],
+  });
+  firstStore.bindClaudeSession(first, "claude-session-tools");
+
+  const rebound = new ThreadStore(persistence).create({
+    hostSessionId: "session-tools",
+    tools: [{ name: "writeFile", inputSchema: { type: "object" } }],
+  });
+
+  assert.equal(rebound.threadId, first.threadId);
+  assert.equal(rebound.claudeSessionId, "claude-session-tools");
+  assert.deepEqual(rebound.tools.map((tool) => tool.name), ["writeFile"]);
+});
+
 test("preset-prompt threads start a fresh session with the custom prompt", () => {
   const root = mkdtempSync(join(tmpdir(), "claude-bridge-v1-"));
   const persistence = join(root, "threads.json");

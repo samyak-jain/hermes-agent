@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { z } from "zod";
 import { jsonSchemaShape, jsonSchemaToZod } from "./schema.js";
@@ -69,3 +70,77 @@ test("JSON schema conversion preserves typed config arrays and reference maps", 
   assert.throws(() => schema.parse({ FIRECRAWL_API_KEY: 7 }));
   assert.throws(() => schema.parse(["firecrawl_map", { nested: true }]));
 });
+
+test("current workshop fixture catalog converts without dropping arguments", () => {
+  const fixtureRoot = new URL(
+    "../../fixtures/workshop-tool-schemas/",
+    import.meta.url,
+  );
+  const manifest = JSON.parse(
+    readFileSync(new URL("index.json", fixtureRoot), "utf8"),
+  ) as { tools: Array<{ file: string }> };
+
+  for (const entry of manifest.tools) {
+    const tool = JSON.parse(
+      readFileSync(new URL(entry.file, fixtureRoot), "utf8"),
+    ) as {
+      name: string;
+      parameters: JsonSchemaFixture;
+    };
+    const required = new Set(tool.parameters.required ?? []);
+    const sample = Object.fromEntries(
+      Object.entries(tool.parameters.properties ?? {})
+        .filter(([name]) => required.has(name))
+        .map(([name, property]) => [name, sampleValue(property)]),
+    );
+    assert.deepEqual(
+      jsonSchemaToZod(tool.parameters).parse(sample),
+      sample,
+      tool.name,
+    );
+  }
+
+  const renderUi = JSON.parse(
+    readFileSync(new URL("renderUI.json", fixtureRoot), "utf8"),
+  ) as { parameters: JsonSchemaFixture };
+  const renderArgs = {
+    jsx: '<Input value={bind("form.name")} />',
+    state: { form: { name: "Hermes" } },
+  };
+  assert.deepEqual(
+    jsonSchemaToZod(renderUi.parameters).parse(renderArgs),
+    renderArgs,
+  );
+});
+
+interface JsonSchemaFixture {
+  type?: string;
+  enum?: unknown[];
+  required?: string[];
+  properties?: Record<string, JsonSchemaFixture>;
+  items?: JsonSchemaFixture;
+}
+
+function sampleValue(schema: JsonSchemaFixture): unknown {
+  if (schema.enum?.length) return schema.enum[0];
+  switch (schema.type) {
+    case "string":
+      return "fixture-value";
+    case "integer":
+    case "number":
+      return 1;
+    case "boolean":
+      return true;
+    case "array":
+      return [sampleValue(schema.items ?? {})];
+    case "object":
+      return Object.fromEntries(
+        Object.entries(schema.properties ?? {}).map(([name, property]) => [
+          name,
+          sampleValue(property),
+        ]),
+      );
+    default:
+      return null;
+  }
+}

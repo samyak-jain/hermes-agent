@@ -1,0 +1,332 @@
+"""aiohttp route provider for the workshop turn protocol."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Callable
+
+from .auth import WorkshopAuthenticator
+from .protocol import (
+    PROTOCOL_VERSION,
+    WorkshopControlRequest,
+    WorkshopDeltaRequest,
+    WorkshopProtocolError,
+    WorkshopToolResultRequest,
+    WorkshopTurnRequest,
+    validate_identifier,
+)
+from .storage import WorkshopLedger
+
+
+logger = logging.getLogger(__name__)
+
+
+def _web():
+    from aiohttp import web
+
+    return web
+
+
+class WorkshopHTTPController:
+    """Authenticated HTTP facade; live execution remains adapter-owned."""
+
+    def __init__(
+        self,
+        api_adapter: Any,
+        *,
+        authenticator: WorkshopAuthenticator | None = None,
+        ledger: WorkshopLedger | None = None,
+    ):
+        self.api_adapter = api_adapter
+        self.authenticator = authenticator
+        self.ledger = ledger
+        self._initialization_attempted = bool(
+            authenticator is not None and ledger is not None
+        )
+        self._initialization_error: str | None = None
+
+    def routes(self) -> list[tuple]:
+        return [
+            ("GET", "/api/workshop/v1/health", self.health),
+            ("POST", "/api/workshop/v1/turns", self.start_turn),
+            ("GET", "/api/workshop/v1/turns/{turn_id}/events", self.turn_events),
+            (
+                "POST",
+                "/api/workshop/v1/turns/{turn_id}/tool-results/{call_id}",
+                self.post_tool_result,
+            ),
+            ("POST", "/api/workshop/v1/turns/{turn_id}/control", self.control_turn),
+            (
+                "POST",
+                "/api/workshop/v1/sessions/{workspace_id}/{chat_id}/deltas",
+                self.post_delta,
+            ),
+        ]
+
+    def _error(self, code: str, message: str, *, status: int):
+        return _web().json_response(
+            {"error": {"code": code, "message": message}}, status=status
+        )
+
+    def _ensure_initialized(self):
+        if self._initialization_attempted:
+            if self._initialization_error is not None:
+                return self._error(
+                    "workshop_unavailable",
+                    "Workshop platform is disabled by invalid server configuration",
+                    status=503,
+                )
+            return None
+        self._initialization_attempted = True
+        try:
+            if self.authenticator is None:
+                self.authenticator = WorkshopAuthenticator.from_environment()
+            if self.ledger is None:
+                self.ledger = WorkshopLedger()
+        except Exception as exc:
+            self._initialization_error = str(exc) or type(exc).__name__
+            # This is intentionally request-lazy: an invalid workshop secret or
+            # ledger disables only these routes, never the API server that also
+            # owns /health, OpenAI compatibility, cron-fire, and Relay.
+            logger.error(
+                "workshop_http_initialization_failed disabled=true error=%s",
+                self._initialization_error,
+                exc_info=True,
+            )
+            return self._error(
+                "workshop_unavailable",
+                "Workshop platform is disabled by invalid server configuration",
+                status=503,
+            )
+        return None
+
+    def _authorize(self, request):
+        unavailable = self._ensure_initialized()
+        if unavailable is not None:
+            return unavailable
+        assert self.authenticator is not None
+        if self.authenticator.authorized(request.headers.get("Authorization")):
+            return None
+        return self._error("unauthorized", "Invalid workshop bearer token", status=401)
+
+    async def _json_body(self, request) -> Any:
+        try:
+            return await request.json()
+        except Exception as exc:
+            raise WorkshopProtocolError("invalid_json", "Request body must be valid JSON") from exc
+
+    def _adapter(self, request):
+        runner = request.app.get("gateway_runner")
+        for platform, adapter in (getattr(runner, "adapters", {}) or {}).items():
+            if str(getattr(platform, "value", platform)) == "workshop":
+                return adapter
+        return None
+
+    async def _parse_and_delegate(
+        self,
+        request,
+        parser: Callable[[Any], Any],
+        method_name: str,
+        *args,
+        delegate_kwargs: dict[str, Any] | None = None,
+    ):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            parsed = parser(await self._json_body(request))
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=exc.status)
+        adapter = self._adapter(request)
+        handler = getattr(adapter, method_name, None) if adapter is not None else None
+        if not callable(handler):
+            return self._error(
+                "workshop_unavailable",
+                "Workshop platform is not connected",
+                status=503,
+            )
+        return await handler(
+            *args,
+            parsed,
+            request=request,
+            controller=self,
+            **(delegate_kwargs or {}),
+        )
+
+    def _after_seq(self, request) -> int:
+        raw = request.query.get("after_seq", "0")
+        if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+            raise WorkshopProtocolError(
+                "invalid_event_sequence",
+                "after_seq must be a non-negative integer",
+            )
+        return int(raw, 10)
+
+    async def start_turn(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            after_seq = self._after_seq(request)
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=400)
+        return await self._parse_and_delegate(
+            request,
+            WorkshopTurnRequest.from_dict,
+            "start_workshop_turn",
+            delegate_kwargs={"after_seq": after_seq},
+        )
+
+    async def health(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        adapter = self._adapter(request)
+        ledger = getattr(adapter, "ledger", None) or self.ledger
+        assert ledger is not None
+        dead_letters = ledger.dead_letter_wake_count()
+        connected = bool(adapter is not None and getattr(adapter, "_running", False))
+        behavior = dict(getattr(adapter, "_behavior", {}) or {})
+        limit_names = (
+            "max_active_turns",
+            "max_pending_remote_calls",
+            "max_client_tools",
+            "max_tool_schema_bytes",
+            "max_event_backlog_bytes",
+            "completed_event_retention_seconds",
+            "turn_timeout_seconds",
+            "remote_tool_timeout_seconds",
+            "wake_timeout_seconds",
+        )
+        status = "ok"
+        if dead_letters:
+            status = "degraded"
+        elif not connected:
+            status = "unavailable"
+        return _web().json_response(
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "status": status,
+                "connected": connected,
+                "active_turns": ledger.count_active_turns(),
+                "dead_letter_wakes": dead_letters,
+                "limits": {
+                    name: behavior[name]
+                    for name in limit_names
+                    if name in behavior
+                },
+                "client_tool_authority": "per_turn_remote_callback",
+            }
+        )
+
+    async def turn_events(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            turn_id = validate_identifier(request.match_info.get("turn_id"), "turn_id")
+            after_seq = self._after_seq(request)
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=400)
+
+        adapter = self._adapter(request)
+        stream = getattr(adapter, "stream_workshop_events", None) if adapter is not None else None
+        if callable(stream):
+            return await stream(turn_id, after_seq=after_seq, request=request, controller=self)
+
+        # Completed turns remain replayable even while the live workshop
+        # adapter is unavailable.  Active turns need the adapter's subscriber
+        # tail and therefore return 503 instead of falsely closing the stream.
+        assert self.ledger is not None
+        turn = self.ledger.get_turn(turn_id)
+        if turn is None:
+            return self._error("turn_not_found", "Workshop turn not found", status=404)
+        if turn.state in {"queued", "running", "ending"}:
+            return self._error(
+                "workshop_unavailable",
+                "Workshop platform is not connected for this active turn",
+                status=503,
+            )
+        events = self.ledger.list_events(turn_id, after_seq=after_seq)
+        web = _web()
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+        for event in events:
+            payload = json.dumps(event.to_wire(), ensure_ascii=False, separators=(",", ":"))
+            await response.write(f"event: {event.event}\ndata: {payload}\n\n".encode("utf-8"))
+        await response.write_eof()
+        return response
+
+    async def post_tool_result(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            turn_id = validate_identifier(request.match_info.get("turn_id"), "turn_id")
+            call_id = validate_identifier(request.match_info.get("call_id"), "call_id")
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=exc.status)
+        return await self._parse_and_delegate(
+            request,
+            WorkshopToolResultRequest.from_dict,
+            "resolve_workshop_tool_call",
+            turn_id,
+            call_id,
+        )
+
+    async def control_turn(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            turn_id = validate_identifier(request.match_info.get("turn_id"), "turn_id")
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=exc.status)
+        return await self._parse_and_delegate(
+            request,
+            WorkshopControlRequest.from_dict,
+            "control_workshop_turn",
+            turn_id,
+        )
+
+    async def post_delta(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            workspace_id = validate_identifier(
+                request.match_info.get("workspace_id"), "workspace_id"
+            )
+            chat_id = validate_identifier(request.match_info.get("chat_id"), "chat_id")
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=exc.status)
+        try:
+            parsed = WorkshopDeltaRequest.from_dict(await self._json_body(request))
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=exc.status)
+        if parsed.workspace_id != workspace_id or parsed.chat_id != chat_id:
+            return self._error(
+                "route_identity_mismatch",
+                "Path workspace/chat identifiers must match the request body",
+                status=409,
+            )
+        adapter = self._adapter(request)
+        handler = getattr(adapter, "ingest_workshop_delta", None) if adapter is not None else None
+        if not callable(handler):
+            return self._error(
+                "workshop_unavailable", "Workshop platform is not connected", status=503
+            )
+        return await handler(parsed, request=request, controller=self)
+
+
+def create_api_routes(api_adapter: Any) -> list[tuple]:
+    """PlatformEntry route factory evaluated during API-server startup."""
+    return WorkshopHTTPController(api_adapter).routes()

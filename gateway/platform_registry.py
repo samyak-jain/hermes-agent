@@ -158,6 +158,20 @@ class PlatformEntry:
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
 
+    # ── Shared API-server ingress ------------------------------------------
+    # Optional factory for HTTP routes hosted on the existing API server
+    # listener.  The factory receives the live APIServerAdapter and returns
+    # ``(method, path, handler)`` rows.  It is evaluated only when this
+    # platform is enabled in the owning GatewayRunner.  The API server
+    # validates all rows and fails startup on collisions, so plugins cannot
+    # silently shadow native or sibling routes.
+    #
+    # This is deliberately an ingress-only seam, not a second server and not
+    # a model-tool extension point.  Handlers should resolve their sibling
+    # adapter lazily through ``request.app["gateway_runner"]`` because adapter
+    # connection order is not stable.
+    api_route_factory: Optional[Callable[[Any], list[tuple]]] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

@@ -1,0 +1,16 @@
+{
+  "name": "describeBinding",
+  "description": "Describe one of the bindings in your `env` (as used with the `executeCode` tool) by name, including TypeScript types specifying the API it offers.\n\nSometimes user messages may contain text like `[Resource Title](env.SOME_NAME)`. This means the user has granted you access to an external resource, available in your `env` under that name. Describe it with this tool before using it.\n\nIMPORTANT: The objects found in `env` most likely do NOT implement any API you are familiar with from your training. DO NOT try to guess what API they implement, and DO NOT use executeCode to try to enumerate them programmatically (this will not work, as they are RPC interfaces). Use the describeBinding tool to learn what interface they provide before writing any code.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "name"
+    ],
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Name of the binding (a property of `env`)."
+      }
+    }
+  }
+}

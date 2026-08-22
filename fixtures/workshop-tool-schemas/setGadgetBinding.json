@@ -1,0 +1,25 @@
+{
+  "name": "setGadgetBinding",
+  "description": "Wire a resource from your `env` into a Gadget's own `env`, so the Gadget's code can use it.\n\nThe bindings in your `env` belong to this chat; a Gadget's code sees only the Gadget's own bindings, which are listed in the system prompt. Use this tool to add one of your bindings to a Gadget: `gadget` names the target Gadget (by its name in your env), `source` names the resource binding to wire in, and `name` is the name the Gadget's code will see it as (`env.<name>` in server.js), defaulting to the same name as `source`.\n\nThe addition is part of your proposed changes: like code edits, it takes permanent effect when the user accepts your changes.\n\nNOTE: You do NOT need this tool to use a resource yourself with `executeCode` — your own bindings are already available there. ONLY use it when a Gadget's code needs the resource.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "gadget",
+      "source"
+    ],
+    "properties": {
+      "gadget": {
+        "type": "string",
+        "description": "Env binding name of the gadget whose bindings to modify."
+      },
+      "source": {
+        "type": "string",
+        "description": "Env binding name of the resource to wire into the gadget."
+      },
+      "name": {
+        "type": "string",
+        "description": "Name to bind the resource under within the gadget (`env.<name>` in the gadget's own code). Defaults to the same name as `source`. Style: ALL_CAPS_WITH_UNDERSCORES."
+      }
+    }
+  }
+}

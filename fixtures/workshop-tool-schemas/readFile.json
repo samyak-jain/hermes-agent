@@ -1,0 +1,21 @@
+{
+  "name": "readFile",
+  "description": "Read the content of a file owned by one of the workspace's gadgets. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "workpiece",
+      "filename"
+    ],
+    "properties": {
+      "workpiece": {
+        "type": "string",
+        "description": "Env binding name of the workpiece (e.g. gadget) that owns the file, as listed in the system prompt or chosen in createGadget."
+      },
+      "filename": {
+        "type": "string",
+        "description": "Name of the file to read."
+      }
+    }
+  }
+}

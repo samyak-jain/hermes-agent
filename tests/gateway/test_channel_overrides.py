@@ -219,6 +219,48 @@ class TestChannelToolPolicy:
             assert policy.mode == "allowlist"
             assert not policy.allows("terminal")
 
+    def test_managed_platform_policy_applies_to_workshop(self, monkeypatch):
+        cfg = self._config()
+        cfg["platforms"]["workshop"] = {
+            "tool_policy": {
+                "mode": "allowlist",
+                "tools": ["clarify", "spawn_agent", "memory"],
+            }
+        }
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed",
+            lambda path: path == "platforms.workshop.tool_policy.mode",
+        )
+        source = SessionSource(
+            platform=Platform("workshop"),
+            chat_id="workspace",
+            thread_id="chat",
+            chat_type="thread",
+        )
+
+        policy = _resolve_tool_policy_for_source(cfg, source)
+
+        assert policy.mode == "allowlist"
+        assert policy.allows("spawn_agent")
+        assert not policy.allows("terminal")
+
+    def test_unmanaged_platform_policy_cannot_elevate(self, monkeypatch):
+        cfg = self._config()
+        cfg["platforms"]["workshop"] = {
+            "tool_policy": {"mode": "unrestricted"}
+        }
+        monkeypatch.setattr(
+            "hermes_cli.managed_scope.is_key_managed", lambda _path: False
+        )
+        source = SessionSource(
+            platform=Platform("workshop"), chat_id="workspace", chat_type="thread"
+        )
+
+        policy = _resolve_tool_policy_for_source(cfg, source)
+
+        assert policy.mode == "allowlist"
+        assert not policy.allows("terminal")
+
     def test_managed_trusted_channel_is_unrestricted(self, monkeypatch):
         cfg = self._config()
         monkeypatch.setattr(

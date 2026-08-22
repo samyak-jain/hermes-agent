@@ -579,6 +579,11 @@ class PlatformConfig:
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
 
+    # Platform-wide exact tool authority. This is resolved after the global
+    # (or profile) policy and before any narrower channel override. Elevating
+    # values remain subject to agent.tool_policy.gateway_override_authority.
+    tool_policy: Optional[Dict[str, Any]] = None
+
     # Reply threading mode (Telegram/Slack)
     # - "off": Never thread replies to original message
     # - "first": Only first chunk threads to user's message (default)
@@ -632,6 +637,8 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.tool_policy is not None:
+            result["tool_policy"] = self.tool_policy
         if self.channel_overrides:
             result["channel_overrides"] = {
                 cid: ov.to_dict() for cid, ov in self.channel_overrides.items()
@@ -679,6 +686,7 @@ class PlatformConfig:
             token=data.get("token"),
             api_key=data.get("api_key"),
             home_channel=home_channel,
+            tool_policy=data.get("tool_policy"),
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
@@ -1536,6 +1544,12 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                has_tool_policy = "tool_policy" in platform_cfg
+                if has_tool_policy:
+                    plat_data, _extra = _ensure_platform_extra_dict(
+                        platforms_data, plat.value
+                    )
+                    plat_data["tool_policy"] = platform_cfg.get("tool_policy")
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")
@@ -1549,7 +1563,12 @@ def load_gateway_config() -> GatewayConfig:
                             if isinstance(ov_data, dict)
                         }
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
-                if not bridged and not enabled_was_explicit and not has_channel_overrides:
+                if (
+                    not bridged
+                    and not enabled_was_explicit
+                    and not has_channel_overrides
+                    and not has_tool_policy
+                ):
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:

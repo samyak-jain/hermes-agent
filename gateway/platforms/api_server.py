@@ -95,6 +95,14 @@ from gateway.readiness import collect_runtime_readiness
 logger = logging.getLogger(__name__)
 
 
+class APIRouteConfigurationError(RuntimeError):
+    """Fatal configuration error while composing the shared HTTP router."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
 
@@ -1522,6 +1530,98 @@ class APIServerAdapter(BasePlatformAdapter):
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    def _platform_http_route_rows(self) -> List[tuple[str, str, str, Any]]:
+        """Collect enabled plugin-platform routes without depending on order.
+
+        Returns ``(owner, method, path, handler)`` rows.  Platform plugins are
+        discovered before adapters connect, while the workshop/API adapter
+        ordering in config is intentionally not stable.  Factories therefore
+        receive this API adapter and their handlers resolve sibling adapters
+        lazily from the request application's gateway-runner reference.
+        """
+        runner = self.gateway_runner
+        runner_config = getattr(runner, "config", None)
+        configured = getattr(runner_config, "platforms", None)
+        if not isinstance(configured, dict):
+            return []
+
+        enabled_names = {
+            str(getattr(platform, "value", platform))
+            for platform, platform_config in configured.items()
+            if bool(getattr(platform_config, "enabled", False))
+        }
+        if not enabled_names:
+            return []
+
+        from gateway.platform_registry import platform_registry
+
+        rows: List[tuple[str, str, str, Any]] = []
+        for entry in sorted(platform_registry.all_entries(), key=lambda item: item.name):
+            factory = getattr(entry, "api_route_factory", None)
+            if entry.name not in enabled_names or factory is None:
+                continue
+            try:
+                provided = factory(self)
+            except Exception as exc:
+                raise APIRouteConfigurationError(
+                    "api_server_route_provider_failed",
+                    f"HTTP route factory for platform {entry.name!r} failed: {exc}",
+                ) from exc
+            if not isinstance(provided, (list, tuple)):
+                raise APIRouteConfigurationError(
+                    "api_server_invalid_route_provider",
+                    f"HTTP route factory for platform {entry.name!r} must return a list of rows",
+                )
+            for index, row in enumerate(provided):
+                if not isinstance(row, (list, tuple)) or len(row) != 3:
+                    raise APIRouteConfigurationError(
+                        "api_server_invalid_route_provider",
+                        f"HTTP route {index} from platform {entry.name!r} must be "
+                        "(method, path, handler)",
+                    )
+                method, path, handler = row
+                method = str(method or "").strip().upper()
+                path = str(path or "").strip()
+                if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+                    raise APIRouteConfigurationError(
+                        "api_server_invalid_route_provider",
+                        f"HTTP route from platform {entry.name!r} has unsupported method {method!r}",
+                    )
+                if not path.startswith("/") or path.startswith("/p/{profile}"):
+                    raise APIRouteConfigurationError(
+                        "api_server_invalid_route_provider",
+                        f"HTTP route from platform {entry.name!r} has invalid path {path!r}",
+                    )
+                if not callable(handler):
+                    raise APIRouteConfigurationError(
+                        "api_server_invalid_route_provider",
+                        f"HTTP route {method} {path} from platform {entry.name!r} has no callable handler",
+                    )
+                rows.append((entry.name, method, path, handler))
+        return rows
+
+    def _combined_http_route_table(self) -> List[tuple]:
+        """Return native plus enabled plugin routes, rejecting collisions."""
+        combined: List[tuple] = []
+        owners: Dict[tuple[str, str], str] = {}
+
+        def add(owner: str, method: str, path: str, handler: Any) -> None:
+            key = (method.upper(), path)
+            previous = owners.get(key)
+            if previous is not None:
+                raise APIRouteConfigurationError(
+                    "api_server_route_collision",
+                    f"HTTP route collision for {key[0]} {path}: {previous!r} and {owner!r}",
+                )
+            owners[key] = owner
+            combined.append((key[0], path, handler))
+
+        for method, path, handler in self._http_route_table():
+            add("api_server", method, path, handler)
+        for owner, method, path, handler in self._platform_http_route_rows():
+            add(owner, method, path, handler)
+        return combined
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -5403,7 +5503,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
             # the profile-prefix middleware validates the prefix and scopes
             # config/credentials to that profile when multiplexing is on.
-            for method, path, handler in self._http_route_table():
+            for method, path, handler in self._combined_http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
             # Store the adapter after native routes are registered. Local Hermes-Relay
@@ -5510,6 +5610,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return True
 
+        except APIRouteConfigurationError as e:
+            self._set_fatal_error(e.code, str(e), retryable=False)
+            logger.error("[%s] Refusing to start API server: %s", self.name, e)
+            return False
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False

@@ -1,0 +1,26 @@
+{
+  "name": "writeFile",
+  "description": "Write a complete file, creating it if it doesn't exist, or replacing it if it does.",
+  "parameters": {
+    "type": "object",
+    "required": [
+      "workpiece",
+      "filename",
+      "content"
+    ],
+    "properties": {
+      "workpiece": {
+        "type": "string",
+        "description": "Env binding name of the workpiece (e.g. gadget) that owns the file, as listed in the system prompt or chosen in createGadget."
+      },
+      "filename": {
+        "type": "string",
+        "description": "Name of the file to write."
+      },
+      "content": {
+        "type": "string",
+        "description": "The entire content of the file to write."
+      }
+    }
+  }
+}

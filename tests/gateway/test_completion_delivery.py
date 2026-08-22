@@ -150,6 +150,8 @@ def test_duplicate_cron_queue_replay_injects_once(monkeypatch, isolated_registry
     assert delivered.source.profile == "vegapunk"
     assert delivered.metadata["automated_trigger"] == "cron_result"
     assert delivered.metadata["cron_job_id"] == "job-1"
+    assert delivered.metadata["_completion_producer_type"] == "cron_result"
+    assert delivered.metadata["_completion_producer_id"] == "exec_duplicate"
 
 
 def test_failed_cron_injection_is_requeued_for_retry(monkeypatch, isolated_registry):
