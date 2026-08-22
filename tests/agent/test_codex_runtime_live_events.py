@@ -67,6 +67,81 @@ def test_agent_message_and_reasoning_deltas_are_forwarded_live():
     ]
 
 
+def test_reasoning_block_starts_signal_redacted_and_visible_thinking_once():
+    agent, calls = _recording_agent()
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    bridge({
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-reasoning-redacted",
+                "type": "reasoning",
+                "summary": [],
+                "content": [],
+            },
+        },
+    })
+    bridge({
+        "method": "item/reasoning/delta",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-reasoning-redacted",
+            "delta": "",
+        },
+    })
+    bridge({
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {"id": "item-message", "type": "agentMessage", "text": ""},
+        },
+    })
+    bridge({
+        "method": "item/agentMessage/delta",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-message",
+            "delta": "Answer",
+        },
+    })
+    bridge({
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-reasoning-visible",
+                "type": "reasoning",
+                "summary": [],
+                "content": [],
+            },
+        },
+    })
+    bridge({
+        "method": "item/reasoning/delta",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-reasoning-visible",
+            "delta": "Visible thought",
+        },
+    })
+
+    assert calls["stream"] == ["Answer"]
+    assert calls["reasoning"] == ["Visible thought"]
+    assert calls["external"] == [
+        ("thinking.delta", {"delta": ""}),
+        ("thinking.delta", {"delta": ""}),
+        ("thinking.delta", {"delta": "Visible thought"}),
+    ]
+
+
 def test_provider_tool_lifecycle_is_forwarded_with_exact_call_id():
     agent, calls = _recording_agent()
     bridge = make_codex_app_server_event_bridge(agent)
@@ -216,7 +291,7 @@ def test_non_tool_events_and_malformed_payloads_are_ignored():
     agent, calls = _recording_agent()
     bridge = make_codex_app_server_event_bridge(agent)
     for note in (
-        {"method": "item/started", "params": {"item": {"type": "reasoning"}}},
+        {"method": "item/started", "params": {"item": {"type": "agentMessage"}}},
         {"method": "turn/completed", "params": {}},
         {"method": "item/started", "params": []},
         {},
