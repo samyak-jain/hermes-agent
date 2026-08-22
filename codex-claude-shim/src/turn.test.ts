@@ -3,7 +3,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "@anthropic-ai/claude-agent-sdk";
+import {
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+  type SDKThinkingTokensMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { ThreadStore, type ThreadState } from "./threads.js";
 import {
   createPartialStreamState,
@@ -284,7 +287,7 @@ test("native compaction never moves system context into a user message", () => {
   });
 
   assert.equal(
-    handleSystemMessage(store, state, {
+    handleSystemMessage({ notify() {} } as never, store, state, "turn-1", {
       subtype: "compact_boundary",
       session_id: "claude-session-1",
     }),
@@ -294,4 +297,38 @@ test("native compaction never moves system context into a user message", () => {
     prompt: "after compact",
     includesHostContext: false,
   });
+});
+
+test("SDK thinking-token messages emit content-free reasoning progress", () => {
+  const root = mkdtempSync(join(tmpdir(), "claude-thinking-progress-"));
+  const store = new ThreadStore(join(root, "threads.json"));
+  const state = store.create({ hostSessionId: "session-1", tools: [] });
+  const notifications: Array<{
+    method: string;
+    params: Record<string, unknown>;
+  }> = [];
+  const rpc = {
+    notify(method: string, params: Record<string, unknown>) {
+      notifications.push({ method, params });
+    },
+  };
+  const message: SDKThinkingTokensMessage = {
+    type: "system",
+    subtype: "thinking_tokens",
+    estimated_tokens: 377,
+    estimated_tokens_delta: 23,
+    uuid: "00000000-0000-0000-0000-000000000001",
+    session_id: "claude-session-1",
+  };
+
+  assert.equal(
+    handleSystemMessage(rpc as never, store, state, "turn-1", message),
+    true,
+  );
+  assert.deepEqual(notifications, [
+    {
+      method: "item/reasoning/progress",
+      params: { threadId: state.threadId, turnId: "turn-1" },
+    },
+  ]);
 });
