@@ -76,6 +76,43 @@ class WorkshopTurnRecord:
         return cls(**{field: row[field] for field in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True)
+class WorkshopToolCallRecord:
+    turn_id: str
+    call_id: str
+    name: str
+    state: str
+    arguments: Any
+    result: Any | None
+    is_error: bool | None
+    created_at: float
+    resolved_at: float | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "WorkshopToolCallRecord":
+        return cls(
+            turn_id=row["turn_id"],
+            call_id=row["call_id"],
+            name=row["name"],
+            state=row["state"],
+            arguments=json.loads(row["arguments_json"]),
+            result=(
+                json.loads(row["result_json"])
+                if row["result_json"] is not None
+                else None
+            ),
+            is_error=(
+                bool(row["is_error"]) if row["is_error"] is not None else None
+            ),
+            created_at=float(row["created_at"]),
+            resolved_at=(
+                float(row["resolved_at"])
+                if row["resolved_at"] is not None
+                else None
+            ),
+        )
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS workshop_turns (
     turn_id TEXT PRIMARY KEY,
@@ -674,6 +711,39 @@ class WorkshopLedger:
                 (result_json, 1 if is_error else 0, now, turn_id, call_id),
             )
             return True
+
+        return self._write(write)
+
+    def get_tool_call(
+        self, turn_id: str, call_id: str
+    ) -> WorkshopToolCallRecord | None:
+        def read(conn: sqlite3.Connection) -> WorkshopToolCallRecord | None:
+            row = conn.execute(
+                """SELECT * FROM workshop_tool_calls
+                   WHERE turn_id=? AND call_id=?""",
+                (turn_id, call_id),
+            ).fetchone()
+            return WorkshopToolCallRecord.from_row(row) if row is not None else None
+
+        return self._read(read)
+
+    def expire_tool_call(self, *, turn_id: str, call_id: str) -> bool:
+        """Mark a still-pending remote call timed out.
+
+        The state transition is conditional so a result racing the deadline
+        wins cleanly if it committed first.
+        """
+
+        now = time.time()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                """UPDATE workshop_tool_calls
+                   SET state='timed_out', resolved_at=?
+                   WHERE turn_id=? AND call_id=? AND state='pending'""",
+                (now, turn_id, call_id),
+            )
+            return cursor.rowcount == 1
 
         return self._write(write)
 

@@ -34,7 +34,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | B6 provider tool-use-ID spike | Complete | Claude Agent SDK 0.3.207 passes the provider ID as `extra._meta["claudecode/toolUseId"]`; the shim forwards it exactly. No FIFO/name correlation. Shim suite: 18 passed. |
 | 2. Stateful adapter and text stream | Complete | Deterministic workspace/chat lanes, execution-epoch session pinning, independent turn tasks, durable ordered SSE text/usage/end events, replay/reattach, disconnect survival, same-lane serialization, cross-lane concurrency, atomic capacity admission, and managed platform-wide tool policy are implemented. Focused phase suite: 262 passed. |
 | 3. Raw runtime event bridge | Complete | Claude SDK partial events now preserve live thinking, exact provider `tool_use` IDs, raw argument fragments, and complete parsed arguments through the Codex shim into workshop SSE. Semantic events remain replayable while thinking/argument fragments remain live-only. |
-| 4-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
+| 4. External tools and result callback | Complete | Strict client schemas merge after the policy-filtered local MCP surface with full registry collision rejection. Catalog digests bust the cached-agent signature; the superseded app-server is retired and the shim rebinds the same Claude session with the new catalog. Remote calls use exact provider IDs, durable pending rows, bounded parallel callback workers, idempotent result POSTs, typed errors/timeouts, and never enter local dispatch. |
+| 5-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
 
 Phase-1 verification notes:
 
@@ -65,6 +66,19 @@ Phase-3 verification notes:
 
 - Claude shim: 19 passed. Focused Python event/workshop suite: 106 passed. After the ordering-race fix, the broader repository Codex plus workshop suite is green at 816 passed, including all 7 turn-stream tests. Ruff and `git diff --check` pass.
 - The repository-wide runner completed all 2,138 test files on the phase-3 source before the final localized stream-merge fix: 43,687 tests passed. The five known production-base assertions remained unchanged. Twelve failures were host temporary-storage quota artifacts and all 95 affected tests passed in isolated retries. `tests/run_agent/test_run_agent.py` exceeded the per-file timeout because a baseline model-metadata test attempts DNS access to `proxy.example`; a faulthandler trace confirmed the block is outside workshop execution.
+
+Phase-4 implementation notes:
+
+- The gateway passes only an explicit external-tool catalog, catalog digest, and per-turn callback across the generic run boundary. The digest is part of `_agent_config_signature`; identical catalogs reuse the cached agent, while a changed digest evicts and soft-releases the old agent. `AIAgent.release_clients()` now closes its Codex app-server subprocess, and the Claude shim's host-session store replaces the tool catalog while retaining the persisted Claude session ID and frozen prompt snapshot.
+- `_app_server_tool_schemas()` merges canonical workshop schemas after the policy-filtered local schemas and rejects names colliding with any currently registered Hermes tool, including local tools denied by workshop policy. Dispatch checks the separate external-name set first and routes those calls only to the workshop callback; tests prove local `_invoke_tool` is never entered for a remote name and exact local policy still denies unavailable local names.
+- Each remote call is registered in `workshop_tool_calls` before `tool_call.end` is exposed. Results are idempotent for identical bodies and return 409 on conflict or after timeout. The blocking SDK callback receives a structured result that preserves the caller's `is_error` bit without converting a normal remote error into a host exception.
+- Claude can issue parallel tool calls. The app-server session therefore runs workshop-origin callbacks in a bounded eight-worker executor while retaining synchronous semantics for Hermes-local tools. The JSON-RPC client serializes outbound JSONL frames. The ledger independently caps pending calls at eight, and tests resolve two simultaneous calls out of order.
+- Phase-4 tests exposed another phase-2 terminal race: `turn.end` could commit between the stream's event query and terminal-state query. The terminal branch now performs one final durable/recent sequence merge before closing. It also exposed the SDK-callback ordering race; remote argument completion is withheld until the pending call is durably addressable.
+
+Phase-4 verification notes:
+
+- Claude shim: 20 passed. Focused runtime/cache/workshop integration suite: 327 passed. Broad repository Codex plus workshop suite: 827 passed. Ruff and `git diff --check` pass.
+- The isolated full runner completed all 2,139 files: 43,670 tests passed. The five known production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH expectations). Relocating pytest's temp root under `/home` to avoid `/tmp` quota caused 17 path-sensitive harness failures (fake-home detection, hidden-directory search, shell fixture paths, and Unix-socket length); all seven affected files pass under the normal temp root, 506 tests total. The three known long files (`test_25107_stale_base_url_api_mode.py`, `test_provider_fallback.py`, and `test_run_agent.py`) hit the per-file timeout under the loaded host; no phase-4 file failed or timed out.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 

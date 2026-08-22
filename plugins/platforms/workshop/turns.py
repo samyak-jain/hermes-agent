@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import threading
+import time
 from typing import Any, Awaitable, Callable
 
 from .protocol import WorkshopEvent, WorkshopEventType
@@ -18,6 +19,20 @@ logger = logging.getLogger(__name__)
 
 _SSE_KEEPALIVE_SECONDS = 15.0
 _MAX_RECENT_EVENT_BYTES = 512 * 1024
+
+
+@dataclass(frozen=True)
+class WorkshopRemoteResult:
+    content: Any
+    is_error: bool
+
+
+class WorkshopRemoteCallTimeout(TimeoutError):
+    pass
+
+
+class WorkshopRemoteCallCancelled(RuntimeError):
+    pass
 
 
 @dataclass
@@ -72,6 +87,8 @@ class WorkshopTurnCoordinator:
         self.ledger = ledger
         self._live: dict[str, _LiveTurn] = {}
         self._lane_locks: dict[str, asyncio.Lock] = {}
+        self._remote_waiters: dict[tuple[str, str], threading.Event] = {}
+        self._remote_waiters_lock = threading.Lock()
 
     def lane_lock(self, session_key: str) -> asyncio.Lock:
         return self._lane_locks.setdefault(session_key, asyncio.Lock())
@@ -145,7 +162,101 @@ class WorkshopTurnCoordinator:
         live = self._live.get(turn_id)
         if live is not None:
             live.publish(item)
+        self._wake_remote_waiters(turn_id)
         return item
+
+    def _waiter_for(self, turn_id: str, call_id: str) -> threading.Event:
+        key = (turn_id, call_id)
+        with self._remote_waiters_lock:
+            return self._remote_waiters.setdefault(key, threading.Event())
+
+    def _wake_remote_waiters(self, turn_id: str, call_id: str | None = None) -> None:
+        with self._remote_waiters_lock:
+            waiters = [
+                waiter
+                for (candidate_turn, candidate_call), waiter in self._remote_waiters.items()
+                if candidate_turn == turn_id
+                and (call_id is None or candidate_call == call_id)
+            ]
+        for waiter in waiters:
+            waiter.set()
+
+    def wait_for_remote_result(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+    ) -> WorkshopRemoteResult:
+        """Register a remote call durably and block its SDK worker for a result."""
+
+        self.ledger.register_tool_call(
+            turn_id=turn_id,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+        )
+        key = (turn_id, call_id)
+        waiter = self._waiter_for(turn_id, call_id)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while True:
+                # Clear before reading: a resolver either commits before this
+                # read (and is observed below) or sets the event afterward.
+                waiter.clear()
+                record = self.ledger.get_tool_call(turn_id, call_id)
+                if record is None:
+                    raise WorkshopRemoteCallCancelled(
+                        f"remote tool call disappeared: {call_id}"
+                    )
+                if record.state == "resolved":
+                    return WorkshopRemoteResult(
+                        content=record.result,
+                        is_error=bool(record.is_error),
+                    )
+                if record.state != "pending":
+                    raise WorkshopRemoteCallCancelled(
+                        f"remote tool call ended with state {record.state}: {call_id}"
+                    )
+                turn = self.ledger.get_turn(turn_id)
+                if turn is None or turn.state in TERMINAL_TURN_STATES:
+                    raise WorkshopRemoteCallCancelled(
+                        f"workshop turn ended while waiting for remote tool: {call_id}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if self.ledger.expire_tool_call(
+                        turn_id=turn_id, call_id=call_id
+                    ):
+                        raise WorkshopRemoteCallTimeout(
+                            f"remote tool result timed out after {timeout_seconds:g}s"
+                        )
+                    # A result committed at the deadline; observe it.
+                    continue
+                waiter.wait(remaining)
+        finally:
+            with self._remote_waiters_lock:
+                if self._remote_waiters.get(key) is waiter:
+                    self._remote_waiters.pop(key, None)
+
+    def resolve_remote_result(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        result: Any,
+        is_error: bool,
+    ) -> bool:
+        created = self.ledger.resolve_tool_call(
+            turn_id=turn_id,
+            call_id=call_id,
+            result=result,
+            is_error=is_error,
+        )
+        self._wake_remote_waiters(turn_id, call_id)
+        return created
 
     def emitted_text(self, turn_id: str) -> str:
         state = self._live.get(turn_id)
@@ -205,7 +316,38 @@ class WorkshopTurnCoordinator:
                     cursor = item.seq
 
                 turn = await asyncio.to_thread(self.ledger.get_turn, turn_id)
-                if turn is None or turn.state in TERMINAL_TURN_STATES:
+                if turn is None:
+                    break
+                if turn.state in TERMINAL_TURN_STATES:
+                    # turn.end and the terminal state commit atomically, but
+                    # they may commit between the event query above and this
+                    # state query. Merge one final tail after observing the
+                    # terminal state so the response never closes one event
+                    # early.
+                    durable_tail = await asyncio.to_thread(
+                        self.ledger.list_events, turn_id, after_seq=cursor
+                    )
+                    recent_tail = (
+                        live.recent_after(cursor) if live is not None else []
+                    )
+                    terminal_tail = {item.seq: item for item in durable_tail}
+                    terminal_tail.update(
+                        {item.seq: item for item in recent_tail}
+                    )
+                    for seq in sorted(terminal_tail):
+                        item = terminal_tail[seq]
+                        payload = json.dumps(
+                            item.to_wire(),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        await response.write(
+                            (
+                                f"id: {item.seq}\nevent: {item.event}\n"
+                                f"data: {payload}\n\n"
+                            ).encode("utf-8")
+                        )
+                        cursor = item.seq
                     break
                 if live is None:
                     # A fresh process closes orphaned active turns during

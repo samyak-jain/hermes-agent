@@ -3602,6 +3602,18 @@ class AIAgent:
         except Exception:
             pass
 
+        # Close the Codex app-server subprocess as well. A cache-signature
+        # rebuild (including a workshop tool-catalog change) constructs a new
+        # bridge and rebinds its hostSessionId to the persisted Claude session;
+        # keeping the superseded subprocess alive only leaks resources.
+        try:
+            codex_session = getattr(self, "_codex_session", None)
+            if codex_session is not None:
+                codex_session.close()
+                self._codex_session = None
+        except Exception:
+            pass
+
         # Close the OpenAI/httpx client to release sockets immediately.
         try:
             client = getattr(self, "client", None)
@@ -3675,7 +3687,15 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close the Codex app-server subprocess and OpenAI/httpx client
+        try:
+            codex_session = getattr(self, "_codex_session", None)
+            if codex_session is not None:
+                codex_session.close()
+                self._codex_session = None
+        except Exception:
+            pass
+
         try:
             client = getattr(self, "client", None)
             if client is not None:

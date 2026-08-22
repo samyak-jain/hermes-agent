@@ -170,6 +170,37 @@ def test_pending_tool_calls_are_bounded_and_results_are_idempotent(tmp_path):
             turn_id=turn.turn_id, call_id="call-1", result={"ok": False}, is_error=False
         )
 
+    first = ledger.get_tool_call(turn.turn_id, "call-1")
+    assert first is not None
+    assert first.state == "resolved"
+    assert first.result == {"ok": True}
+    assert first.is_error is False
+
+
+def test_pending_tool_call_timeout_is_terminal_and_rejects_late_result(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.register_tool_call(
+        turn_id=turn.turn_id,
+        call_id="call-timeout",
+        name="readFile",
+        arguments={"path": "README.md"},
+    )
+
+    assert ledger.expire_tool_call(
+        turn_id=turn.turn_id, call_id="call-timeout"
+    )
+    assert not ledger.expire_tool_call(
+        turn_id=turn.turn_id, call_id="call-timeout"
+    )
+    with pytest.raises(WorkshopConflictError):
+        ledger.resolve_tool_call(
+            turn_id=turn.turn_id,
+            call_id="call-timeout",
+            result={"ok": True},
+            is_error=False,
+        )
+
 
 def test_dead_letter_and_retention_are_durable(tmp_path):
     ledger = _ledger(tmp_path, completed_retention_seconds=10)

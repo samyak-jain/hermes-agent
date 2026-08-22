@@ -138,6 +138,7 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
@@ -299,8 +300,12 @@ class CodexAppServerClient:
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            # Host-tool results may be posted by bounded worker threads while
+            # the turn loop sends interrupts or other requests. Serialize each
+            # JSONL frame so writes can never interleave on stdin.
+            with self._send_lock:
+                self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise RuntimeError(
                 f"codex app-server stdin closed unexpectedly: {exc}"

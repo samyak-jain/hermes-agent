@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from types import SimpleNamespace
+import time
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -15,20 +17,29 @@ from plugins.platforms.workshop.adapter import WorkshopAdapter
 from plugins.platforms.workshop.auth import WorkshopAuthenticator
 from plugins.platforms.workshop.http import WorkshopHTTPController
 from plugins.platforms.workshop.storage import WorkshopLedger
-from plugins.platforms.workshop.turns import WorkshopTurnCoordinator
+from plugins.platforms.workshop.turns import (
+    WorkshopRemoteCallTimeout,
+    WorkshopTurnCoordinator,
+)
 
 
 KEY = "a" * 64
 
 
-def _body(*, client_turn_id="client-1", workspace_id="workspace-1", chat_id="chat-1"):
+def _body(
+    *,
+    client_turn_id="client-1",
+    workspace_id="workspace-1",
+    chat_id="chat-1",
+    tools=None,
+):
     return {
         "protocol_version": 1,
         "client_turn_id": client_turn_id,
         "workspace_id": workspace_id,
         "chat_id": chat_id,
         "input": {"type": "user", "text": "Hello"},
-        "tools": [],
+        "tools": tools or [],
     }
 
 
@@ -65,6 +76,7 @@ def _adapter(tmp_path, handler, *, session_ids=None, max_active=4):
     adapter._behavior = {
         "max_active_turns": max_active,
         "max_event_backlog_bytes": 8 * 1024 * 1024,
+        "remote_tool_timeout_seconds": 2,
     }
     adapter._running = True
     adapter.set_message_handler(handler)
@@ -294,6 +306,119 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
 
 
 @pytest.mark.asyncio
+async def test_remote_tool_blocks_until_idempotent_posted_result(tmp_path):
+    observed = {}
+    callback_entered = asyncio.Event()
+
+    async def handler(event):
+        callback = event.metadata["_workshop_tool_callback"]
+        sink = event.metadata["_gateway_event_sink"]
+        sink(
+            "tool_call.start",
+            {"call_id": "toolu_remote_123", "name": "writeFile"},
+        )
+        # Simulate the SDK argument-complete notification racing ahead of its
+        # in-process MCP callback. The adapter must withhold this boundary
+        # until the durable pending-call row exists.
+        sink(
+            "tool_call.end",
+            {
+                "call_id": "toolu_remote_123",
+                "name": "writeFile",
+                "arguments": {"path": "README.md", "content": "hello"},
+            },
+        )
+
+        def invoke():
+            callback_entered_loop.call_soon_threadsafe(callback_entered.set)
+            return callback(
+                "writeFile",
+                {"path": "README.md", "content": "hello"},
+                "toolu_remote_123",
+            )
+
+        remote = await asyncio.to_thread(invoke)
+        observed["remote"] = remote
+        event.metadata["_gateway_event_sink"]("text.delta", {"delta": "saved"})
+        return {"final_response": "saved"}
+
+    callback_entered_loop = asyncio.get_running_loop()
+    tools = [
+        {
+            "name": "writeFile",
+            "description": "Write a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(tools=tools),
+            headers=_headers(),
+        )
+        await asyncio.wait_for(callback_entered.wait(), timeout=1)
+
+        records = []
+        while not any(item["event"] == "tool_call.end" for item in records):
+            line = (await response.content.readline()).decode()
+            if line.startswith("data: "):
+                records.append(json.loads(line.removeprefix("data: ")))
+        turn_id = records[0]["turn_id"]
+        posted = {
+            "protocol_version": 1,
+            "result": {"ok": True, "revision": 7},
+            "is_error": False,
+        }
+        accepted = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/tool-results/toolu_remote_123",
+            json=posted,
+            headers=_headers(),
+        )
+        assert accepted.status == 200
+        assert (await accepted.json())["duplicate"] is False
+
+        duplicate = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/tool-results/toolu_remote_123",
+            json=posted,
+            headers=_headers(),
+        )
+        assert duplicate.status == 200
+        assert (await duplicate.json())["duplicate"] is True
+        records.extend(_sse_records(await response.text()))
+
+        conflict = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/tool-results/toolu_remote_123",
+            json={**posted, "result": {"ok": False}},
+            headers=_headers(),
+        )
+        assert conflict.status == 409
+
+    assert observed["remote"].content == {"ok": True, "revision": 7}
+    assert observed["remote"].is_error is False
+    assert [item["event"] for item in records] == [
+        "turn.started",
+        "message.start",
+        "tool_call.start",
+        "tool_call.end",
+        "text.delta",
+        "usage",
+        "turn.end",
+    ]
+    assert adapter.ledger.get_tool_call(
+        turn_id, "toolu_remote_123"
+    ).state == "resolved"
+
+
+@pytest.mark.asyncio
 async def test_same_chat_turns_serialize_while_different_chats_overlap(tmp_path):
     active_by_lane = {}
     max_by_lane = {}
@@ -380,3 +505,82 @@ def test_external_text_sink_composes_with_native_gateway_stream():
 
     assert native == ["hello"]
     assert external == [("text.delta", {"delta": "hello"})]
+
+
+def test_remote_wait_timeout_is_typed_and_durable(tmp_path):
+    ledger = WorkshopLedger(tmp_path / "state.db")
+    turn, _ = ledger.create_turn(
+        client_turn_id="client-timeout",
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        session_key="agent:main:workshop:thread:workspace-1:chat-1",
+        session_id="session-1",
+        catalog_version="catalog-1",
+        request_digest="request-timeout",
+    )
+    coordinator = WorkshopTurnCoordinator(ledger)
+
+    with pytest.raises(WorkshopRemoteCallTimeout, match="timed out"):
+        coordinator.wait_for_remote_result(
+            turn_id=turn.turn_id,
+            call_id="toolu_timeout",
+            name="readFile",
+            arguments={"path": "README.md"},
+            timeout_seconds=0.01,
+        )
+
+    call = ledger.get_tool_call(turn.turn_id, "toolu_timeout")
+    assert call is not None and call.state == "timed_out"
+
+
+def test_simultaneous_remote_calls_resolve_independently(tmp_path):
+    ledger = WorkshopLedger(tmp_path / "state.db")
+    turn, _ = ledger.create_turn(
+        client_turn_id="client-parallel",
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        session_key="agent:main:workshop:thread:workspace-1:chat-1",
+        session_id="session-1",
+        catalog_version="catalog-1",
+        request_digest="request-parallel",
+    )
+    coordinator = WorkshopTurnCoordinator(ledger)
+
+    def wait(call_id: str):
+        return coordinator.wait_for_remote_result(
+            turn_id=turn.turn_id,
+            call_id=call_id,
+            name="writeFile",
+            arguments={"path": f"{call_id}.txt"},
+            timeout_seconds=2,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(wait, "toolu_parallel_1")
+        second = pool.submit(wait, "toolu_parallel_2")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if all(
+                ledger.get_tool_call(turn.turn_id, call_id) is not None
+                for call_id in ("toolu_parallel_1", "toolu_parallel_2")
+            ):
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("parallel calls were not registered")
+
+        coordinator.resolve_remote_result(
+            turn_id=turn.turn_id,
+            call_id="toolu_parallel_2",
+            result={"order": 2},
+            is_error=False,
+        )
+        coordinator.resolve_remote_result(
+            turn_id=turn.turn_id,
+            call_id="toolu_parallel_1",
+            result={"order": 1},
+            is_error=False,
+        )
+
+        assert first.result(timeout=1).content == {"order": 1}
+        assert second.result(timeout=1).content == {"order": 2}

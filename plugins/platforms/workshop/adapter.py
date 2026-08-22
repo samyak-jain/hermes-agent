@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -31,12 +32,14 @@ from .protocol import (
     MAX_TURN_SECONDS,
     WorkshopEventType,
     WorkshopTurnRequest,
+    validate_identifier,
 )
 from .storage import (
     WorkshopBacklogExceeded,
     WorkshopCapacityError,
     WorkshopConflictError,
     WorkshopLedger,
+    WorkshopNotFoundError,
 )
 from .turns import WorkshopTurnCoordinator
 
@@ -355,8 +358,88 @@ class WorkshopAdapter(BasePlatformAdapter):
                     {"role": "assistant"},
                 )
 
+                remote_names = frozenset(tool.name for tool in turn.tools)
+                lifecycle_lock = threading.Lock()
+                emitted_starts: set[str] = set()
+                emitted_ends: set[str] = set()
+                registered_remote_calls: set[str] = set()
+
                 def event_sink(event: str, payload: dict[str, Any]) -> None:
+                    call_id = str(payload.get("call_id") or "")
+                    name = str(payload.get("name") or "")
+                    if event in {
+                        WorkshopEventType.TOOL_CALL_START.value,
+                        WorkshopEventType.TOOL_CALL_END.value,
+                    } and call_id:
+                        seen = (
+                            emitted_starts
+                            if event == WorkshopEventType.TOOL_CALL_START.value
+                            else emitted_ends
+                        )
+                        with lifecycle_lock:
+                            if (
+                                event == WorkshopEventType.TOOL_CALL_END.value
+                                and name in remote_names
+                                and call_id not in registered_remote_calls
+                            ):
+                                # The partial SDK stream can finish arguments
+                                # before its MCP callback reaches Hermes. Do
+                                # not invite an unresolvable early result POST;
+                                # the callback republishes this boundary only
+                                # after the durable call row exists.
+                                return
+                            if call_id in seen:
+                                return
+                            self.turns.emit_sync(turn_id, event, payload)
+                            seen.add(call_id)
+                        return
                     self.turns.emit_sync(turn_id, event, payload)
+
+                def remote_tool_callback(
+                    name: str,
+                    arguments: dict[str, Any],
+                    call_id: str,
+                ):
+                    if name not in remote_names:
+                        raise PermissionError(
+                            f"Tool is not in this workshop catalog: {name}"
+                        )
+                    if not call_id:
+                        raise RuntimeError(
+                            "Workshop remote tool call has no provider call ID"
+                        )
+                    validate_identifier(call_id, "call_id")
+                    # Register before publishing complete arguments so an
+                    # immediate client POST can always resolve a known call.
+                    self.ledger.register_tool_call(
+                        turn_id=turn_id,
+                        call_id=call_id,
+                        name=name,
+                        arguments=arguments,
+                    )
+                    with lifecycle_lock:
+                        registered_remote_calls.add(call_id)
+                    event_sink(
+                        WorkshopEventType.TOOL_CALL_START.value,
+                        {"call_id": call_id, "name": name},
+                    )
+                    event_sink(
+                        WorkshopEventType.TOOL_CALL_END.value,
+                        {
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    )
+                    return self.turns.wait_for_remote_result(
+                        turn_id=turn_id,
+                        call_id=call_id,
+                        name=name,
+                        arguments=arguments,
+                        timeout_seconds=float(
+                            self._behavior["remote_tool_timeout_seconds"]
+                        ),
+                    )
 
                 event = MessageEvent(
                     text=turn.text,
@@ -371,6 +454,7 @@ class WorkshopAdapter(BasePlatformAdapter):
                         "workshop_tools": [
                             tool.to_bridge_schema() for tool in turn.tools
                         ],
+                        "_workshop_tool_callback": remote_tool_callback,
                         "workshop_client_metadata": dict(turn.metadata),
                     },
                 )
@@ -459,6 +543,46 @@ class WorkshopAdapter(BasePlatformAdapter):
                     code="turn_execution_failed",
                     message=str(exc)[:2048] or type(exc).__name__,
                 )
+
+    async def resolve_workshop_tool_call(
+        self,
+        turn_id: str,
+        call_id: str,
+        tool_result,
+        *,
+        request,
+        controller,
+    ):
+        del request, controller
+        if self.ledger is None or self.turns is None or not self._running:
+            return self._json_error(
+                "workshop_unavailable",
+                "Workshop platform is not connected",
+                status=503,
+            )
+        try:
+            accepted = await asyncio.to_thread(
+                self.turns.resolve_remote_result,
+                turn_id=turn_id,
+                call_id=call_id,
+                result=tool_result.result,
+                is_error=tool_result.is_error,
+            )
+        except WorkshopNotFoundError as exc:
+            return self._json_error("tool_call_not_found", str(exc), status=404)
+        except WorkshopConflictError as exc:
+            return self._json_error("tool_result_conflict", str(exc), status=409)
+
+        from aiohttp import web
+
+        return web.json_response(
+            {
+                "ok": True,
+                "turn_id": turn_id,
+                "call_id": call_id,
+                "duplicate": not accepted,
+            }
+        )
 
     async def _finish_execution_error(
         self, turn_id: str, *, code: str, message: str

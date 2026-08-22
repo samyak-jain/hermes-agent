@@ -13688,6 +13688,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 external_event_sink=(event.metadata or {}).get(
                     "_gateway_event_sink"
                 ),
+                external_tool_schemas=(event.metadata or {}).get(
+                    "workshop_tools"
+                ),
+                external_tool_catalog_version=str(
+                    (event.metadata or {}).get("workshop_catalog_version") or ""
+                ),
+                external_tool_callback=(event.metadata or {}).get(
+                    "_workshop_tool_callback"
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18181,6 +18190,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         tool_policy=None,
+        external_tool_catalog_version: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -18235,6 +18245,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 str(user_id or ""),
                 str(user_id_alt or ""),
                 getattr(tool_policy, "fingerprint", "legacy"),
+                str(external_tool_catalog_version or ""),
             ],
             sort_keys=True,
             default=str,
@@ -19565,6 +19576,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
         external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        external_tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        external_tool_catalog_version: str = "",
+        external_tool_callback: Optional[
+            Callable[[str, Dict[str, Any], str], Any]
+        ] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19585,6 +19601,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
                 external_event_sink=external_event_sink,
+                external_tool_schemas=external_tool_schemas,
+                external_tool_catalog_version=external_tool_catalog_version,
+                external_tool_callback=external_tool_callback,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19598,6 +19617,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 automated_trigger=automated_trigger,
                 external_event_sink=external_event_sink,
+                external_tool_schemas=external_tool_schemas,
+                external_tool_catalog_version=external_tool_catalog_version,
+                external_tool_callback=external_tool_callback,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19721,6 +19743,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         automated_trigger: str = "",
         external_event_sink: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        external_tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        external_tool_catalog_version: str = "",
+        external_tool_callback: Optional[
+            Callable[[str, Dict[str, Any], str], Any]
+        ] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20988,6 +21015,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
                 tool_policy=tool_policy,
+                external_tool_catalog_version=external_tool_catalog_version,
             )
             agent = None
             reused_cached_agent = False
@@ -21047,6 +21075,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
+                    if cached and cached[1] != _sig:
+                        # A config-signature miss replaces the cached agent.
+                        # Retire the superseded clients explicitly instead of
+                        # overwriting the tuple and leaking its app-server
+                        # subprocess. Workshop catalog changes intentionally
+                        # take this path once per real digest change.
+                        evicted = _cache.pop(session_key, None)
+                        _ev_agent = (
+                            evicted[0]
+                            if isinstance(evicted, tuple) and evicted
+                            else None
+                        )
+                        if (
+                            _ev_agent
+                            and _ev_agent is not _AGENT_PENDING_SENTINEL
+                        ):
+                            _xproc_evicted_agent = _ev_agent
+                        cached = None
                     if cached and cached[1] == _sig:
                         # cached[2] is the message_count at cache time;
                         # stale when a second process appended rows.
@@ -21270,6 +21316,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (thinking and tool argument fragments). The cached agent must
             # never retain a prior workshop turn's sink.
             agent._external_event_sink = external_event_sink
+            # Workshop client tools are a separate authority from Hermes-local
+            # tools. Their canonical catalog digest participates in the cache
+            # signature above; these volatile callback bindings are refreshed
+            # every turn on both new and cached agents.
+            agent._external_tool_schemas = list(external_tool_schemas or [])
+            agent._external_tool_names = frozenset(
+                str(schema.get("name") or "")
+                for schema in (external_tool_schemas or [])
+                if isinstance(schema, dict) and schema.get("name")
+            )
+            agent._external_tool_callback = external_tool_callback
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).

@@ -44,9 +44,20 @@ def _codex_app_server_config() -> dict[str, Any]:
 
 
 def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
-    """Convert the agent's policy-filtered OpenAI tools to bridge schemas."""
+    """Merge local policy-filtered tools with a turn's external catalog.
+
+    External tools remain a distinct dispatch authority. Any collision with
+    the actual local surface fails closed before the SDK thread starts.
+    """
     allowed = set(getattr(agent, "valid_tool_names", set()) or set())
     schemas: list[dict[str, Any]] = []
+    known_local_names: set[str] = set()
+    try:
+        from tools.registry import registry
+
+        known_local_names.update(registry.get_all_tool_names())
+    except Exception:
+        logger.debug("Could not snapshot registered tool names", exc_info=True)
     for raw_tool in getattr(agent, "tools", None) or []:
         if not isinstance(raw_tool, dict):
             continue
@@ -54,6 +65,8 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
         if not isinstance(function, dict):
             continue
         name = str(function.get("name") or "")
+        if name:
+            known_local_names.add(name)
         if not name or name not in allowed:
             continue
         parameters = function.get("parameters") or {"type": "object", "properties": {}}
@@ -64,7 +77,75 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
                 "inputSchema": parameters,
             }
         )
+    external_names: set[str] = set()
+    for raw_schema in getattr(agent, "_external_tool_schemas", None) or []:
+        if not isinstance(raw_schema, dict):
+            raise ValueError("External tool schema must be an object")
+        name = str(raw_schema.get("name") or "")
+        if not name:
+            raise ValueError("External tool schema is missing a name")
+        if name in known_local_names:
+            raise PermissionError(
+                f"External tool name collides with a Hermes-local tool: {name}"
+            )
+        if name in external_names:
+            raise ValueError(f"Duplicate external tool name: {name}")
+        input_schema = raw_schema.get("inputSchema")
+        if not isinstance(input_schema, dict):
+            raise ValueError(f"External tool {name} has no object inputSchema")
+        external_names.add(name)
+        schemas.append(
+            {
+                "name": name,
+                "description": str(raw_schema.get("description") or ""),
+                "inputSchema": input_schema,
+            }
+        )
     return schemas
+
+
+def _dispatch_app_server_host_tool(
+    agent: Any,
+    name: str,
+    arguments: dict[str, Any],
+    tool_call_id: str,
+) -> Any:
+    """Dispatch one in-process MCP call across the local/remote authority split."""
+
+    from agent.transports.codex_app_server_session import HostToolResult
+
+    external_names = (
+        getattr(agent, "_external_tool_names", frozenset()) or frozenset()
+    )
+    if name in external_names:
+        callback = getattr(agent, "_external_tool_callback", None)
+        if not callable(callback):
+            raise RuntimeError(
+                f"External tool callback is unavailable for this turn: {name}"
+            )
+        remote = callback(name, arguments, tool_call_id)
+        if isinstance(remote, HostToolResult):
+            return remote
+        # Keep the callback protocol small: workshop returns a
+        # content/is_error object; other external bridges may return a legacy
+        # value and receive success semantics.
+        if hasattr(remote, "content") and hasattr(remote, "is_error"):
+            return HostToolResult(
+                content=remote.content,
+                is_error=bool(remote.is_error),
+            )
+        return remote
+
+    if name not in (getattr(agent, "valid_tool_names", set()) or set()):
+        raise PermissionError(f"Tool is not enabled for this session: {name}")
+    context = getattr(agent, "_codex_host_tool_context", {}) or {}
+    return agent._invoke_tool(
+        name,
+        arguments,
+        context.get("effective_task_id") or "",
+        tool_call_id=tool_call_id or None,
+        messages=context.get("messages"),
+    )
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -791,15 +872,8 @@ def run_codex_app_server_turn(
             arguments: dict[str, Any],
             tool_call_id: str,
         ) -> Any:
-            if name not in (getattr(agent, "valid_tool_names", set()) or set()):
-                raise PermissionError(f"Tool is not enabled for this session: {name}")
-            context = getattr(agent, "_codex_host_tool_context", {}) or {}
-            return agent._invoke_tool(
-                name,
-                arguments,
-                context.get("effective_task_id") or "",
-                tool_call_id=tool_call_id or None,
-                messages=context.get("messages"),
+            return _dispatch_app_server_host_tool(
+                agent, name, arguments, tool_call_id
             )
 
         app_server_prompt_parts = (
@@ -834,6 +908,11 @@ def run_codex_app_server_turn(
             system_prompt_identity=system_prompt_static,
             tool_schemas=(_app_server_tool_schemas(agent) if use_host_bridge else None),
             tool_callback=(_invoke_host_tool if use_host_bridge else None),
+            concurrent_tool_names=(
+                set(getattr(agent, "_external_tool_names", frozenset()) or ())
+                if use_host_bridge
+                else None
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
