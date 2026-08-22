@@ -977,8 +977,56 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
             )
         )
         bridge({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-reasoning-redacted",
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [],
+                },
+            },
+        })
+        bridge({
             "method": "item/reasoning/delta",
-            "params": {"delta": "private thought"},
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-reasoning-redacted",
+                "delta": "",
+            },
+        })
+        bridge({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "item-message", "type": "agentMessage", "text": ""},
+            },
+        })
+        bridge({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-reasoning-visible",
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [],
+                },
+            },
+        })
+        bridge({
+            "method": "item/reasoning/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-reasoning-visible",
+                "delta": "private thought",
+            },
         })
         bridge({
             "method": "item/started",
@@ -1045,6 +1093,8 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
         "turn.started",
         "message.start",
         "thinking.delta",
+        "thinking.delta",
+        "thinking.delta",
         "tool_call.start",
         "tool_call.arguments.delta",
         "tool_call.end",
@@ -1052,8 +1102,10 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
         "usage",
         "turn.end",
     ]
-    assert records[3]["call_id"] == "toolu_exact_123"
-    assert records[5]["arguments"] == {"path": "README.md"}
+    thinking = [record for record in records if record["event"] == "thinking.delta"]
+    assert [record["delta"] for record in thinking] == ["", "", "private thought"]
+    assert records[5]["call_id"] == "toolu_exact_123"
+    assert records[7]["arguments"] == {"path": "README.md"}
     assert [item.event for item in adapter.ledger.list_events(turn_id)] == [
         "turn.started",
         "message.start",

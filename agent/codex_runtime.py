@@ -563,6 +563,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     ``CodexAppServerSession(on_event=...)``.
 
     Translation map:
+      * ``item/started`` for ``reasoning`` items → live-only
+        ``thinking.delta`` with an empty delta, marking the reasoning-block
+        boundary even when its visible text is redacted.
       * ``item/started`` for tool-shaped items → ``tool_progress_callback(
         "tool.started", name, preview, args)``
       * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
@@ -805,6 +808,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if method == "item/started" and item_type == "reasoning":
+            _fire_external_event("thinking.delta", {"delta": ""})
+            return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
             return
