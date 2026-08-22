@@ -79,12 +79,24 @@ export function systemPromptForThread(thread: ThreadState): string | string[] {
 }
 
 export function handleSystemMessage(
+  rpc: Pick<RpcConnection, "notify">,
   threads: ThreadStore,
   thread: ThreadState,
+  turnId: string,
   message: { subtype: string; session_id?: string },
 ): boolean {
   if (message.subtype === "init" && message.session_id) {
     threads.bindClaudeSession(thread, message.session_id);
+  }
+  if (message.subtype === "thinking_tokens") {
+    // The SDK's token estimates are only a liveness signal. Keep counts and
+    // all reasoning-derived data inside the shim; the bridge needs only the
+    // turn identity to advance the existing thinking indicator.
+    rpc.notify("item/reasoning/progress", {
+      threadId: thread.threadId,
+      turnId,
+    });
+    return true;
   }
   return false;
 }
@@ -421,7 +433,7 @@ export async function runTurn(options: {
     for await (const message of runningQuery as AsyncIterable<SDKMessage>) {
       switch (message.type) {
         case "system":
-          handleSystemMessage(threads, thread, message);
+          handleSystemMessage(rpc, threads, thread, turnId, message);
           break;
         case "stream_event": {
           const event: any = (message as any).event;

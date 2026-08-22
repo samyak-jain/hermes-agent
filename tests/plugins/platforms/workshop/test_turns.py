@@ -1094,7 +1094,6 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
         "message.start",
         "thinking.delta",
         "thinking.delta",
-        "thinking.delta",
         "tool_call.start",
         "tool_call.arguments.delta",
         "tool_call.end",
@@ -1103,9 +1102,9 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
         "turn.end",
     ]
     thinking = [record for record in records if record["event"] == "thinking.delta"]
-    assert [record["delta"] for record in thinking] == ["", "", "private thought"]
-    assert records[5]["call_id"] == "toolu_exact_123"
-    assert records[7]["arguments"] == {"path": "README.md"}
+    assert [record["delta"] for record in thinking] == ["", "private thought"]
+    assert records[4]["call_id"] == "toolu_exact_123"
+    assert records[6]["arguments"] == {"path": "README.md"}
     assert [item.event for item in adapter.ledger.list_events(turn_id)] == [
         "turn.started",
         "message.start",
@@ -1115,6 +1114,67 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
         "usage",
         "turn.end",
     ]
+
+
+@pytest.mark.asyncio
+async def test_redacted_reasoning_progress_reaches_sse_empty_and_throttled(tmp_path):
+    timeline = iter([10.0, 10.2, 10.9, 11.0, 11.4, 11.8, 12.0, 14.5])
+
+    async def handler(event):
+        bridge = make_codex_app_server_event_bridge(
+            SimpleNamespace(
+                _external_event_sink=event.metadata["_gateway_event_sink"],
+                _fire_reasoning_delta=None,
+                tool_progress_callback=None,
+                tool_start_callback=None,
+            ),
+            clock=lambda: next(timeline),
+        )
+        progress = {
+            "method": "item/reasoning/progress",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        }
+        late_block_start = {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-reasoning-redacted",
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [],
+                },
+            },
+        }
+        for shim_event in [
+            progress,
+            progress,
+            progress,
+            progress,
+            progress,
+            late_block_start,
+            progress,
+            progress,
+        ]:
+            bridge(shim_event)
+        return _gateway_result(event, "done")
+
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        records = _sse_records(await response.text())
+
+    thinking = [record for record in records if record["event"] == "thinking.delta"]
+    assert len(thinking) == 4
+    assert {record["delta"] for record in thinking} == {""}
+    assert "item/reasoning/progress" not in {record["event"] for record in records}
+    turn_id = records[0]["turn_id"]
+    assert "thinking.delta" not in {
+        item.event for item in adapter.ledger.list_events(turn_id)
+    }
 
 
 @pytest.mark.asyncio

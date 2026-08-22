@@ -137,9 +137,51 @@ def test_reasoning_block_starts_signal_redacted_and_visible_thinking_once():
     assert calls["reasoning"] == ["Visible thought"]
     assert calls["external"] == [
         ("thinking.delta", {"delta": ""}),
-        ("thinking.delta", {"delta": ""}),
         ("thinking.delta", {"delta": "Visible thought"}),
     ]
+
+
+def test_redacted_reasoning_progress_is_empty_and_throttles_block_starts():
+    agent, calls = _recording_agent()
+    timeline = iter([100.0, 100.2, 100.9, 101.0, 101.4, 102.0, 104.5])
+    bridge = make_codex_app_server_event_bridge(agent, clock=lambda: next(timeline))
+
+    progress = {
+        "method": "item/reasoning/progress",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    }
+    reasoning_start = {
+        "method": "item/started",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-reasoning-redacted",
+                "type": "reasoning",
+                "summary": [],
+                "content": [],
+            },
+        },
+    }
+
+    for event in [
+        progress,
+        progress,
+        reasoning_start,
+        progress,
+        reasoning_start,
+        progress,
+        progress,
+    ]:
+        bridge(event)
+
+    assert calls["external"] == [
+        ("thinking.delta", {"delta": ""}),
+        ("thinking.delta", {"delta": ""}),
+        ("thinking.delta", {"delta": ""}),
+        ("thinking.delta", {"delta": ""}),
+    ]
+    assert {payload["delta"] for _event, payload in calls["external"]} == {""}
 
 
 def test_provider_tool_lifecycle_is_forwarded_with_exact_call_id():

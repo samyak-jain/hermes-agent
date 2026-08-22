@@ -555,7 +555,11 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     return "", False
 
 
-def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
+def make_codex_app_server_event_bridge(
+    agent,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> Callable[[dict], None]:
     """Build an ``on_event`` callback that wires codex app-server JSON-RPC
     notifications into Hermes' gateway UI callbacks.
 
@@ -563,9 +567,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     ``CodexAppServerSession(on_event=...)``.
 
     Translation map:
+      * ``item/reasoning/progress`` → throttled, live-only
+        ``thinking.delta`` with an empty delta. The shim emits this while
+        redacted reasoning is still in progress without forwarding token
+        estimates or reasoning-derived content.
       * ``item/started`` for ``reasoning`` items → live-only
-        ``thinking.delta`` with an empty delta, marking the reasoning-block
-        boundary even when its visible text is redacted.
+        ``thinking.delta`` through the same throttle, marking the
+        reasoning-block boundary for models with visible streaming thinking.
       * ``item/started`` for tool-shaped items → ``tool_progress_callback(
         "tool.started", name, preview, args)``
       * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
@@ -588,6 +596,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    thinking_progress_at: dict[str, float] = {}
 
     def _fire_external_event(event_type: str, payload: dict) -> None:
         callback = getattr(agent, "_external_event_sink", None)
@@ -746,6 +755,22 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 logger.debug("_fire_reasoning_delta raised", exc_info=True)
         _fire_external_event("thinking.delta", {"delta": text})
 
+    def _fire_thinking_progress(params: dict) -> None:
+        """Emit a privacy-safe thinking heartbeat at most once per second.
+
+        Both the Claude shim's redacted-reasoning progress notification and
+        the reasoning item boundary use this path, so a late block start does
+        not immediately duplicate the heartbeat already shown to the user.
+        """
+        turn_id = params.get("turnId")
+        turn_key = turn_id if isinstance(turn_id, str) and turn_id else "__unknown__"
+        now = clock()
+        prior = thinking_progress_at.get(turn_key)
+        if prior is not None and now - prior < 1.0:
+            return
+        thinking_progress_at[turn_key] = now
+        _fire_external_event("thinking.delta", {"delta": ""})
+
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
@@ -778,6 +803,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
             return
+        if method == "item/reasoning/progress":
+            _fire_thinking_progress(params)
+            return
+        if method == "turn/completed":
+            turn_id = params.get("turnId")
+            if not isinstance(turn_id, str):
+                turn = params.get("turn")
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if isinstance(turn_id, str) and turn_id:
+                thinking_progress_at.pop(turn_id, None)
+            return
         if method == "item/toolCall/argumentsDelta":
             call_id = params.get("callId")
             name = params.get("name")
@@ -809,7 +845,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         item_type = item.get("type") or ""
         if method == "item/started" and item_type == "reasoning":
-            _fire_external_event("thinking.delta", {"delta": ""})
+            _fire_thinking_progress(params)
             return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
