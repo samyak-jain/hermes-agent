@@ -38,7 +38,7 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | 5. Controls, timeout, disconnect, replay | Complete | Durable idempotent controls implement `after_current_call` and `immediate`, including typed cancellation, exact caller stop reasons, startup-safe runtime interruption, the hard turn cap, and non-cancelling observer disconnects. |
 | 6. Workspace-delta turns | Complete | Strict versioned delta envelopes are safety-scanned, idempotently attached only to existing workshop sessions, queued on the chat lane as durable internal turns, and run with zero client tools plus local `spawn_agent` denied. |
 | 7. Autonomous wake delivery | Complete | Producer-stable durable turns are announced with a direction-specific authenticated callback; 2xx gates producer ack, retryable failures preserve claim/reuse, and all 4xx become durable visible dead letters without retry loops. |
-| 8. Hardening and final verification | Pending | Follow build order in B10; update this table at the phase boundary. |
+| 8. Hardening and final verification | Complete | Effective configured limits, automatic 24-hour retention, permanent dead-letter preservation, deployment health detail, completed replay, keepalive, secret-safe wake failures, and single-owner interrupt delivery are verified. |
 
 Phase-1 verification notes:
 
@@ -122,6 +122,21 @@ Phase-7 verification notes:
 
 - The focused workshop plus completion/session-routing suite is green at 137 tests; the final canonical wake slice is 64/64. Tests cover exact outbound auth/idempotency, 2xx/4xx/5xx/transport classification, durable attempt transitions, retry with the same turn, immediate DO attachment ownership, empty autonomous catalog, current/pinned epochs, permanent dead-letter no-hot-loop behavior, authenticated health, and restart-visible interruption. Ruff, byte compilation, and `git diff --check` pass.
 - The repository-wide runner completed all 2,140 files with 43,704 passing tests. The same five production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH fixture expectations). The three known loaded-host files `test_25107_stale_base_url_api_mode.py`, `test_primary_runtime_restore.py`, and `test_run_agent.py` reached the runner's per-file cap; no phase-7 or adjacent file failed or timed out.
+
+Phase-8 implementation notes:
+
+- The protocol's hard schema ceilings remain the absolute ingress boundary, and the adapter now also enforces the lower configured `max_client_tools` and `max_tool_schema_bytes` values before session creation or model execution. This closes the gap between managed configuration and effective admission behavior.
+- Completed-turn retention is now applied at adapter startup and all turn-producing ingress paths. Ordinary terminal turns and their delta identities expire after the configured 24 hours. Turns with permanent wake dead letters are deliberately exempt so the durable failure and health degradation cannot disappear solely because replay retention elapsed.
+- Authenticated health now reports protocol version, adapter connectivity, active-turn count, durable wake dead letters, the effective non-secret limit set, and the per-turn client-tool authority mode. It never exposes the wake URL or either credential.
+- The fake-DO remote-tool test now reattaches after completion and proves persisted semantic replay equals the original live event stream. Additional tests cover effective count/byte limits, live SSE keepalive, dead-letter retention, and failure-message credential redaction.
+- The first full-suite run exposed a real control race: the HTTP control handler and turn poller could both call `AIAgent.interrupt()` for the same durable control. Live turns now atomically claim each `(signal, mode, reason)` interrupt side effect. The integration test passed 12 consecutive retries, and a 32-way concurrent claim test locks down single ownership without weakening control semantics.
+- The CF track supplied `renderUI`, bringing the representative fixture catalog to 14 tools. Strict Python ingress accepts the updated canonical manifest, and the Claude shim now tests every current fixture plus preservation of `renderUI.state` additional properties. No converter weakening was required.
+- Per the working agreement, this phase changes only Hermes. Kumo managed config, SSM material, Cloudflare secrets, and the Cloudflare OS driver remain orchestrator/CF-track responsibilities and were not modified here.
+
+Phase-8 verification notes:
+
+- The focused Workshop, completion-delivery, agent-cache, and external-tool regression slice is green at 191 tests. The Claude shim is green at 21 tests, including provider tool-use IDs, raw deltas, catalog rebind, and the complete 14-tool fixture catalog. Ruff, Python byte compilation, and `git diff --check` pass.
+- The final repository-wide runner completed all 2,140 files on the corrected source: 43,660 tests passed. All 25 Workshop tests passed under full 16-worker load. The only five assertions are the unchanged production-base failures already isolated in earlier phases: one Bedrock host-region default, two model-catalog expectations, and two restricted-PATH SSH expectations. Three unrelated oversized baseline files reached the runner's 300-second per-file cap (`test_model_switch_custom_providers.py`, `test_user_providers_model_switch.py`, and `test_run_agent.py`); `test_25107_stale_base_url_api_mode.py`, `test_provider_fallback.py`, and `test_primary_runtime_restore.py` completed successfully in this run.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 
