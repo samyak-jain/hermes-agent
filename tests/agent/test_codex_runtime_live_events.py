@@ -128,6 +128,51 @@ def test_provider_tool_lifecycle_is_forwarded_with_exact_call_id():
     ]
 
 
+def test_tool_activity_bridge_constructs_name_and_status_only():
+    """The bridge itself must not expose local tool payload details.
+
+    The Workshop adapter reconstructs this payload again, but that second
+    boundary must not be the only thing preventing arguments, results, or
+    provider call IDs from leaving the runtime bridge.
+    """
+    agent, calls = _recording_agent()
+    bridge = make_codex_app_server_event_bridge(agent)
+    started = {
+        "type": "mcpToolCall",
+        "id": "toolu_private_memory",
+        "providerCallId": "toolu_private_memory",
+        "server": "agent-runtime",
+        "tool": "memory",
+        "arguments": {
+            "action": "read",
+            "query": "secret bridge argument",
+        },
+    }
+    completed = {
+        **started,
+        "status": "completed",
+        "result": {
+            "content": [
+                {"type": "text", "text": "secret bridge result"},
+            ],
+        },
+    }
+
+    bridge({"method": "item/started", "params": {"item": started}})
+    bridge({"method": "item/completed", "params": {"item": completed}})
+
+    activities = [
+        payload
+        for event, payload in calls["external"]
+        if event == "tool_activity"
+    ]
+    assert activities == [
+        {"name": "memory", "status": "started"},
+        {"name": "memory", "status": "completed"},
+    ]
+    assert all(set(payload) == {"name", "status"} for payload in activities)
+
+
 def test_command_start_and_complete_fire_both_callback_contracts():
     agent, calls = _recording_agent()
     bridge = make_codex_app_server_event_bridge(agent)
