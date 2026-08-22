@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .auth import WorkshopAuthenticator
 from .protocol import (
+    PROTOCOL_VERSION,
     WorkshopControlRequest,
     WorkshopDeltaRequest,
     WorkshopProtocolError,
@@ -114,10 +115,37 @@ class WorkshopHTTPController:
         adapter = self._adapter(request)
         ledger = getattr(adapter, "ledger", None) or self.ledger
         dead_letters = ledger.dead_letter_wake_count()
+        connected = bool(adapter is not None and getattr(adapter, "_running", False))
+        behavior = dict(getattr(adapter, "_behavior", {}) or {})
+        limit_names = (
+            "max_active_turns",
+            "max_pending_remote_calls",
+            "max_client_tools",
+            "max_tool_schema_bytes",
+            "max_event_backlog_bytes",
+            "completed_event_retention_seconds",
+            "turn_timeout_seconds",
+            "remote_tool_timeout_seconds",
+            "wake_timeout_seconds",
+        )
+        status = "ok"
+        if dead_letters:
+            status = "degraded"
+        elif not connected:
+            status = "unavailable"
         return _web().json_response(
             {
-                "status": "degraded" if dead_letters else "ok",
+                "protocol_version": PROTOCOL_VERSION,
+                "status": status,
+                "connected": connected,
+                "active_turns": ledger.count_active_turns(),
                 "dead_letter_wakes": dead_letters,
+                "limits": {
+                    name: behavior[name]
+                    for name in limit_names
+                    if name in behavior
+                },
+                "client_tool_authority": "per_turn_remote_callback",
             }
         )
 

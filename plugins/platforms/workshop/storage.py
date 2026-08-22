@@ -1097,13 +1097,23 @@ class WorkshopLedger:
                        SELECT turn_id FROM workshop_turns
                        WHERE state IN ('completed', 'error', 'aborted', 'interrupted')
                          AND completed_at IS NOT NULL AND completed_at < ?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM workshop_wakes
+                             WHERE workshop_wakes.turn_id=workshop_turns.turn_id
+                               AND workshop_wakes.state='dead_letter'
+                         )
                    )""",
                 (cutoff,),
             )
             cursor = conn.execute(
                 """DELETE FROM workshop_turns
                    WHERE state IN ('completed', 'error', 'aborted', 'interrupted')
-                     AND completed_at IS NOT NULL AND completed_at < ?""",
+                     AND completed_at IS NOT NULL AND completed_at < ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM workshop_wakes
+                         WHERE workshop_wakes.turn_id=workshop_turns.turn_id
+                           AND workshop_wakes.state='dead_letter'
+                     )""",
                 (cutoff,),
             )
             return cursor.rowcount

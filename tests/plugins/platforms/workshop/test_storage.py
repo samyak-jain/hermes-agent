@@ -347,8 +347,25 @@ def test_dead_letter_and_retention_are_durable(tmp_path):
         timestamp=100,
     )
     assert ledger.prune_completed(now=109) == 0
+    assert ledger.prune_completed(now=111) == 0
+    assert ledger.get_turn(turn.turn_id) is not None
+    assert ledger.dead_letter_wake_count() == 1
+
+    ordinary, _ = _turn(
+        ledger,
+        client_turn_id="ordinary-1",
+        request_digest="ordinary-request-1",
+        turn_id="wturn_ordinary",
+    )
+    ledger.finish_turn(
+        turn_id=ordinary.turn_id,
+        state="completed",
+        stop_reason="end_turn",
+        timestamp=100,
+    )
     assert ledger.prune_completed(now=111) == 1
-    assert ledger.get_turn(turn.turn_id) is None
+    assert ledger.get_turn(ordinary.turn_id) is None
+    assert ledger.get_turn(turn.turn_id) is not None
 
 
 def test_restart_recovery_durably_interrupts_active_turns(tmp_path):

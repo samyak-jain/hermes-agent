@@ -19,6 +19,7 @@ from plugins.platforms.workshop.adapter import WorkshopAdapter
 from plugins.platforms.workshop.auth import WorkshopAuthenticator
 from plugins.platforms.workshop.http import WorkshopHTTPController
 from plugins.platforms.workshop.storage import WorkshopLedger
+import plugins.platforms.workshop.turns as workshop_turns
 from plugins.platforms.workshop.turns import (
     WorkshopRemoteCallTimeout,
     WorkshopTurnCoordinator,
@@ -101,6 +102,8 @@ def _adapter(tmp_path, handler, *, session_ids=None, max_active=4):
     adapter.turns = WorkshopTurnCoordinator(adapter.ledger)
     adapter._behavior = {
         "max_active_turns": max_active,
+        "max_client_tools": 32,
+        "max_tool_schema_bytes": 256 * 1024,
         "max_event_backlog_bytes": 8 * 1024 * 1024,
         "remote_tool_timeout_seconds": 2,
     }
@@ -151,6 +154,28 @@ class _FakeWakeClient:
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if isinstance(outcome, BaseException):
             raise outcome
+
+
+@pytest.mark.asyncio
+async def test_interrupt_side_effect_claim_is_thread_safe(tmp_path):
+    coordinator = WorkshopTurnCoordinator(WorkshopLedger(tmp_path / "state.db"))
+    coordinator.ensure_live("wturn_interrupt_claim")
+    signature = ("abort", "immediate", "user_clicked_stop")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(
+            pool.map(
+                lambda _index: coordinator.claim_interrupt(
+                    "wturn_interrupt_claim", signature
+                ),
+                range(32),
+            )
+        )
+
+    assert claims.count(True) == 1
+    assert coordinator.claim_interrupt(
+        "wturn_interrupt_claim", ("abort", "immediate", "turn_timeout")
+    )
 
 
 def _wake_event(*, producer_type="spawn_result", producer_id="delegation-1"):
@@ -410,6 +435,34 @@ async def test_sse_disconnect_does_not_cancel_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_sse_emits_keepalive_without_ending_turn(tmp_path, monkeypatch):
+    release = asyncio.Event()
+
+    async def handler(_event):
+        await release.wait()
+        return {"final_response": "done"}
+
+    monkeypatch.setattr(workshop_turns, "_SSE_KEEPALIVE_SECONDS", 0.01)
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        while True:
+            line = (await asyncio.wait_for(response.content.readline(), timeout=1)).decode()
+            if line == ": keepalive\n":
+                break
+        turn_id = adapter.ledger.get_turn_for_client(
+            "workspace-1", "chat-1", "client-1"
+        ).turn_id
+        assert adapter.ledger.get_turn(turn_id).state == "running"
+        release.set()
+        await response.text()
+
+    assert adapter.ledger.get_turn(turn_id).state == "completed"
+
+
+@pytest.mark.asyncio
 async def test_after_seq_replays_only_later_semantic_events(tmp_path):
     async def handler(event):
         event.metadata["_gateway_event_sink"]("text.delta", {"delta": "answer"})
@@ -606,6 +659,13 @@ async def test_remote_tool_blocks_until_idempotent_posted_result(tmp_path):
         )
         assert conflict.status == 409
 
+        replay = await client.get(
+            f"/api/workshop/v1/turns/{turn_id}/events?after_seq=0",
+            headers=_headers(),
+        )
+        assert replay.status == 200
+        replay_records = _sse_records(await replay.text())
+
     assert observed["remote"].content == {"ok": True, "revision": 7}
     assert observed["remote"].is_error is False
     assert [item["event"] for item in records] == [
@@ -620,6 +680,44 @@ async def test_remote_tool_blocks_until_idempotent_posted_result(tmp_path):
     assert adapter.ledger.get_tool_call(
         turn_id, "toolu_remote_123"
     ).state == "resolved"
+    assert replay_records == records
+
+
+@pytest.mark.asyncio
+async def test_configured_client_catalog_limits_are_enforced_before_execution(tmp_path):
+    handler = MagicMock()
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    adapter._behavior["max_client_tools"] = 1
+    tools = [
+        {
+            "name": name,
+            "description": f"Tool {name}",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        for name in ("first", "second")
+    ]
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        too_many = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(tools=tools),
+            headers=_headers(),
+        )
+        too_many_body = await too_many.json()
+        adapter._behavior["max_client_tools"] = 32
+        adapter._behavior["max_tool_schema_bytes"] = 32
+        too_large = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(client_turn_id="client-2", tools=tools[:1]),
+            headers=_headers(),
+        )
+        too_large_body = await too_large.json()
+
+    assert too_many.status == 400
+    assert too_many_body["error"]["code"] == "too_many_tools"
+    assert too_large.status == 413
+    assert too_large_body["error"]["code"] == "tool_catalog_too_large"
+    handler.assert_not_called()
 
 
 @pytest.mark.asyncio

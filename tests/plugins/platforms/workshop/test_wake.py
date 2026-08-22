@@ -61,6 +61,22 @@ async def test_wake_classifies_all_4xx_as_permanent_rejection():
 
 
 @pytest.mark.asyncio
+async def test_wake_failure_never_exposes_outbound_token():
+    token = "wake-secret-that-must-not-leak"
+    server = await _server(401, {})
+    try:
+        client = WorkshopWakeClient(
+            url=str(server.make_url("/wake")), token=token, timeout_seconds=2
+        )
+        with pytest.raises(WorkshopWakeRejectedError) as caught:
+            await client.deliver({}, idempotency_key="wake-secret-test")
+    finally:
+        await server.close()
+
+    assert token not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_wake_classifies_5xx_and_transport_errors_as_retryable():
     server = await _server(503, {})
     try:

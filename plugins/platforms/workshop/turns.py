@@ -45,6 +45,7 @@ class _LiveTurn:
     subscribers: int = 0
     task: asyncio.Task | None = None
     text_parts: list[str] = field(default_factory=list)
+    interrupt_signatures: set[tuple[str, str, str]] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def publish(self, event: WorkshopEvent) -> None:
@@ -79,6 +80,17 @@ class _LiveTurn:
     def emitted_text(self) -> str:
         with self.lock:
             return "".join(self.text_parts)
+
+    def claim_interrupt(self, signature: tuple[str, str, str]) -> bool:
+        with self.lock:
+            if signature in self.interrupt_signatures:
+                return False
+            self.interrupt_signatures.add(signature)
+            return True
+
+    def release_interrupt(self, signature: tuple[str, str, str]) -> None:
+        with self.lock:
+            self.interrupt_signatures.discard(signature)
 
 
 class WorkshopTurnCoordinator:
@@ -303,6 +315,19 @@ class WorkshopTurnCoordinator:
     def emitted_text(self, turn_id: str) -> str:
         state = self._live.get(turn_id)
         return state.emitted_text() if state is not None else ""
+
+    def claim_interrupt(
+        self, turn_id: str, signature: tuple[str, str, str]
+    ) -> bool:
+        state = self._live.get(turn_id)
+        return state.claim_interrupt(signature) if state is not None else False
+
+    def release_interrupt(
+        self, turn_id: str, signature: tuple[str, str, str]
+    ) -> None:
+        state = self._live.get(turn_id)
+        if state is not None:
+            state.release_interrupt(signature)
 
     def task_for(self, turn_id: str) -> asyncio.Task | None:
         state = self._live.get(turn_id)

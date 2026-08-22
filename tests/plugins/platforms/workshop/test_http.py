@@ -92,6 +92,11 @@ async def test_health_surfaces_durable_wake_dead_letters(tmp_path):
         producer_id="delegation-1",
         error="HTTP 403",
     )
+    ledger.finish_turn(
+        turn_id=turn.turn_id,
+        state="error",
+        stop_reason="wake_rejected",
+    )
 
     async with TestClient(TestServer(app)) as client:
         unauthorized = await client.get("/api/workshop/v1/health")
@@ -102,7 +107,51 @@ async def test_health_surfaces_durable_wake_dead_letters(tmp_path):
 
     assert unauthorized.status == 401
     assert response.status == 200
-    assert body == {"status": "degraded", "dead_letter_wakes": 1}
+    assert body == {
+        "protocol_version": 1,
+        "status": "degraded",
+        "connected": False,
+        "active_turns": 0,
+        "dead_letter_wakes": 1,
+        "limits": {},
+        "client_tool_authority": "per_turn_remote_callback",
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_reports_effective_limits_without_secrets(tmp_path):
+    behavior = {
+        "wake_url": "https://workshop.example.test/wake",
+        "max_active_turns": 4,
+        "max_pending_remote_calls": 8,
+        "max_client_tools": 32,
+        "max_tool_schema_bytes": 256 * 1024,
+        "max_event_backlog_bytes": 8 * 1024 * 1024,
+        "completed_event_retention_seconds": 24 * 60 * 60,
+        "turn_timeout_seconds": 15 * 60,
+        "remote_tool_timeout_seconds": 5 * 60,
+        "wake_timeout_seconds": 10,
+    }
+    adapter = SimpleNamespace(
+        _running=True,
+        _behavior=behavior,
+        ledger=WorkshopLedger(tmp_path / "adapter-state.db"),
+    )
+    app, _ledger = _app(tmp_path, adapters={"workshop": adapter})
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/api/workshop/v1/health", headers=_headers()
+        )
+        body = await response.json()
+
+    assert response.status == 200
+    assert body["status"] == "ok"
+    assert body["connected"] is True
+    assert body["limits"] == {
+        key: value for key, value in behavior.items() if key != "wake_url"
+    }
+    assert "wake_url" not in json.dumps(body)
 
 
 @pytest.mark.asyncio

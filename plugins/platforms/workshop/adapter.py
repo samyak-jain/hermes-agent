@@ -36,6 +36,7 @@ from .protocol import (
     WorkshopDeltaRequest,
     WorkshopProtocolError,
     WorkshopTurnRequest,
+    canonical_json,
     parse_tool_catalog,
     validate_identifier,
 )
@@ -200,6 +201,9 @@ class WorkshopAdapter(BasePlatformAdapter):
             )
         if self.turns is None:
             self.turns = WorkshopTurnCoordinator(self.ledger)
+        pruned = self.ledger.prune_completed()
+        if pruned:
+            logger.info("workshop_pruned_completed_turns count=%d", pruned)
         # A fresh process cannot resume SDK generators, so stale active rows
         # become replayable interrupted turns.  An in-process adapter reconnect
         # must not interrupt live GatewayRunner tasks that still own them.
@@ -297,6 +301,7 @@ class WorkshopAdapter(BasePlatformAdapter):
             or not self._running
         ):
             raise WorkshopWakeRetryableError("Workshop platform is not connected")
+        await asyncio.to_thread(self.ledger.prune_completed)
 
         metadata = dict(event.metadata or {})
         producer_type = str(metadata.get("_completion_producer_type") or "").strip()
@@ -513,6 +518,23 @@ class WorkshopAdapter(BasePlatformAdapter):
                 "workshop_unavailable", "Workshop platform is not connected", status=503
             )
 
+        catalog_bytes = len(
+            canonical_json([tool.to_wire() for tool in turn.tools]).encode("utf-8")
+        )
+        if len(turn.tools) > int(self._behavior["max_client_tools"]):
+            return self._json_error(
+                "too_many_tools",
+                "tools exceeds the configured workshop tool limit",
+                status=400,
+            )
+        if catalog_bytes > int(self._behavior["max_tool_schema_bytes"]):
+            return self._json_error(
+                "tool_catalog_too_large",
+                "tool catalog exceeds the configured workshop byte limit",
+                status=413,
+            )
+        await asyncio.to_thread(self.ledger.prune_completed)
+
         existing = await asyncio.to_thread(
             self.ledger.get_turn_for_client,
             turn.workspace_id,
@@ -591,6 +613,7 @@ class WorkshopAdapter(BasePlatformAdapter):
             return self._json_error(
                 "workshop_unavailable", "Workshop platform is not connected", status=503
             )
+        await asyncio.to_thread(self.ledger.prune_completed)
         existing_delta = await asyncio.to_thread(
             self.ledger.get_delta,
             delta.workspace_id,
@@ -997,13 +1020,26 @@ class WorkshopAdapter(BasePlatformAdapter):
                     message=str(exc)[:2048] or type(exc).__name__,
                 )
 
-    def _interrupt_active_agent(self, session_key: str, reason: str) -> bool:
+    def _interrupt_active_agent(
+        self,
+        turn_id: str,
+        session_key: str,
+        reason: str,
+        signature: tuple[str, str, str],
+    ) -> bool:
+        assert self.turns is not None
         runner = self._runner()
         agent = getattr(runner, "_running_agents", {}).get(session_key)
         interrupt = getattr(agent, "interrupt", None)
         if not callable(interrupt):
             return False
-        interrupt(reason)
+        if not self.turns.claim_interrupt(turn_id, signature):
+            return False
+        try:
+            interrupt(reason)
+        except BaseException:
+            self.turns.release_interrupt(turn_id, signature)
+            raise
         return True
 
     async def _finish_controlled_turn(self, record) -> None:
@@ -1036,14 +1072,18 @@ class WorkshopAdapter(BasePlatformAdapter):
                         reason="turn_timeout",
                         replace=True,
                     )
+                    timeout_signature = (
+                        str(record.control_signal),
+                        str(record.control_mode),
+                        str(record.control_reason),
+                    )
                     if affected == 0 and self._interrupt_active_agent(
-                        record.session_key, "turn_timeout"
+                        turn_id,
+                        record.session_key,
+                        "turn_timeout",
+                        timeout_signature,
                     ):
-                        interrupt_sent = (
-                            str(record.control_signal),
-                            str(record.control_mode),
-                            str(record.control_reason),
-                        )
+                        interrupt_sent = timeout_signature
                     timeout_applied = True
 
                 record = await asyncio.to_thread(self.ledger.get_turn, turn_id)
@@ -1073,8 +1113,10 @@ class WorkshopAdapter(BasePlatformAdapter):
                         )
                     ):
                         sent = self._interrupt_active_agent(
+                            turn_id,
                             record.session_key,
                             str(record.control_reason or "controlled"),
+                            signature,
                         )
                         if sent:
                             interrupt_sent = signature
@@ -1122,7 +1164,16 @@ class WorkshopAdapter(BasePlatformAdapter):
         if (control.mode == "immediate" and cancelled == 0) or (
             control.mode == "after_current_call" and affected_calls == 0
         ):
-            self._interrupt_active_agent(record.session_key, control.reason)
+            self._interrupt_active_agent(
+                turn_id,
+                record.session_key,
+                control.reason,
+                (
+                    str(record.control_signal),
+                    str(record.control_mode),
+                    str(record.control_reason),
+                ),
+            )
 
         from aiohttp import web
 
