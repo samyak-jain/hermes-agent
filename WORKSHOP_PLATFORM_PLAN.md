@@ -42,6 +42,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 
 Security-review remediation (PR #68): H1-H3, M1-M5, and L1-L7 are implemented and tracked finding-by-finding in `PROGRESS.md`. L8 is an approved operational contract: invisible Unicode rejected by the delta safety scanner is a permanent typed rejection for that `delta_id`; the DO must sanitize the content and allocate a new `delta_id` rather than retry the rejected identity. The shared Codex interrupt propagation is a deliberate Kumo fork-contract update: Discord keeps its existing interrupt flags/routing but now also signals the app-server session, while cron keeps its inline active-request abort and also signals that session. These paths have explicit unit coverage and still require the requested live Kumo Discord/cron smoke test before rollout.
 
+Security-remediation verification: the blocker, medium, and low/shared focused sets passed (63, 70, and 120 tests respectively), the Claude shim passed all 22 tests, and the canonical adjacent regression set passed all 478 tests. The repository-wide runner recorded 43,733 passes across 2,140 files. Its assertion failures consist of the three established production-base files plus an unchanged host-sensitive MoA wall-clock threshold; two unchanged large `run_agent` files reached the runner timeout after partial progress. `PROGRESS.md` records the exact files and dispositions. No Workshop, gateway, policy, interrupt, or shim test failed.
+
 Phase-1 verification notes:
 
 - The supplied 13-tool Cloudflare fixture catalog is accepted without schema weakening, and its canonical digest matches `fixtures/workshop-tool-schemas/index.json` exactly.
