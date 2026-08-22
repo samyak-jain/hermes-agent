@@ -6,7 +6,7 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 
 | Finding | State | Evidence / disposition |
 | --- | --- | --- |
-| H1 slash-command escalation | Fixed | `MessageEvent.commands_enabled=False` makes every leading-slash workshop input ordinary model content; `transport_authorized` admits the bearer-authenticated request without operator authority, and `WorkshopAdapter.authorization_is_upstream` is now false. The real gateway dispatch test covers `/restart`, `/yolo`, `/update`, and `/config ...` and asserts zero control-handler calls. |
+| H1 slash-command escalation | Fixed | Workshop command exclusion is now structural in `MessageEvent.is_command()`: a Workshop event can never be a gateway slash command, independent of transport admission or how an alternate caller constructs the event. `transport_authorized` admits the bearer-authenticated request without operator authority, and `WorkshopAdapter.authorization_is_upstream` remains false. The real HTTP → adapter → gateway dispatch test covers `/restart`, `/yolo`, `/update`, and `/config ...` and asserts zero control-handler calls. |
 | H2 handler return-contract mismatch | Fixed | Workshop now consumes the real `Optional[str]` return. `GatewayRunner` stamps a private structured outcome sidecar containing failure/interruption/usage facts; all workshop handler fakes now return `str | None`. Provider failure coverage asserts persisted `error` plus `turn.end{status:error}` with the user-facing message intact. |
 | H3 route-factory startup coupling | Fixed | Route construction no longer reads credentials or opens the ledger. First workshop request lazily initializes both; failure logs `workshop_http_initialization_failed disabled=true` once and returns typed 503 while a shared `/health` remains 200. Generic route-shape/collision validation stays startup-fatal. |
 
@@ -19,6 +19,21 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 | M3 hard duration deadline | Fixed | The 15-minute control deadline now has a fixed 5-second grace after interrupt, then cancels the handler task and persists `turn.end{status:aborted,stop_reason:turn_timeout}`. The test uses an uncooperative handler and a shortened grace. |
 | M4 internal-turn cache churn | Fixed | A durable `workshop_chat_catalogs` row tracks the last admitted user catalog digest. Delta/wake turns reuse that digest for cached-agent identity while installing an empty schema list and no callback, so authority remains zero without alternating cache eviction. Existing wake retries pin their original turn digest. |
 | M5 `after_seq` validation | Fixed | POST start and GET replay accept only ASCII decimal non-negative sequences at HTTP ingress, return typed 400 for invalid values, and pass the parsed integer into the stream coordinator (no second raw parse). |
+
+## Re-review at `39a7e85`
+
+| Finding | State | Evidence / disposition |
+| --- | --- | --- |
+| R1 stale remote-tool publication on delta turns | Fixed | The Workshop event sink now gates every `tool_call.start`, `tool_call.arguments.delta`, and `tool_call.end` against the current turn's authorized remote-name set before publishing anything to the DO or registering a pending call. Delta/wake turns retain the established catalog digest only for cache identity; their current authorized set remains empty. The real HTTP delta path drives the production Codex event bridge with a stale `writeFile` call and the production host-tool dispatcher: Hermes returns `isError`, no local dispatch occurs, no tool-call event reaches the SSE subscriber, and no call row is recorded. |
+| R2 swallowed backlog exhaustion | Fixed | `WorkshopTurnCoordinator.emit_sync()` terminalizes atomically at the durable append failure site, publishes the replayable `error` + `turn.end{status:error}` pair, and wakes remote waiters before re-raising. This does not rely on propagation through `AIAgent`, whose production stream callback intentionally swallows sink exceptions. The adapter observes the already-terminal row after the handler unwinds and cannot append usage/completed. |
+| R3 independently configurable command flag | Fixed | The removable `commands_enabled` flag is gone. Platform identity is the single authoritative property: `MessageEvent.is_command()` always returns false for Workshop. The test creates the event only through authenticated Workshop HTTP ingress and executes the real gateway command dispatcher. |
+
+### Re-review mutation evidence
+
+- R1: removing the current-catalog publication guard makes `test_delta_stale_remote_tool_is_denied_and_never_published` fail because stale `tool_call.*` records reach the DO-facing stream, while the independent Hermes host dispatcher still returns `isError`. This proves both defenses are covered separately.
+- R2: replacing the drop-site terminalization with a plain ledger append makes the production-callback overflow test fail: the callback swallows the quota exception and the observed tail becomes `usage` + completed `turn.end` instead of `error` + error `turn.end`.
+- R3: removing the Workshop platform exclusion makes all four real HTTP cases fail. `/restart`, `/yolo`, and `/update` enter their gateway control handlers; `/config ...` enters slash-command routing instead of the model path.
+- The reviewer-requested raising-Codex case is retained: a `request_interrupt()` exception does not prevent Discord's legacy interrupt flag, message, or thread signal from being set. Existing cron coverage continues to assert its inline abort plus Codex-session signal.
 
 ## Low findings
 
@@ -40,6 +55,9 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 | Codex app-server interrupt propagation | Covered; pre-deploy smoke pending | Explicit tests prove Discord retains the legacy flags/message while signaling Codex, and cron retains `_active_request_abort("interrupt_abort")` while also signaling Codex. This is documented in `WORKSHOP_PLATFORM_PLAN.md` as a deliberate Kumo fork-contract effectiveness change. The orchestrator must mirror that note into external `hermes-fork.md` and run one live Discord interrupt plus one cron turn before rollout. |
 
 ## Verification log
+
+- Re-review R1/R2/R3 production-path regression set: **17 passed**. Canonical Workshop/gateway/Codex/interrupt adjacent set: **141 passed**; after the repository run exposed the source-less `MessageEvent` compatibility case, the expanded platform-base plus adjacent set passed **335 tests**. The three controlled production-code mutations above each make their corresponding regression test fail and were reverted before the green runs.
+- Repository-wide runner at the re-review boundary: **43,705 passed across all 2,140 files**. It initially reported 21 assertions: 15 were a genuine R3 compatibility regression caused by dereferencing optional `MessageEvent.source`; the guard was corrected and the entire 194-test platform-base file plus every changed adjacent surface passed in the 335-test rerun. The six remaining assertions are unchanged production-base/environment behavior: Bedrock default region (1), model-catalog expectations (2), loaded-host MoA timing (1), and restricted-PATH SSH fixtures (2). No Workshop, Codex bridge, interrupt, or gateway command-boundary test failed. The unchanged oversized files `test_primary_runtime_restore.py`, `test_provider_fallback.py`, and `test_run_agent.py` reached the runner's 300-second per-file deadline after partial progress; `test_25107_stale_base_url_api_mode.py` did the same. `test_doctor.py` timed out once and passed all 74 tests on the runner's retry.
 
 - Blocker-focused integration set: **63 passed** (`test_adapter`, `test_http`, `test_turns`, minimal real gateway command dispatch, shared API route composition).
 - Medium-focused integration set: **70 passed** (storage, turn/SSE, HTTP ingress, platform policy/runtime).
