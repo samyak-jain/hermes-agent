@@ -79,7 +79,7 @@ jobs:
             cache-to: type=gha,mode=max,scope=docker-arm64
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
       PUBLISH_IMAGE_NAMES: ${{ needs.prepare.outputs.publish_image_names }}
