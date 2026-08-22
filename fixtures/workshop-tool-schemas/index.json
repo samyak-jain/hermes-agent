@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256",
-  "digest": "f466b2e194cd16ffc91ba39cadb2947217ce8a9c0548edff45ccfae516f8b1a4",
+  "digest": "d2ad0a2e697504add4c6eec3c82cc4a456360195e26cbe09b0fe8b2d2fa5fc04",
   "canonicalization": "JSON object keys sorted recursively; tools sorted by name",
   "tools": [
     {
@@ -47,6 +47,11 @@
       "name": "readFile",
       "file": "readFile.json",
       "sha256": "fbfac7371fe64bf0c66d035de776e63dd16077d3ea41abbf81de836e0b39364d"
+    },
+    {
+      "name": "renderUI",
+      "file": "renderUI.json",
+      "sha256": "2d085c4a767f88d609c5a9b22c11b2d0f37be887192a4823ddc064bbb10188da"
     },
     {
       "name": "requestConnection",
