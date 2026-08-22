@@ -8,6 +8,10 @@ import pytest
 
 from plugins.platforms.workshop.protocol import (
     LIVE_ONLY_EVENT_TYPES,
+    MAX_DISPLAY_METADATA_BYTES,
+    MAX_DISPLAY_METADATA_COLLECTION_ITEMS,
+    MAX_DISPLAY_METADATA_DEPTH,
+    MAX_DISPLAY_METADATA_STRING_BYTES,
     PROTOCOL_VERSION,
     WorkshopControlRequest,
     WorkshopDeltaRequest,
@@ -40,6 +44,7 @@ def _turn(tools=None):
         "chat_id": "chat-1",
         "input": {"type": "user", "text": "Build it"},
         "tools": [_tool()] if tools is None else tools,
+        "metadata": {},
     }
 
 
@@ -112,6 +117,27 @@ def test_turn_request_returns_catalog_version_and_stable_request_digest():
     assert request.tools[0].to_bridge_schema()["origin"] == "workshop"
 
 
+def test_turn_request_metadata_participates_in_idempotency_digest():
+    first = _turn()
+    first["metadata"] = {"title": "First"}
+    second = _turn()
+    second["metadata"] = {"title": "Second"}
+
+    assert (
+        WorkshopTurnRequest.from_dict(first).request_digest
+        != WorkshopTurnRequest.from_dict(second).request_digest
+    )
+
+
+def test_turn_request_defaults_omitted_display_metadata_to_empty_object():
+    raw = _turn()
+    raw.pop("metadata")
+
+    request = WorkshopTurnRequest.from_dict(raw)
+
+    assert request.metadata == {}
+
+
 def test_turn_request_rejects_colons_in_routing_ids():
     raw = _turn()
     raw["workspace_id"] = "tenant:escape"
@@ -120,12 +146,80 @@ def test_turn_request_rejects_colons_in_routing_ids():
     assert exc.value.code == "invalid_identifier"
 
 
-def test_turn_request_rejects_unsupported_caller_metadata():
+def test_turn_request_accepts_merged_driver_field_set_with_empty_metadata():
+    request = WorkshopTurnRequest.from_dict(_turn())
+
+    assert request.metadata == {}
+
+
+def test_turn_request_accepts_bounded_display_metadata():
     raw = _turn()
-    raw["metadata"] = {"title": "unused"}
+    raw["metadata"] = {
+        "title": "Workspace title",
+        "badges": ["preview"],
+        "ui": {"accent": "blue"},
+    }
+
+    request = WorkshopTurnRequest.from_dict(raw)
+
+    assert request.metadata == raw["metadata"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "code"),
+    [
+        ([], "invalid_request"),
+        (None, "invalid_request"),
+        ({"title": "\ud800"}, "invalid_metadata"),
+        (
+            {"title": "x" * (MAX_DISPLAY_METADATA_STRING_BYTES + 1)},
+            "metadata_value_too_large",
+        ),
+        (
+            {
+                f"field-{index}": index
+                for index in range(MAX_DISPLAY_METADATA_COLLECTION_ITEMS + 1)
+            },
+            "metadata_too_complex",
+        ),
+    ],
+)
+def test_turn_request_rejects_invalid_or_complex_display_metadata(metadata, code):
+    raw = _turn()
+    raw["metadata"] = metadata
+
     with pytest.raises(WorkshopProtocolError) as exc:
         WorkshopTurnRequest.from_dict(raw)
-    assert exc.value.code == "unknown_field"
+
+    assert exc.value.code == code
+
+
+def test_turn_request_bounds_display_metadata_depth():
+    nested: dict[str, object] = {"value": "leaf"}
+    for _ in range(MAX_DISPLAY_METADATA_DEPTH + 1):
+        nested = {"child": nested}
+    raw = _turn()
+    raw["metadata"] = nested
+
+    with pytest.raises(WorkshopProtocolError) as exc:
+        WorkshopTurnRequest.from_dict(raw)
+
+    assert exc.value.code == "metadata_too_complex"
+
+
+def test_turn_request_bounds_aggregate_display_metadata_bytes():
+    raw = _turn()
+    raw["metadata"] = {
+        f"field-{index}": "x" * MAX_DISPLAY_METADATA_STRING_BYTES
+        for index in range(5)
+    }
+
+    with pytest.raises(WorkshopProtocolError) as exc:
+        WorkshopTurnRequest.from_dict(raw)
+
+    assert exc.value.code == "metadata_too_large"
+    assert exc.value.status == 413
+    assert MAX_DISPLAY_METADATA_BYTES < 5 * MAX_DISPLAY_METADATA_STRING_BYTES
 
 
 def test_control_defaults_are_signal_specific():

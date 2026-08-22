@@ -44,6 +44,8 @@ Security-review remediation (PR #68): H1-H3, M1-M5, and L1-L7 are implemented an
 
 Security-remediation verification: the blocker, medium, and low/shared focused sets passed (63, 70, and 120 tests respectively), the Claude shim passed all 22 tests, and the canonical adjacent regression set passed all 478 tests. The repository-wide runner recorded 43,733 passes across 2,140 files. Its assertion failures consist of the three established production-base files plus an unchanged host-sensitive MoA wall-clock threshold; two unchanged large `run_agent` files reached the runner timeout after partial progress. `PROGRESS.md` records the exact files and dispositions. No Workshop, gateway, policy, interrupt, or shim test failed.
 
+Cross-repo wire reconciliation: Cloudflare OS `origin/main` at `eb919686` serializes `metadata: {}` on every turn request. This is legitimate under B1's optional bounded display-metadata contract, so Hermes accepts a strictly bounded JSON object and includes it in request idempotency. Caller metadata remains opaque and is not copied into gateway event metadata or model context; it cannot confer instructions, command authority, or tools.
+
 Phase-1 verification notes:
 
 - The supplied 13-tool Cloudflare fixture catalog is accepted without schema weakening, and its canonical digest matches `fixtures/workshop-tool-schemas/index.json` exactly.

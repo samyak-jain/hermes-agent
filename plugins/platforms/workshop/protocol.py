@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import hashlib
@@ -26,6 +26,12 @@ MAX_ID_LENGTH = 128
 MAX_TOOL_NAME_LENGTH = 128
 MAX_TOOL_DESCRIPTION_LENGTH = 8 * 1024
 MAX_TURN_TEXT_BYTES = 1024 * 1024
+MAX_DISPLAY_METADATA_BYTES = 16 * 1024
+MAX_DISPLAY_METADATA_DEPTH = 4
+MAX_DISPLAY_METADATA_NODES = 128
+MAX_DISPLAY_METADATA_COLLECTION_ITEMS = 64
+MAX_DISPLAY_METADATA_STRING_BYTES = 4 * 1024
+MAX_DISPLAY_METADATA_KEY_BYTES = 128
 MAX_DELTA_BYTES = 256 * 1024
 MAX_DELTA_NODES = 4096
 MAX_DELTA_DEPTH = 16
@@ -63,6 +69,7 @@ _TURN_FIELDS = frozenset(
         "chat_id",
         "input",
         "tools",
+        "metadata",
     }
 )
 _INPUT_FIELDS = frozenset({"type", "text"})
@@ -178,6 +185,100 @@ def _version(value: Any) -> int:
             f"protocol_version must be {PROTOCOL_VERSION}",
         )
     return PROTOCOL_VERSION
+
+
+def _validate_display_metadata_value(
+    value: Any,
+    *,
+    path: str = "metadata",
+    depth: int = 0,
+    counter: list[int] | None = None,
+) -> None:
+    """Bound caller display data without interpreting it as agent context."""
+
+    if counter is None:
+        counter = [0]
+    counter[0] += 1
+    if (
+        depth > MAX_DISPLAY_METADATA_DEPTH
+        or counter[0] > MAX_DISPLAY_METADATA_NODES
+    ):
+        raise WorkshopProtocolError(
+            "metadata_too_complex", f"{path} exceeds the metadata complexity limit"
+        )
+    if value is None or isinstance(value, (bool, int, float)):
+        canonical_json(value)
+        return
+    if isinstance(value, str):
+        try:
+            encoded_length = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise WorkshopProtocolError(
+                "invalid_metadata", f"{path} contains invalid Unicode"
+            ) from exc
+        if encoded_length > MAX_DISPLAY_METADATA_STRING_BYTES:
+            raise WorkshopProtocolError(
+                "metadata_value_too_large", f"{path} string is too large"
+            )
+        return
+    if isinstance(value, list):
+        if len(value) > MAX_DISPLAY_METADATA_COLLECTION_ITEMS:
+            raise WorkshopProtocolError(
+                "metadata_too_complex",
+                f"{path} may contain at most {MAX_DISPLAY_METADATA_COLLECTION_ITEMS} items",
+            )
+        for index, item in enumerate(value):
+            _validate_display_metadata_value(
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                counter=counter,
+            )
+        return
+    if isinstance(value, Mapping):
+        if len(value) > MAX_DISPLAY_METADATA_COLLECTION_ITEMS:
+            raise WorkshopProtocolError(
+                "metadata_too_complex",
+                f"{path} may contain at most {MAX_DISPLAY_METADATA_COLLECTION_ITEMS} fields",
+            )
+        for key, item in value.items():
+            try:
+                key_length = len(key.encode("utf-8")) if isinstance(key, str) else 0
+            except UnicodeEncodeError as exc:
+                raise WorkshopProtocolError(
+                    "invalid_metadata", f"{path} contains an invalid field name"
+                ) from exc
+            if (
+                not isinstance(key, str)
+                or not key
+                or key_length > MAX_DISPLAY_METADATA_KEY_BYTES
+            ):
+                raise WorkshopProtocolError(
+                    "invalid_metadata", f"{path} contains an invalid field name"
+                )
+            _validate_display_metadata_value(
+                item,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+                counter=counter,
+            )
+        return
+    raise WorkshopProtocolError("invalid_metadata", f"{path} contains a non-JSON value")
+
+
+def _display_metadata(value: Any) -> dict[str, Any]:
+    metadata = _mapping(value, "metadata")
+    _validate_display_metadata_value(metadata)
+    encoded = canonical_json(metadata).encode("utf-8")
+    if len(encoded) > MAX_DISPLAY_METADATA_BYTES:
+        raise WorkshopProtocolError(
+            "metadata_too_large",
+            f"metadata exceeds {MAX_DISPLAY_METADATA_BYTES} bytes",
+            status=413,
+        )
+    # Normalize to an owned JSON value. This remains opaque display data and
+    # is deliberately never inserted into MessageEvent or model context.
+    return json.loads(encoded)
 
 
 def _validate_delta_data(
@@ -450,6 +551,7 @@ class WorkshopTurnRequest:
     text: str
     tools: tuple[WorkshopToolDefinition, ...]
     catalog_version: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "WorkshopTurnRequest":
@@ -466,6 +568,9 @@ class WorkshopTurnRequest:
         if len(text.encode("utf-8")) > MAX_TURN_TEXT_BYTES:
             raise WorkshopProtocolError("input_too_large", "input.text is too large", status=413)
         tools, digest = parse_tool_catalog(value.get("tools"))
+        metadata = _display_metadata(
+            value["metadata"] if "metadata" in value else {}
+        )
         return cls(
             client_turn_id=_identifier(value.get("client_turn_id"), "client_turn_id"),
             workspace_id=_identifier(value.get("workspace_id"), "workspace_id"),
@@ -473,6 +578,7 @@ class WorkshopTurnRequest:
             text=text,
             tools=tools,
             catalog_version=digest,
+            metadata=metadata,
         )
 
     @property
@@ -483,6 +589,7 @@ class WorkshopTurnRequest:
             "chat_id": self.chat_id,
             "input": {"type": "user", "text": self.text},
             "tools": [tool.to_wire() for tool in self.tools],
+            "metadata": self.metadata,
         }
         return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
