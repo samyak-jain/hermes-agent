@@ -29,7 +29,9 @@ def test_dynamic_platform_identity_and_registration_contract():
     assert kwargs["name"] == "workshop"
     assert kwargs["required_env"] == ["WORKSHOP_API_KEY", "WORKSHOP_WAKE_TOKEN"]
     assert callable(kwargs["api_route_factory"])
-    assert isinstance(kwargs["adapter_factory"](_config()), WorkshopAdapter)
+    adapter = kwargs["adapter_factory"](_config())
+    assert isinstance(adapter, WorkshopAdapter)
+    assert adapter.authorization_is_upstream is False
 
 
 def test_yaml_bridge_keeps_only_owned_behavior_settings():

@@ -39,13 +39,14 @@ def _body(
     workspace_id="workspace-1",
     chat_id="chat-1",
     tools=None,
+    text="Hello",
 ):
     return {
         "protocol_version": 1,
         "client_turn_id": client_turn_id,
         "workspace_id": workspace_id,
         "chat_id": chat_id,
-        "input": {"type": "user", "text": "Hello"},
+        "input": {"type": "user", "text": text},
         "tools": tools or [],
     }
 
@@ -67,6 +68,33 @@ def _delta_body(*, delta_id="delta-1", data=None):
 
 def _headers():
     return {"Authorization": f"Bearer {KEY}"}
+
+
+def _gateway_result(
+    event,
+    text: str | None,
+    *,
+    failed: bool = False,
+    interrupted: bool = False,
+    interrupt_message: str = "",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    last_prompt_tokens: int = 0,
+    model: str | None = None,
+):
+    """Mirror GatewayRunner's real Optional[str] + private outcome contract."""
+
+    event.metadata["_gateway_turn_outcome"] = {
+        "failed": failed,
+        "interrupted": interrupted,
+        "interrupt_message": interrupt_message,
+        "error_message": text if failed else "",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "last_prompt_tokens": last_prompt_tokens,
+        "model": model,
+    }
+    return text
 
 
 class _SessionStore:
@@ -213,13 +241,14 @@ async def test_turn_stream_uses_execution_epoch_and_persists_exact_order(tmp_pat
         captured["source"] = event.source
         captured["session_id"] = event.metadata["gateway_session_id"]
         event.metadata["_gateway_event_sink"]("text.delta", {"delta": "Hi"})
-        return {
-            "final_response": "Hi there",
-            "input_tokens": 7,
-            "output_tokens": 2,
-            "last_prompt_tokens": 9,
-            "model": "test-model",
-        }
+        return _gateway_result(
+            event,
+            "Hi there",
+            input_tokens=7,
+            output_tokens=2,
+            last_prompt_tokens=9,
+            model="test-model",
+        )
 
     adapter, _runner, store = _adapter(
         tmp_path, handler, session_ids=["admission-epoch", "execution-epoch"]
@@ -256,6 +285,45 @@ async def test_turn_stream_uses_execution_epoch_and_persists_exact_order(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_emits_error_and_error_terminal_boundary(tmp_path):
+    message = (
+        "Sorry, I encountered an unexpected error. The API is temporarily "
+        "unavailable."
+    )
+
+    async def handler(event):
+        return _gateway_result(
+            event,
+            message,
+            failed=True,
+            input_tokens=11,
+            model="test-model",
+        )
+
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        records = _sse_records(await response.text())
+
+    assert response.status == 200
+    assert [item["event"] for item in records] == [
+        "turn.started",
+        "message.start",
+        "usage",
+        "error",
+        "turn.end",
+    ]
+    assert records[2]["input_tokens"] == 11
+    assert records[3]["code"] == "agent_error"
+    assert records[3]["message"] == message
+    assert records[3]["retryable"] is False
+    assert records[-1]["status"] == "error"
+    assert records[-1]["stop_reason"] == "agent_error"
+
+
+@pytest.mark.asyncio
 async def test_workspace_delta_requires_an_existing_session(tmp_path):
     async def handler(_event):
         raise AssertionError("a missing-session delta must not run")
@@ -281,7 +349,7 @@ async def test_workspace_delta_is_internal_idempotent_and_has_no_remote_tools(tm
 
     async def handler(event):
         captured.append(event)
-        return {"final_response": "reconciled"}
+        return _gateway_result(event, "reconciled")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     delta_path = "/api/workshop/v1/sessions/workspace-1/chat-1/deltas"
@@ -329,8 +397,8 @@ async def test_workspace_delta_is_internal_idempotent_and_has_no_remote_tools(tm
 
 @pytest.mark.asyncio
 async def test_workspace_delta_rejects_prompt_injection_before_recording(tmp_path):
-    async def handler(_event):
-        return {"final_response": "unused"}
+    async def handler(event):
+        return _gateway_result(event, "unused")
 
     adapter, _runner, store = _adapter(tmp_path, handler)
     store.current = "session-1"
@@ -359,11 +427,11 @@ async def test_workspace_delta_queues_behind_active_user_turn(tmp_path):
         if trigger == "workshop_delta":
             order.append("delta")
             delta_entered.set()
-            return {"final_response": "delta done"}
+            return _gateway_result(event, "delta done")
         order.append("user")
         user_entered.set()
         await release_user.wait()
-        return {"final_response": "user done"}
+        return _gateway_result(event, "user done")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -400,7 +468,7 @@ async def test_sse_disconnect_does_not_cancel_turn(tmp_path):
         entered.set()
         await continue_turn.wait()
         event.metadata["_gateway_event_sink"]("text.delta", {"delta": "second"})
-        return {"final_response": "firstsecond"}
+        return _gateway_result(event, "firstsecond")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -438,9 +506,9 @@ async def test_sse_disconnect_does_not_cancel_turn(tmp_path):
 async def test_active_sse_emits_keepalive_without_ending_turn(tmp_path, monkeypatch):
     release = asyncio.Event()
 
-    async def handler(_event):
+    async def handler(event):
         await release.wait()
-        return {"final_response": "done"}
+        return _gateway_result(event, "done")
 
     monkeypatch.setattr(workshop_turns, "_SSE_KEEPALIVE_SECONDS", 0.01)
     adapter, _runner, _store = _adapter(tmp_path, handler)
@@ -466,7 +534,7 @@ async def test_active_sse_emits_keepalive_without_ending_turn(tmp_path, monkeypa
 async def test_after_seq_replays_only_later_semantic_events(tmp_path):
     async def handler(event):
         event.metadata["_gateway_event_sink"]("text.delta", {"delta": "answer"})
-        return {"final_response": "answer"}
+        return _gateway_result(event, "answer")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -528,7 +596,7 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
                 "arguments": {"path": "README.md"},
             },
         })
-        return {"final_response": "done"}
+        return _gateway_result(event, "done")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -597,7 +665,7 @@ async def test_remote_tool_blocks_until_idempotent_posted_result(tmp_path):
         remote = await asyncio.to_thread(invoke)
         observed["remote"] = remote
         event.metadata["_gateway_event_sink"]("text.delta", {"delta": "saved"})
-        return {"final_response": "saved"}
+        return _gateway_result(event, "saved")
 
     callback_entered_loop = asyncio.get_running_loop()
     tools = [
@@ -737,7 +805,7 @@ async def test_same_chat_turns_serialize_while_different_chats_overlap(tmp_path)
         await asyncio.sleep(0.05)
         total_active -= 1
         active_by_lane[lane] -= 1
-        return {"final_response": f"done-{event.message_id}"}
+        return _gateway_result(event, f"done-{event.message_id}")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -769,9 +837,9 @@ async def test_same_chat_turns_serialize_while_different_chats_overlap(tmp_path)
 async def test_active_turn_limit_is_atomic_and_retryable(tmp_path):
     release = asyncio.Event()
 
-    async def handler(_event):
+    async def handler(event):
         await release.wait()
-        return {"final_response": "done"}
+        return _gateway_result(event, "done")
 
     adapter, _runner, _store = _adapter(tmp_path, handler, max_active=1)
     async with TestClient(TestServer(_app(adapter))) as client:
@@ -893,13 +961,14 @@ async def test_immediate_abort_during_generation_echoes_reason(tmp_path):
     interrupted = asyncio.Event()
     reasons = []
 
-    async def handler(_event):
+    async def handler(event):
         await interrupted.wait()
-        return {
-            "interrupted": True,
-            "interrupt_message": reasons[-1],
-            "final_response": "",
-        }
+        return _gateway_result(
+            event,
+            "",
+            interrupted=True,
+            interrupt_message=reasons[-1],
+        )
 
     adapter, runner, _store = _adapter(tmp_path, handler)
     lane = "agent:main:workshop:thread:workspace-1:chat-1"
@@ -954,7 +1023,7 @@ async def test_after_current_call_allows_remote_result_then_ends(tmp_path):
             )
 
         remote_result["value"] = await asyncio.to_thread(invoke)
-        return {"final_response": "paused"}
+        return _gateway_result(event, "paused")
 
     tools = [
         {
@@ -1018,7 +1087,7 @@ async def test_immediate_end_turn_cancels_remote_call_with_typed_error(tmp_path)
             )
 
         remote_result["value"] = await asyncio.to_thread(invoke)
-        return {"interrupted": True}
+        return _gateway_result(event, None, interrupted=True)
 
     tools = [
         {
@@ -1078,9 +1147,9 @@ async def test_immediate_end_turn_cancels_remote_call_with_typed_error(tmp_path)
 async def test_turn_duration_cap_aborts_and_interrupts(tmp_path):
     interrupted = asyncio.Event()
 
-    async def handler(_event):
+    async def handler(event):
         await interrupted.wait()
-        return {"interrupted": True}
+        return _gateway_result(event, None, interrupted=True)
 
     adapter, runner, _store = _adapter(tmp_path, handler)
     adapter._behavior["turn_timeout_seconds"] = 0.02
@@ -1109,7 +1178,7 @@ async def test_wake_announces_durable_turn_before_launch_and_uses_empty_catalog(
 
     async def handler(event):
         captured["metadata"] = event.metadata
-        return {"final_response": "Autonomous follow-up complete"}
+        return _gateway_result(event, "Autonomous follow-up complete")
 
     adapter, _runner, store = _adapter(tmp_path, handler)
     store.current = "session-1"
@@ -1141,8 +1210,8 @@ async def test_wake_announces_durable_turn_before_launch_and_uses_empty_catalog(
 
 @pytest.mark.asyncio
 async def test_retryable_wake_reuses_turn_and_defers_completion_ack(tmp_path):
-    async def handler(_event):
-        return {"final_response": "done"}
+    async def handler(event):
+        return _gateway_result(event, "done")
 
     adapter, _runner, store = _adapter(tmp_path, handler)
     store.current = "session-1"
@@ -1171,8 +1240,8 @@ async def test_retryable_wake_reuses_turn_and_defers_completion_ack(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unpinned_cron_wake_uses_only_the_current_existing_epoch(tmp_path):
-    async def handler(_event):
-        return {"final_response": "done"}
+    async def handler(event):
+        return _gateway_result(event, "done")
 
     adapter, _runner, store = _adapter(tmp_path, handler)
     store.current = "session-1"

@@ -155,10 +155,10 @@ class WorkshopAdapter(BasePlatformAdapter):
 
     @property
     def authorization_is_upstream(self) -> bool:
-        # Inbound requests are admitted only after the workshop-specific
-        # bearer check on the shared API listener.  There is no end-user
-        # platform account for the generic gateway allowlist to evaluate.
-        return True
+        # The workshop bearer admits API traffic; it does not grant operator
+        # command authority.  Individual API-created MessageEvents carry the
+        # narrower transport_authorized marker and disable slash interpretation.
+        return False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("workshop"))
@@ -906,6 +906,8 @@ class WorkshopAdapter(BasePlatformAdapter):
                     source=source,
                     message_id=event_message_id or turn.client_turn_id,
                     internal=internal,
+                    transport_authorized=not internal,
+                    commands_enabled=False,
                     metadata={
                         "gateway_session_id": session_id,
                         "_gateway_event_sink": event_sink,
@@ -927,17 +929,25 @@ class WorkshopAdapter(BasePlatformAdapter):
                     event=event,
                     handler=handler,
                 )
-                result = result if isinstance(result, dict) else {}
-                final_response = str(result.get("final_response") or "")
+                if result is not None and not isinstance(result, str):
+                    raise TypeError(
+                        "Gateway message handler must return Optional[str]"
+                    )
+                outcome = event.metadata.get("_gateway_turn_outcome")
+                outcome = outcome if isinstance(outcome, dict) else {}
+                final_response = result or ""
+                failed = bool(outcome.get("failed"))
                 streamed = self.turns.emitted_text(turn_id)
-                if final_response and not streamed:
+                if final_response and not streamed and not failed:
                     await self.turns.emit(
                         turn_id,
                         WorkshopEventType.TEXT_DELTA,
                         {"delta": final_response},
                     )
-                elif final_response.startswith(streamed) and len(final_response) > len(
-                    streamed
+                elif (
+                    not failed
+                    and final_response.startswith(streamed)
+                    and len(final_response) > len(streamed)
                 ):
                     await self.turns.emit(
                         turn_id,
@@ -949,12 +959,12 @@ class WorkshopAdapter(BasePlatformAdapter):
                     turn_id,
                     WorkshopEventType.USAGE,
                     {
-                        "input_tokens": int(result.get("input_tokens") or 0),
-                        "output_tokens": int(result.get("output_tokens") or 0),
+                        "input_tokens": int(outcome.get("input_tokens") or 0),
+                        "output_tokens": int(outcome.get("output_tokens") or 0),
                         "last_prompt_tokens": int(
-                            result.get("last_prompt_tokens") or 0
+                            outcome.get("last_prompt_tokens") or 0
                         ),
-                        "model": result.get("model"),
+                        "model": outcome.get("model"),
                     },
                 )
                 controlled = await asyncio.to_thread(self.ledger.get_turn, turn_id)
@@ -968,17 +978,19 @@ class WorkshopAdapter(BasePlatformAdapter):
                         ),
                         stop_reason=str(controlled.control_reason or "controlled")[:1024],
                     )
-                elif result.get("interrupted"):
-                    stop_reason = str(result.get("interrupt_message") or "interrupted")[
-                        :1024
-                    ]
+                elif outcome.get("interrupted"):
+                    stop_reason = str(
+                        outcome.get("interrupt_message") or "interrupted"
+                    )[:1024]
                     await self.turns.finish(
                         turn_id,
                         state="interrupted",
                         stop_reason=stop_reason,
                     )
-                elif result.get("failed") and result.get("error"):
-                    message = str(result.get("error"))[:2048]
+                elif failed:
+                    message = str(
+                        outcome.get("error_message") or final_response or "Agent turn failed"
+                    )[:2048]
                     await self.turns.emit(
                         turn_id,
                         WorkshopEventType.ERROR,

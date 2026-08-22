@@ -1812,6 +1812,17 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Transport-scoped admission is distinct from operator authority.  An
+    # adapter may set this only after its own authenticated ingress has
+    # accepted the request; it skips the sender-account allowlist without
+    # granting gateway slash-command privileges.
+    transport_authorized: bool = False
+
+    # Some authenticated API surfaces carry user-authored text but are not an
+    # operator console.  For those surfaces a leading slash is ordinary model
+    # input, including names that happen to match gateway control commands.
+    commands_enabled: bool = True
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -1824,7 +1835,7 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        return self.text.startswith("/")
+        return self.commands_enabled and self.text.startswith("/")
     
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""

@@ -485,6 +485,38 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _stamp_gateway_turn_outcome(
+    event: Any,
+    *,
+    response: Optional[str],
+    agent_result: Optional[Dict[str, Any]] = None,
+    failed: bool = False,
+) -> None:
+    """Publish structured turn facts without changing the handler return type.
+
+    Platform handlers historically return ``Optional[str]``.  Streaming API
+    adapters still need failure and usage facts that cannot be reconstructed
+    from that string, so the gateway writes a private per-event sidecar after
+    the real agent result is known.
+    """
+
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    result = agent_result if isinstance(agent_result, dict) else {}
+    is_failed = bool(failed or result.get("failed"))
+    metadata["_gateway_turn_outcome"] = {
+        "failed": is_failed,
+        "interrupted": bool(result.get("interrupted")),
+        "interrupt_message": str(result.get("interrupt_message") or ""),
+        "error_message": str(response or "") if is_failed else "",
+        "input_tokens": int(result.get("input_tokens") or 0),
+        "output_tokens": int(result.get("output_tokens") or 0),
+        "last_prompt_tokens": int(result.get("last_prompt_tokens") or 0),
+        "model": result.get("model"),
+    }
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -10768,7 +10800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
-        if is_internal:
+        if is_internal or bool(getattr(event, "transport_authorized", False)):
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -14281,8 +14313,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                _stamp_gateway_turn_outcome(
+                    event,
+                    response=response,
+                    agent_result=agent_result,
+                )
                 return None
 
+            _stamp_gateway_turn_outcome(
+                event,
+                response=response,
+                agent_result=agent_result,
+            )
             return response
             
         except Exception as e:
@@ -14387,17 +14429,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # 500 with a large session often means the payload is too large
                 # for the API to process — treat it the same way.
                 if _hist_len > 50:
-                    return (
+                    _error_response = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
                         "/reset to start fresh."
                     )
+                    _stamp_gateway_turn_outcome(
+                        event, response=_error_response, failed=True
+                    )
+                    return _error_response
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
-            return (
+            _error_response = (
                 f"Sorry, I encountered an unexpected error.{status_hint}\n"
                 "Try again or use /reset to start a fresh session."
             )
+            _stamp_gateway_turn_outcome(
+                event, response=_error_response, failed=True
+            )
+            return _error_response
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)

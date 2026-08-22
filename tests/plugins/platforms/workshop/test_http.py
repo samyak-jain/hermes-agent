@@ -8,7 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
 from plugins.platforms.workshop.auth import WorkshopAuthenticator
-from plugins.platforms.workshop.http import WorkshopHTTPController
+from plugins.platforms.workshop.http import WorkshopHTTPController, create_api_routes
 from plugins.platforms.workshop.storage import WorkshopLedger
 
 
@@ -68,6 +68,47 @@ async def test_workshop_routes_require_the_separate_workshop_bearer(tmp_path):
 
     assert missing.status == 401
     assert api_key.status == 401
+
+
+@pytest.mark.asyncio
+async def test_missing_workshop_key_disables_only_workshop_routes(
+    monkeypatch, caplog
+):
+    monkeypatch.delenv("WORKSHOP_API_KEY", raising=False)
+    controller = WorkshopHTTPController(api_adapter=object())
+    app = web.Application()
+    app["gateway_runner"] = SimpleNamespace(adapters={})
+
+    async def shared_health(_request):
+        return web.json_response({"status": "ok"})
+
+    app.router.add_get("/health", shared_health)
+    for method, path, handler in controller.routes():
+        app.router.add_route(method, path, handler)
+
+    async with TestClient(TestServer(app)) as client:
+        workshop = await client.post(
+            "/api/workshop/v1/turns",
+            json=_turn_body(),
+            headers=_headers(),
+        )
+        workshop_body = await workshop.json()
+        shared = await client.get("/health")
+        shared_body = await shared.json()
+
+    assert workshop.status == 503
+    assert workshop_body["error"]["code"] == "workshop_unavailable"
+    assert shared.status == 200
+    assert shared_body == {"status": "ok"}
+    assert "workshop_http_initialization_failed disabled=true" in caplog.text
+
+
+def test_workshop_route_factory_never_eagerly_reads_credentials(monkeypatch):
+    monkeypatch.delenv("WORKSHOP_API_KEY", raising=False)
+    routes = create_api_routes(object())
+    assert ("GET", "/api/workshop/v1/health") in {
+        (method, path) for method, path, _handler in routes
+    }
 
 
 @pytest.mark.asyncio

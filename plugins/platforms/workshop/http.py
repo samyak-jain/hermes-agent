@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable
 
 from .auth import WorkshopAuthenticator
@@ -16,6 +17,9 @@ from .protocol import (
     validate_identifier,
 )
 from .storage import WorkshopLedger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _web():
@@ -35,8 +39,12 @@ class WorkshopHTTPController:
         ledger: WorkshopLedger | None = None,
     ):
         self.api_adapter = api_adapter
-        self.authenticator = authenticator or WorkshopAuthenticator.from_environment()
-        self.ledger = ledger or WorkshopLedger()
+        self.authenticator = authenticator
+        self.ledger = ledger
+        self._initialization_attempted = bool(
+            authenticator is not None and ledger is not None
+        )
+        self._initialization_error: str | None = None
 
     def routes(self) -> list[tuple]:
         return [
@@ -61,7 +69,43 @@ class WorkshopHTTPController:
             {"error": {"code": code, "message": message}}, status=status
         )
 
+    def _ensure_initialized(self):
+        if self._initialization_attempted:
+            if self._initialization_error is not None:
+                return self._error(
+                    "workshop_unavailable",
+                    "Workshop platform is disabled by invalid server configuration",
+                    status=503,
+                )
+            return None
+        self._initialization_attempted = True
+        try:
+            if self.authenticator is None:
+                self.authenticator = WorkshopAuthenticator.from_environment()
+            if self.ledger is None:
+                self.ledger = WorkshopLedger()
+        except Exception as exc:
+            self._initialization_error = str(exc) or type(exc).__name__
+            # This is intentionally request-lazy: an invalid workshop secret or
+            # ledger disables only these routes, never the API server that also
+            # owns /health, OpenAI compatibility, cron-fire, and Relay.
+            logger.error(
+                "workshop_http_initialization_failed disabled=true error=%s",
+                self._initialization_error,
+                exc_info=True,
+            )
+            return self._error(
+                "workshop_unavailable",
+                "Workshop platform is disabled by invalid server configuration",
+                status=503,
+            )
+        return None
+
     def _authorize(self, request):
+        unavailable = self._ensure_initialized()
+        if unavailable is not None:
+            return unavailable
+        assert self.authenticator is not None
         if self.authenticator.authorized(request.headers.get("Authorization")):
             return None
         return self._error("unauthorized", "Invalid workshop bearer token", status=401)
@@ -114,6 +158,7 @@ class WorkshopHTTPController:
             return auth_error
         adapter = self._adapter(request)
         ledger = getattr(adapter, "ledger", None) or self.ledger
+        assert ledger is not None
         dead_letters = ledger.dead_letter_wake_count()
         connected = bool(adapter is not None and getattr(adapter, "_running", False))
         behavior = dict(getattr(adapter, "_behavior", {}) or {})
@@ -172,6 +217,7 @@ class WorkshopHTTPController:
         # Completed turns remain replayable even while the live workshop
         # adapter is unavailable.  Active turns need the adapter's subscriber
         # tail and therefore return 503 instead of falsely closing the stream.
+        assert self.ledger is not None
         turn = self.ledger.get_turn(turn_id)
         if turn is None:
             return self._error("turn_not_found", "Workshop turn not found", status=404)
