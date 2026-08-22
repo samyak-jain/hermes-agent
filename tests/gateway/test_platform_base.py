@@ -2,6 +2,7 @@
 
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -124,6 +125,24 @@ class TestMessageEventIsCommand:
 
     def test_slash_only(self):
         event = MessageEvent(text="/")
+        assert event.is_command() is True
+
+    @pytest.mark.parametrize(
+        "platform",
+        ["workshop", SimpleNamespace(value="workshop")],
+    )
+    def test_duck_typed_workshop_platform_never_dispatches_commands(self, platform):
+        event = MessageEvent(
+            text="/restart",
+            source=SimpleNamespace(platform=platform),
+        )
+        assert event.is_command() is False
+
+    def test_duck_typed_non_workshop_platform_keeps_legacy_commands(self):
+        event = MessageEvent(
+            text="/help",
+            source=SimpleNamespace(platform="discord"),
+        )
         assert event.is_command() is True
 
 

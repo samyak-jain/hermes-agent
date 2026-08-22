@@ -102,6 +102,10 @@ def test_provider_tool_lifecycle_is_forwarded_with_exact_call_id():
 
     assert calls["external"] == [
         (
+            "tool_activity",
+            {"name": "workshop_write", "status": "started"},
+        ),
+        (
             "tool_call.start",
             {"call_id": "toolu_provider_123", "name": "workshop_write"},
         ),

@@ -227,7 +227,18 @@ async def test_valid_turn_is_strictly_parsed_before_adapter_availability(tmp_pat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw_after", ["-1", "abc", "1.5", "+1", ""])
+@pytest.mark.parametrize(
+    "raw_after",
+    [
+        "-1",
+        "abc",
+        "1.5",
+        "+1",
+        "",
+        pytest.param("9" * 4301, id="over-python-int-limit"),
+        pytest.param(str(1 << 63), id="over-sqlite-int-limit"),
+    ],
+)
 async def test_after_seq_is_validated_at_http_ingress_for_post_and_get(
     tmp_path, raw_after
 ):

@@ -657,7 +657,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 logger.debug(
                     "tool_start_callback raised for %s", name, exc_info=True,
                 )
+        # Privacy-safe lifecycle signal for external observers. This payload
+        # is constructed without args; the Workshop adapter independently
+        # allowlists local names and reconstructs the wire payload again.
         provider_identity = _provider_tool_identity(item)
+        activity_name = provider_identity[1] if provider_identity is not None else name
+        _fire_external_event(
+            "tool_activity",
+            {"name": activity_name, "status": "started"},
+        )
         if provider_identity is not None:
             call_id, provider_name = provider_identity
             _fire_external_event(
@@ -699,6 +707,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 logger.debug(
                     "tool_complete_callback raised for %s", name, exc_info=True,
                 )
+        # Do not include ``args`` or ``result`` here. Local-tool details can
+        # contain memory queries, soul edits, prompts, or configuration data.
+        provider_identity = _provider_tool_identity(item)
+        activity_name = provider_identity[1] if provider_identity is not None else name
+        _fire_external_event(
+            "tool_activity",
+            {
+                "name": activity_name,
+                "status": "error" if is_error else "completed",
+            },
+        )
 
     def _fire_text_delta(params: dict) -> None:
         text = params.get("delta") or params.get("text") or ""
