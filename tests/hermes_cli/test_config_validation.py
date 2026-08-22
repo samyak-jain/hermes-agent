@@ -218,6 +218,22 @@ class TestExactToolPolicyValidation:
         })
         assert not [issue for issue in issues if "tool policy" in issue.message]
 
+    def test_malformed_global_policy_is_not_misreported_as_a_platform_policy(self):
+        issues = validate_config_structure({
+            "agent": {
+                "tool_policy": {
+                    "mode": "unrestricted",
+                    "tools": ["terminal"],
+                }
+            }
+        })
+
+        policy_issues = [
+            issue for issue in issues if "agent.tool_policy" in issue.message
+        ]
+        assert len(policy_issues) == 1
+        assert "invalid platform policies" not in policy_issues[0].hint.lower()
+
     def test_valid_cron_policy(self):
         issues = validate_config_structure({
             "cron": {"tool_policy": {

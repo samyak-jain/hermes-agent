@@ -110,10 +110,12 @@ function hostToolDefinition(
       // Claude Code attaches the provider's tool_use block ID to the MCP
       // request metadata. Preserve it across the host callback so streamed
       // tool-use events and execution/results share one unambiguous identity.
-      // The fallback keeps compatibility with custom MCP callers that do not
-      // originate from Claude Code; it is not used to correlate provider calls.
-      const toolCallId =
-        toolCallIdFromMcpExtra(extra) ?? `tool_${randomUUID()}`;
+      const toolCallId = toolCallIdFromMcpExtra(extra);
+      if (!toolCallId) {
+        throw new Error(
+          `Host tool ${definition.name} is missing the provider tool_use ID`,
+        );
+      }
       const response = await rpc.request<{ content?: string; isError?: boolean }>(
         "agent/tool/call",
         {

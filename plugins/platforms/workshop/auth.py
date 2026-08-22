@@ -72,4 +72,6 @@ class WorkshopAuthenticator:
             # Compare a fixed dummy of the same length to keep the missing/bad
             # header path from becoming an obvious oracle.
             supplied = "0" * len(self.api_key)
-        return hmac.compare_digest(supplied, self.api_key)
+        return hmac.compare_digest(
+            supplied.encode("utf-8"), self.api_key.encode("utf-8")
+        )

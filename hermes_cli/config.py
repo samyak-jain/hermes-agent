@@ -5830,6 +5830,20 @@ def _iter_discord_channel_tool_policies(config: Dict[str, Any]):
 def _iter_platform_tool_policies(config: Dict[str, Any]):
     """Yield platform-wide exact policies across supported config layouts."""
     seen: set[str] = set()
+    from gateway.config import Platform
+
+    known_platforms = {
+        str(member.value) for member in Platform.__members__.values()
+    }
+    known_platforms.update(Platform._scan_bundled_plugin_platforms())
+    try:
+        from gateway.platform_registry import platform_registry
+
+        known_platforms.update(entry.name for entry in platform_registry.all_entries())
+    except Exception:
+        # Config validation still recognizes built-ins and bundled plugins if a
+        # third-party registry entry cannot be enumerated.
+        pass
 
     def collect(container: Any, prefix: str):
         if not isinstance(container, dict):
@@ -5849,7 +5863,7 @@ def _iter_platform_tool_policies(config: Dict[str, Any]):
     for root_key, block in config.items():
         if root_key in {"platforms", "gateway"} or not isinstance(block, dict):
             continue
-        if "tool_policy" in block:
+        if root_key in known_platforms and "tool_policy" in block:
             path = f"{root_key}.tool_policy"
             if path not in seen:
                 seen.add(path)

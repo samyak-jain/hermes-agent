@@ -122,6 +122,51 @@ test("runtime MCP tools preserve Claude's provider tool_use ID", async () => {
   await server.instance.close();
 });
 
+test("runtime MCP tools fail closed without a provider tool_use ID", async () => {
+  const rpc = {
+    request: async () => {
+      assert.fail("host callback must not run without provider identity");
+    },
+  };
+  const server = mcpServer(
+    rpc as never,
+    thread({
+      tools: [
+        {
+          name: "probe",
+          description: "identity probe",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ],
+    }),
+    "turn-1",
+  );
+  const sent: unknown[] = [];
+  const transport: any = {
+    async start() {},
+    async send(message: unknown) {
+      sent.push(message);
+    },
+    async close() {},
+  };
+  await server.instance.connect(transport);
+  transport.onmessage({
+    jsonrpc: "2.0",
+    id: 8,
+    method: "tools/call",
+    params: { name: "probe", arguments: {} },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const response = sent.find((message: any) => message?.id === 8) as any;
+  assert.equal(response?.result?.isError, true);
+  assert.match(
+    String(response?.result?.content?.[0]?.text),
+    /provider tool_use ID/,
+  );
+  await server.instance.close();
+});
+
 test("provider tool_use ID extraction fails closed on malformed metadata", () => {
   assert.equal(toolCallIdFromMcpExtra(undefined), undefined);
   assert.equal(toolCallIdFromMcpExtra({ _meta: {} }), undefined);

@@ -21166,6 +21166,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+            _signature_evicted_agent = None
             _xproc_evicted_agent = None
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -21186,7 +21187,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _ev_agent
                             and _ev_agent is not _AGENT_PENDING_SENTINEL
                         ):
-                            _xproc_evicted_agent = _ev_agent
+                            _signature_evicted_agent = _ev_agent
                         cached = None
                     if cached and cached[1] == _sig:
                         # cached[2] is the message_count at cache time;
@@ -21308,6 +21309,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._apply_fallback_chain_to_agent(
                     agent, self._refresh_fallback_model(),
                 )
+
+            # A signature miss is an intentional in-session replacement (for
+            # workshop, one real client catalog change). Close the retired
+            # app-server synchronously on this already-off-loop worker before
+            # constructing its replacement so both processes never coexist
+            # against the shared Claude thread store.
+            if _signature_evicted_agent is not None:
+                self._release_evicted_agent_soft(_signature_evicted_agent)
 
             # Lock released — now schedule cleanup of any cross-process-evicted
             # agent on a daemon thread so memory-provider shutdown / socket

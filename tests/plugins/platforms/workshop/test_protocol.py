@@ -40,7 +40,6 @@ def _turn(tools=None):
         "chat_id": "chat-1",
         "input": {"type": "user", "text": "Build it"},
         "tools": [_tool()] if tools is None else tools,
-        "metadata": {"title": "Workshop"},
     }
 
 
@@ -119,6 +118,14 @@ def test_turn_request_rejects_colons_in_routing_ids():
     with pytest.raises(WorkshopProtocolError) as exc:
         WorkshopTurnRequest.from_dict(raw)
     assert exc.value.code == "invalid_identifier"
+
+
+def test_turn_request_rejects_unsupported_caller_metadata():
+    raw = _turn()
+    raw["metadata"] = {"title": "unused"}
+    with pytest.raises(WorkshopProtocolError) as exc:
+        WorkshopTurnRequest.from_dict(raw)
+    assert exc.value.code == "unknown_field"
 
 
 def test_control_defaults_are_signal_specific():

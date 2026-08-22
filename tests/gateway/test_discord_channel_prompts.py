@@ -36,9 +36,12 @@ from gateway.session import SessionSource
 
 class _CapturingAgent:
     last_init = None
+    lifecycle_events = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        if type(self).lifecycle_events is not None:
+            type(self).lifecycle_events.append("init")
         self.tools = []
 
     def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
@@ -374,20 +377,29 @@ async def test_workshop_delta_turn_cannot_spawn_children(monkeypatch, tmp_path):
         thread_id="chat-1",
     )
 
+    lifecycle = []
+    session_key = "agent:main:workshop:thread:workspace-1:chat-1"
+    runner._agent_cache[session_key] = (object(), "retired-catalog", None, "session-1")
+    runner._release_evicted_agent_soft = lambda _agent: lifecycle.append("release")
+    _CapturingAgent.lifecycle_events = lifecycle
     _CapturingAgent.last_init = None
-    result = await runner._run_agent(
-        message="workspace changed",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="session-1",
-        session_key="agent:main:workshop:thread:workspace-1:chat-1",
-        automated_trigger="workshop_delta",
-        external_tool_schemas=[],
-        external_tool_catalog_version="empty-catalog",
-    )
+    try:
+        result = await runner._run_agent(
+            message="workspace changed",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+            automated_trigger="workshop_delta",
+            external_tool_schemas=[],
+            external_tool_catalog_version="established-catalog",
+        )
+    finally:
+        _CapturingAgent.lifecycle_events = None
 
     assert result["final_response"] == "ok"
+    assert lifecycle == ["release", "init"]
     policy = _CapturingAgent.last_init["tool_policy"]
     assert policy.allows("memory")
     assert not policy.allows("spawn_agent")

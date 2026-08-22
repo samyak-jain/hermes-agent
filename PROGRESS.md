@@ -24,23 +24,24 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 
 | Finding | State | Evidence / disposition |
 | --- | --- | --- |
-| L1 non-ASCII bearer 500 | Pending | Compare encoded bytes and return 401 without a traceback. |
-| L2 collision snapshot fails open | Pending | Make registry snapshot failure fatal to external-schema construction. |
-| L3 root config policy over-match | Pending | Restrict legacy root-level platform-policy scanning to registered/known platform names. |
-| L4 lane-lock growth | Pending | Reference-count or evict idle lane locks without weakening same-chat serialization. |
-| L5 silent provider-ID fallback | Pending | Fail loudly when a workshop-origin callback lacks the provider tool-use ID; preserve fallback only for non-workshop host tools if required. |
-| L6 dead caller metadata | Pending | Remove unsupported caller metadata from protocol ingress rather than carrying an unused authority/data surface. |
-| L7 asynchronous retired-shim close | Pending | Make replacement wait for the retired app-server close on the signature-miss path, or document a safe bounded alternative if the gateway event-loop contract prevents it. |
-| L8 invisible-Unicode delta rejection | Pending | No code change planned: approved fail-closed behavior. Add an operational note for the DO integration contract and typed-error handling. |
+| L1 non-ASCII bearer 500 | Fixed | Authenticator compares UTF-8 bytes, so arbitrary Unicode bearer input returns false/401 without `compare_digest` raising. |
+| L2 collision snapshot fails open | Fixed | Registry enumeration failure now aborts app-server tool-surface construction; a test forces the snapshot exception while an external `terminal` schema is present. |
+| L3 root config policy over-match | Fixed | Legacy root scanning is restricted to enum, bundled-plugin, and runtime-registered platform names. A malformed global `agent.tool_policy` now produces exactly its one authoritative error. |
+| L4 lane-lock growth | Fixed | Lane state reference-counts holders/waiters and evicts itself after the final release. Tests preserve same-lane serialization and drain 100 unique caller-controlled lanes to zero entries. |
+| L5 silent provider-ID fallback | Fixed | The shim no longer invents a random host-tool ID. Missing/malformed SDK metadata becomes an MCP error result before any Hermes/workshop callback, while exact provider ID coverage remains. |
+| L6 dead caller metadata | Fixed | `metadata` was removed from the strict turn protocol, request digest, adapter event, and size constant. Supplying it now returns `unknown_field`. |
+| L7 asynchronous retired-shim close | Fixed | Signature-miss eviction is separated from cross-process stale eviction. On the off-loop agent worker, the signature-retired client is synchronously soft-released before replacement construction; an integration test records `release` before `init`. Cross-process cleanup remains asynchronous to preserve heartbeat safety. |
+| L8 invisible-Unicode delta rejection | Documented | Approved fail-closed behavior is retained. `WORKSHOP_PLATFORM_PLAN.md` now requires the DO to treat rejection as permanent for that `delta_id`, sanitize/reframe content, and allocate a new identity. |
 
 ## Shared runtime / fork contract
 
 | Finding | State | Evidence / disposition |
 | --- | --- | --- |
-| Codex app-server interrupt propagation | Pending | Add explicit Discord and cron-path tests proving the shared `AIAgent.interrupt()` propagation changes only runtime effectiveness, not routing, authorization, or turn semantics. If the behavior itself differs from the documented fork contract, record it as deliberate and flag it for the orchestrator. |
+| Codex app-server interrupt propagation | Covered; pre-deploy smoke pending | Explicit tests prove Discord retains the legacy flags/message while signaling Codex, and cron retains `_active_request_abort("interrupt_abort")` while also signaling Codex. This is documented in `WORKSHOP_PLATFORM_PLAN.md` as a deliberate Kumo fork-contract effectiveness change. The orchestrator must mirror that note into external `hermes-fork.md` and run one live Discord interrupt plus one cron turn before rollout. |
 
 ## Verification log
 
 - Blocker-focused integration set: **63 passed** (`test_adapter`, `test_http`, `test_turns`, minimal real gateway command dispatch, shared API route composition).
 - Medium-focused integration set: **70 passed** (storage, turn/SSE, HTTP ingress, platform policy/runtime).
-- Low remediation and full-suite rerun remain pending.
+- Low/shared-runtime Python set: **120 passed**. Claude shim: **22 passed**, including missing-provider-ID fail-closed behavior.
+- Full-suite rerun remains pending.

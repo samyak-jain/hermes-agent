@@ -62,6 +62,31 @@ class TestInterruptPropagationToChild(unittest.TestCase):
 
         parent._codex_session.request_interrupt.assert_called_once_with()
 
+    def test_discord_interrupt_keeps_legacy_flags_and_signals_codex_session(self):
+        agent = self._make_bare_agent()
+        agent.platform = "discord"
+        agent._codex_session = MagicMock()
+
+        agent.interrupt("new Discord message")
+
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "new Discord message"
+        assert agent._interrupt_thread_signal_pending is True
+        agent._codex_session.request_interrupt.assert_called_once_with()
+
+    def test_cron_interrupt_keeps_inline_abort_and_signals_codex_session(self):
+        agent = self._make_bare_agent()
+        agent.platform = "cron"
+        agent._codex_session = MagicMock()
+        agent._active_request_abort = MagicMock()
+
+        agent.interrupt("cron deadline")
+
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "cron deadline"
+        agent._active_request_abort.assert_called_once_with("interrupt_abort")
+        agent._codex_session.request_interrupt.assert_called_once_with()
+
     def test_child_clear_interrupt_at_start_clears_thread(self):
         """child.clear_interrupt() at start of run_conversation clears the
         bound execution thread's interrupt flag.

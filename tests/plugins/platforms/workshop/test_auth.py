@@ -40,3 +40,8 @@ def test_authenticator_accepts_only_its_bearer():
     assert auth.authorized(f"bearer {key}") is True
     assert auth.authorized("Bearer " + "d" * 64) is False
     assert auth.authorized(None) is False
+
+
+def test_non_ascii_bearer_is_a_normal_authentication_failure():
+    auth = WorkshopAuthenticator("a" * 64)
+    assert auth.authorized("Bearer " + "é" * 64) is False

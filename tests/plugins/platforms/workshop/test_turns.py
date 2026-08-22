@@ -207,6 +207,28 @@ async def test_interrupt_side_effect_claim_is_thread_safe(tmp_path):
     )
 
 
+@pytest.mark.asyncio
+async def test_idle_lane_locks_are_evicted_without_losing_serialization(tmp_path):
+    coordinator = WorkshopTurnCoordinator(WorkshopLedger(tmp_path / "state.db"))
+    active = 0
+    max_active = 0
+
+    async def enter(key):
+        nonlocal active, max_active
+        async with coordinator.lane(key):
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.001)
+            active -= 1
+
+    await asyncio.gather(*(enter("shared") for _ in range(10)))
+    assert max_active == 1
+    assert coordinator._lane_locks == {}
+
+    await asyncio.gather(*(enter(f"chat-{index}") for index in range(100)))
+    assert coordinator._lane_locks == {}
+
+
 def _wake_event(*, producer_type="spawn_result", producer_id="delegation-1"):
     return MessageEvent(
         text="[SYSTEM: A delegated task completed]",

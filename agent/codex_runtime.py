@@ -52,12 +52,12 @@ def _app_server_tool_schemas(agent: Any) -> list[dict[str, Any]]:
     allowed = set(getattr(agent, "valid_tool_names", set()) or set())
     schemas: list[dict[str, Any]] = []
     known_local_names: set[str] = set()
-    try:
-        from tools.registry import registry
+    from tools.registry import registry
 
-        known_local_names.update(registry.get_all_tool_names())
-    except Exception:
-        logger.debug("Could not snapshot registered tool names", exc_info=True)
+    # A partial snapshot would let an external catalog impersonate the name of
+    # a policy-denied Hermes tool. Registry failure is therefore fatal to tool
+    # surface construction, not a reason to weaken the collision boundary.
+    known_local_names.update(registry.get_all_tool_names())
     for raw_tool in getattr(agent, "tools", None) or []:
         if not isinstance(raw_tool, dict):
             continue

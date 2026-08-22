@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import json
 import logging
@@ -93,18 +94,40 @@ class _LiveTurn:
             self.interrupt_signatures.discard(signature)
 
 
+@dataclass
+class _LaneState:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 class WorkshopTurnCoordinator:
     """Own running tasks independently from any particular SSE connection."""
 
     def __init__(self, ledger: WorkshopLedger):
         self.ledger = ledger
         self._live: dict[str, _LiveTurn] = {}
-        self._lane_locks: dict[str, asyncio.Lock] = {}
+        self._lane_locks: dict[str, _LaneState] = {}
         self._remote_waiters: dict[tuple[str, str], threading.Event] = {}
         self._remote_waiters_lock = threading.Lock()
 
-    def lane_lock(self, session_key: str) -> asyncio.Lock:
-        return self._lane_locks.setdefault(session_key, asyncio.Lock())
+    @asynccontextmanager
+    async def lane(self, session_key: str):
+        state = self._lane_locks.get(session_key)
+        if state is None:
+            state = _LaneState()
+            self._lane_locks[session_key] = state
+        state.users += 1
+        try:
+            async with state.lock:
+                yield
+        finally:
+            state.users -= 1
+            if (
+                state.users == 0
+                and not state.lock.locked()
+                and self._lane_locks.get(session_key) is state
+            ):
+                self._lane_locks.pop(session_key, None)
 
     def ensure_live(self, turn_id: str) -> _LiveTurn:
         state = self._live.get(turn_id)

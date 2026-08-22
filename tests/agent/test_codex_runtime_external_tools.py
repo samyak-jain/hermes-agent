@@ -72,6 +72,26 @@ def test_duplicate_external_names_fail_closed():
         _app_server_tool_schemas(agent)
 
 
+def test_local_registry_snapshot_failure_cannot_degrade_collision_check(
+    monkeypatch,
+):
+    from tools.registry import registry
+
+    monkeypatch.setattr(
+        registry,
+        "get_all_tool_names",
+        lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+    agent = SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        _external_tool_schemas=[_external_tool("terminal")],
+    )
+
+    with pytest.raises(RuntimeError, match="registry unavailable"):
+        _app_server_tool_schemas(agent)
+
+
 def test_external_dispatch_never_enters_local_tool_handler():
     local_calls = []
     remote_calls = []

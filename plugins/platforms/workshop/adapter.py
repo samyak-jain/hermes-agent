@@ -377,7 +377,6 @@ class WorkshopAdapter(BasePlatformAdapter):
             text=text,
             tools=(),
             catalog_version=established_catalog,
-            metadata={},
         )
         try:
             record, _created = await asyncio.to_thread(
@@ -711,7 +710,6 @@ class WorkshopAdapter(BasePlatformAdapter):
             text=text,
             tools=(),
             catalog_version=established_catalog,
-            metadata={},
         )
         try:
             record, created = await asyncio.to_thread(
@@ -800,8 +798,7 @@ class WorkshopAdapter(BasePlatformAdapter):
         assert self.ledger is not None and self.turns is not None
         runner = self._runner()
         initial_key = runner._session_key_for_source(source)
-        lane = self.turns.lane_lock(initial_key)
-        async with lane:
+        async with self.turns.lane(initial_key):
             try:
                 admitted = await asyncio.to_thread(self.ledger.get_turn, turn_id)
                 if admitted is None or admitted.state in {
@@ -963,7 +960,6 @@ class WorkshopAdapter(BasePlatformAdapter):
                             tool.to_bridge_schema() for tool in turn.tools
                         ],
                         "_workshop_tool_callback": remote_tool_callback,
-                        "workshop_client_metadata": dict(turn.metadata),
                         "automated_trigger": automated_trigger,
                     },
                 )

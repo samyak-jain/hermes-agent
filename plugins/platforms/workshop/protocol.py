@@ -31,7 +31,6 @@ MAX_DELTA_NODES = 4096
 MAX_DELTA_DEPTH = 16
 MAX_DELTA_COLLECTION_ITEMS = 256
 MAX_DELTA_STRING_BYTES = 64 * 1024
-MAX_METADATA_BYTES = 16 * 1024
 MAX_SCHEMA_DEPTH = 16
 MAX_SCHEMA_NODES = 4096
 
@@ -64,7 +63,6 @@ _TURN_FIELDS = frozenset(
         "chat_id",
         "input",
         "tools",
-        "metadata",
     }
 )
 _INPUT_FIELDS = frozenset({"type", "text"})
@@ -452,7 +450,6 @@ class WorkshopTurnRequest:
     text: str
     tools: tuple[WorkshopToolDefinition, ...]
     catalog_version: str
-    metadata: dict[str, Any]
 
     @classmethod
     def from_dict(cls, raw: Any) -> "WorkshopTurnRequest":
@@ -469,10 +466,6 @@ class WorkshopTurnRequest:
         if len(text.encode("utf-8")) > MAX_TURN_TEXT_BYTES:
             raise WorkshopProtocolError("input_too_large", "input.text is too large", status=413)
         tools, digest = parse_tool_catalog(value.get("tools"))
-        metadata_raw = value.get("metadata", {})
-        metadata = dict(_mapping(metadata_raw, "metadata"))
-        if _byte_length(metadata) > MAX_METADATA_BYTES:
-            raise WorkshopProtocolError("metadata_too_large", "metadata is too large", status=413)
         return cls(
             client_turn_id=_identifier(value.get("client_turn_id"), "client_turn_id"),
             workspace_id=_identifier(value.get("workspace_id"), "workspace_id"),
@@ -480,7 +473,6 @@ class WorkshopTurnRequest:
             text=text,
             tools=tools,
             catalog_version=digest,
-            metadata=metadata,
         )
 
     @property
@@ -491,7 +483,6 @@ class WorkshopTurnRequest:
             "chat_id": self.chat_id,
             "input": {"type": "user", "text": self.text},
             "tools": [tool.to_wire() for tool in self.tools],
-            "metadata": self.metadata,
         }
         return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
