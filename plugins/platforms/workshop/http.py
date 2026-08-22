@@ -39,6 +39,7 @@ class WorkshopHTTPController:
 
     def routes(self) -> list[tuple]:
         return [
+            ("GET", "/api/workshop/v1/health", self.health),
             ("POST", "/api/workshop/v1/turns", self.start_turn),
             ("GET", "/api/workshop/v1/turns/{turn_id}/events", self.turn_events),
             (
@@ -104,6 +105,20 @@ class WorkshopHTTPController:
     async def start_turn(self, request):
         return await self._parse_and_delegate(
             request, WorkshopTurnRequest.from_dict, "start_workshop_turn"
+        )
+
+    async def health(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        adapter = self._adapter(request)
+        ledger = getattr(adapter, "ledger", None) or self.ledger
+        dead_letters = ledger.dead_letter_wake_count()
+        return _web().json_response(
+            {
+                "status": "degraded" if dead_letters else "ok",
+                "dead_letter_wakes": dead_letters,
+            }
         )
 
     async def turn_events(self, request):

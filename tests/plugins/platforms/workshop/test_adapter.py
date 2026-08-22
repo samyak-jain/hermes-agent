@@ -108,6 +108,42 @@ async def test_connect_initializes_shared_ledger_and_recovers_stale_turns(
 
 
 @pytest.mark.asyncio
+async def test_restart_keeps_pending_wake_and_exposes_interrupted_turn(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKSHOP_API_KEY", "a" * 64)
+    monkeypatch.setenv("WORKSHOP_WAKE_TOKEN", "wake-secret")
+    first = WorkshopAdapter(_config())
+    assert await first.connect() is True
+    turn, _created = first.ledger.create_turn(
+        client_turn_id="wake.pending",
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        session_key="agent:main:workshop:thread:workspace-1:chat-1",
+        session_id="session-1",
+        catalog_version="catalog-empty",
+        request_digest="request-wake",
+    )
+    first.ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-restart",
+        turn_id=turn.turn_id,
+    )
+    await first.disconnect()
+
+    second = WorkshopAdapter(_config())
+    assert await second.connect() is True
+    recovered = second.ledger.get_turn(turn.turn_id)
+    wake = second.ledger.get_wake("spawn_result", "delegation-restart")
+
+    assert recovered is not None and recovered.state == "interrupted"
+    assert wake is not None and wake.state == "pending"
+    assert second.ledger.list_events(turn.turn_id)[-1].event == "turn.end"
+    await second.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_in_process_reconnect_does_not_interrupt_live_turn(
     monkeypatch, tmp_path
 ):

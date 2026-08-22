@@ -92,6 +92,63 @@ def test_delta_record_is_idempotent_and_bound_to_one_turn(tmp_path):
         )
 
 
+def test_wake_delivery_state_is_durable_and_idempotent(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+
+    assert ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        turn_id=turn.turn_id,
+    ) is True
+    assert ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        turn_id=turn.turn_id,
+    ) is False
+
+    ledger.mark_wake_retryable(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        error="temporary",
+    )
+    pending = ledger.get_wake("spawn_result", "delegation-1")
+    assert pending is not None
+    assert (pending.state, pending.attempts, pending.last_error) == (
+        "pending",
+        1,
+        "temporary",
+    )
+
+    ledger.mark_wake_delivered(
+        producer_type="spawn_result", producer_id="delegation-1"
+    )
+    delivered = ledger.get_wake("spawn_result", "delegation-1")
+    assert delivered is not None
+    assert (delivered.state, delivered.attempts, delivered.last_error) == (
+        "delivered",
+        2,
+        None,
+    )
+
+
+def test_dead_letter_wake_is_counted_for_health(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.record_wake(
+        producer_type="cron_result", producer_id="execution-1", turn_id=turn.turn_id
+    )
+    ledger.mark_wake_dead_letter(
+        producer_type="cron_result", producer_id="execution-1", error="HTTP 403"
+    )
+
+    wake = ledger.get_wake("cron_result", "execution-1")
+    assert wake is not None
+    assert wake.state == "dead_letter"
+    assert wake.attempts == 1
+    assert ledger.dead_letter_wake_count() == 1
+
+
 def test_replay_persists_text_and_complete_args_but_not_live_only_deltas(tmp_path):
     ledger = _ledger(tmp_path)
     turn, _ = _turn(ledger)

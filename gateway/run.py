@@ -17696,6 +17696,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            identity = self._completion_delivery_identity(evt)
+            if identity is not None:
+                producer_type, producer_id, producer_epoch = identity
+                if producer_epoch not in {"", None}:
+                    epoch_digest = __import__("hashlib").sha256(
+                        str(producer_epoch).encode("utf-8")
+                    ).hexdigest()[:16]
+                    producer_id = f"{producer_id}.{epoch_digest}"
+                # Internal-only routing metadata lets asynchronous adapters
+                # persist their own delivery boundary before this gateway
+                # acknowledges the authoritative producer record.
+                metadata["_completion_producer_type"] = producer_type
+                metadata["_completion_producer_id"] = producer_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,

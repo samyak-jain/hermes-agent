@@ -71,6 +71,41 @@ async def test_workshop_routes_require_the_separate_workshop_bearer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_health_surfaces_durable_wake_dead_letters(tmp_path):
+    app, ledger = _app(tmp_path)
+    turn, _created = ledger.create_turn(
+        client_turn_id="wake-1",
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        session_key="agent:main:workshop:thread:workspace-1:chat-1",
+        session_id="session-1",
+        catalog_version="catalog-1",
+        request_digest="request-1",
+    )
+    ledger.record_wake(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        turn_id=turn.turn_id,
+    )
+    ledger.mark_wake_dead_letter(
+        producer_type="spawn_result",
+        producer_id="delegation-1",
+        error="HTTP 403",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        unauthorized = await client.get("/api/workshop/v1/health")
+        response = await client.get(
+            "/api/workshop/v1/health", headers=_headers()
+        )
+        body = await response.json()
+
+    assert unauthorized.status == 401
+    assert response.status == 200
+    assert body == {"status": "degraded", "dead_letter_wakes": 1}
+
+
+@pytest.mark.asyncio
 async def test_authentication_precedes_resource_identifier_validation(tmp_path):
     app, _ledger = _app(tmp_path)
     async with TestClient(TestServer(app)) as client:

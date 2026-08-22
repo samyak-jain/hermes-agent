@@ -30,6 +30,7 @@ from .protocol import (
     MAX_EVENT_BACKLOG_BYTES,
     MAX_PENDING_REMOTE_CALLS,
     MAX_SCHEMA_BYTES,
+    MAX_TURN_TEXT_BYTES,
     MAX_TURN_SECONDS,
     WorkshopEventType,
     WorkshopDeltaRequest,
@@ -39,6 +40,7 @@ from .protocol import (
     validate_identifier,
 )
 from .storage import (
+    TERMINAL_TURN_STATES,
     WorkshopBacklogExceeded,
     WorkshopCapacityError,
     WorkshopConflictError,
@@ -46,6 +48,11 @@ from .storage import (
     WorkshopNotFoundError,
 )
 from .turns import WorkshopTurnCoordinator
+from .wake import (
+    WorkshopWakeClient,
+    WorkshopWakeRejectedError,
+    WorkshopWakeRetryableError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +164,7 @@ class WorkshopAdapter(BasePlatformAdapter):
         self.ledger: WorkshopLedger | None = None
         self.turns: WorkshopTurnCoordinator | None = None
         self._behavior: dict[str, int | str] = {}
+        self._wake_client: WorkshopWakeClient | None = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         try:
@@ -169,13 +177,19 @@ class WorkshopAdapter(BasePlatformAdapter):
             )
             return False
         try:
-            load_workshop_credentials()
+            _api_key, wake_token = load_workshop_credentials()
         except WorkshopAuthConfigurationError as exc:
             self._set_fatal_error(
                 "workshop_invalid_credentials", str(exc), retryable=False
             )
             return False
         self._behavior = behavior
+        if self._wake_client is None:
+            self._wake_client = WorkshopWakeClient(
+                url=str(behavior["wake_url"]),
+                token=wake_token,
+                timeout_seconds=float(behavior["wake_timeout_seconds"]),
+            )
         if self.ledger is None:
             self.ledger = WorkshopLedger(
                 max_event_backlog_bytes=int(behavior["max_event_backlog_bytes"]),
@@ -241,15 +255,16 @@ class WorkshopAdapter(BasePlatformAdapter):
         return entry.session_key, entry.session_id
 
     async def _resolve_existing_session(
-        self, source: SessionSource
+        self, source: SessionSource, *, pinned_session_id: str | None = None
     ) -> tuple[str, str] | None:
         """Resolve a workshop lane without creating or reviving a session."""
 
         runner = self._runner()
         session_key = runner._session_key_for_source(source)
-        session_id = await runner.async_session_store.peek_session_id(session_key)
-        if not session_id:
+        current_session_id = await runner.async_session_store.peek_session_id(session_key)
+        if not current_session_id:
             return None
+        session_id = str(pinned_session_id or current_session_id)
         session_db = getattr(runner, "_session_db", None)
         get_session = getattr(session_db, "get_session", None)
         if callable(get_session):
@@ -264,7 +279,192 @@ class WorkshopAdapter(BasePlatformAdapter):
                 return None
             if row is None or row.get("ended_at"):
                 return None
+        elif pinned_session_id and session_id != str(current_session_id):
+            # Without the authoritative DB row, never revive a non-current
+            # epoch merely because an internal event supplied its identifier.
+            return None
         return session_key, str(session_id)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Announce and launch an already-created autonomous workshop turn."""
+
+        if not event.internal:
+            raise RuntimeError("Workshop accepts user turns only through its turn API")
+        if (
+            self.ledger is None
+            or self.turns is None
+            or self._wake_client is None
+            or not self._running
+        ):
+            raise WorkshopWakeRetryableError("Workshop platform is not connected")
+
+        metadata = dict(event.metadata or {})
+        producer_type = str(metadata.get("_completion_producer_type") or "").strip()
+        producer_id = str(metadata.get("_completion_producer_id") or "").strip()
+        pinned_session_id = str(metadata.get("gateway_session_id") or "").strip()
+        if not producer_type or not producer_id:
+            raise WorkshopWakeRetryableError(
+                "Autonomous workshop event is missing its durable producer identity"
+            )
+
+        source = event.source
+        workspace_id = validate_identifier(source.chat_id, "workspace_id")
+        chat_id = validate_identifier(source.thread_id, "chat_id")
+        resolved = await self._resolve_existing_session(
+            source, pinned_session_id=pinned_session_id or None
+        )
+        if resolved is None:
+            raise WorkshopWakeRetryableError(
+                "Autonomous workshop event's pinned session is unavailable"
+            )
+        session_key, session_id = resolved
+
+        text = str(event.text or "")
+        if len(text.encode("utf-8")) > MAX_TURN_TEXT_BYTES:
+            raise WorkshopWakeRetryableError(
+                "Autonomous workshop event exceeds the turn input limit"
+            )
+
+        # Caller-supplied schemas are per-turn capabilities. An autonomous
+        # producer has not supplied fresh authority, so this turn receives no
+        # remote workshop tools. Persisting the previous catalog would widen
+        # a security boundary across turns.
+        _empty_tools, empty_catalog = parse_tool_catalog([])
+        wake_identity = f"{producer_type}\0{producer_id}"
+        synthetic = WorkshopTurnRequest(
+            client_turn_id=(
+                "wake." + hashlib.sha256(wake_identity.encode("utf-8")).hexdigest()
+            ),
+            workspace_id=workspace_id,
+            chat_id=chat_id,
+            text=text,
+            tools=(),
+            catalog_version=empty_catalog,
+            metadata={},
+        )
+        try:
+            record, _created = await asyncio.to_thread(
+                self.ledger.create_turn,
+                client_turn_id=synthetic.client_turn_id,
+                workspace_id=workspace_id,
+                chat_id=chat_id,
+                session_key=session_key,
+                session_id=session_id,
+                catalog_version=empty_catalog,
+                request_digest=synthetic.request_digest,
+                max_active_turns=int(self._behavior["max_active_turns"]),
+            )
+            await asyncio.to_thread(
+                self.ledger.record_wake,
+                producer_type=producer_type,
+                producer_id=producer_id,
+                turn_id=record.turn_id,
+            )
+        except WorkshopCapacityError as exc:
+            raise WorkshopWakeRetryableError(
+                "Workshop has reached its active turn limit"
+            ) from exc
+
+        wake = await asyncio.to_thread(
+            self.ledger.get_wake, producer_type, producer_id
+        )
+        assert wake is not None
+        if wake.state in {"delivered", "dead_letter"}:
+            return
+
+        # The DO may attach to the event path before its wake handler returns.
+        # Install the live tail before making the outbound call so that early
+        # attachment waits for launch instead of observing an active DB row
+        # with no process-local owner and closing prematurely.
+        self.turns.ensure_live(record.turn_id)
+
+        events_path = f"/api/workshop/v1/turns/{record.turn_id}/events"
+        idempotency_key = hashlib.sha256(
+            f"workshop-wake\0{producer_type}\0{producer_id}".encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "protocol_version": 1,
+            "workspace_id": workspace_id,
+            "chat_id": chat_id,
+            "session_id": session_id,
+            "turn_id": record.turn_id,
+            "events_path": events_path,
+            "catalog_version": empty_catalog,
+            "producer": {"type": producer_type, "id": producer_id},
+            "idempotency_key": idempotency_key,
+        }
+        try:
+            await self._wake_client.deliver(
+                payload, idempotency_key=idempotency_key
+            )
+        except WorkshopWakeRejectedError as exc:
+            await asyncio.to_thread(
+                self.ledger.mark_wake_dead_letter,
+                producer_type=producer_type,
+                producer_id=producer_id,
+                error=str(exc),
+            )
+            logger.error(
+                "workshop_wake_dead_letter producer_type=%s producer_id=%s "
+                "turn_id=%s http_status=%d",
+                producer_type,
+                producer_id,
+                record.turn_id,
+                exc.status,
+            )
+            rejected_turn = await asyncio.to_thread(
+                self.ledger.get_turn, record.turn_id
+            )
+            if (
+                rejected_turn is not None
+                and rejected_turn.state not in TERMINAL_TURN_STATES
+            ):
+                await self.turns.finish(
+                    record.turn_id,
+                    state="error",
+                    stop_reason="wake_rejected",
+                    payload={"wake_http_status": exc.status},
+                )
+            status_update = getattr(
+                self._runner(), "_update_platform_runtime_status", None
+            )
+            if callable(status_update):
+                status_update(
+                    "workshop",
+                    platform_state="degraded",
+                    error_code="workshop_wake_dead_letter",
+                    error_message="A workshop wake was permanently rejected",
+                )
+            return
+        except WorkshopWakeRetryableError as exc:
+            await asyncio.to_thread(
+                self.ledger.mark_wake_retryable,
+                producer_type=producer_type,
+                producer_id=producer_id,
+                error=str(exc),
+            )
+            raise
+
+        await asyncio.to_thread(
+            self.ledger.mark_wake_delivered,
+            producer_type=producer_type,
+            producer_id=producer_id,
+        )
+        launchable = await asyncio.to_thread(self.ledger.get_turn, record.turn_id)
+        if launchable is not None and launchable.state == "queued":
+            self.turns.launch(
+                record.turn_id,
+                lambda: self._execute_turn(
+                    record.turn_id,
+                    synthetic,
+                    source,
+                    internal=True,
+                    automated_trigger=producer_type,
+                    event_message_id=event.message_id,
+                    require_existing_session=True,
+                    pinned_session_id=session_id,
+                ),
+            )
 
     @staticmethod
     def _prepare_workspace_delta(delta: WorkshopDeltaRequest) -> str:
@@ -526,6 +726,7 @@ class WorkshopAdapter(BasePlatformAdapter):
         automated_trigger: str = "",
         event_message_id: str | None = None,
         require_existing_session: bool = False,
+        pinned_session_id: str | None = None,
     ) -> None:
         assert self.ledger is not None and self.turns is not None
         runner = self._runner()
@@ -547,7 +748,9 @@ class WorkshopAdapter(BasePlatformAdapter):
                 # Re-resolve after waiting: an earlier turn in this lane may
                 # have rotated to a compressed child session.
                 if require_existing_session:
-                    resolved = await self._resolve_existing_session(source)
+                    resolved = await self._resolve_existing_session(
+                        source, pinned_session_id=pinned_session_id
+                    )
                     if resolved is None:
                         raise WorkshopConflictError(
                             "workshop session ended before delta execution"

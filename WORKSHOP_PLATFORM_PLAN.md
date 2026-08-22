@@ -37,7 +37,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | 4. External tools and result callback | Complete | Strict client schemas merge after the policy-filtered local MCP surface with full registry collision rejection. Catalog digests bust the cached-agent signature; the superseded app-server is retired and the shim rebinds the same Claude session with the new catalog. Remote calls use exact provider IDs, durable pending rows, bounded parallel callback workers, idempotent result POSTs, typed errors/timeouts, and never enter local dispatch. |
 | 5. Controls, timeout, disconnect, replay | Complete | Durable idempotent controls implement `after_current_call` and `immediate`, including typed cancellation, exact caller stop reasons, startup-safe runtime interruption, the hard turn cap, and non-cancelling observer disconnects. |
 | 6. Workspace-delta turns | Complete | Strict versioned delta envelopes are safety-scanned, idempotently attached only to existing workshop sessions, queued on the chat lane as durable internal turns, and run with zero client tools plus local `spawn_agent` denied. |
-| 7-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
+| 7. Autonomous wake delivery | Complete | Producer-stable durable turns are announced with a direction-specific authenticated callback; 2xx gates producer ack, retryable failures preserve claim/reuse, and all 4xx become durable visible dead letters without retry loops. |
+| 8. Hardening and final verification | Pending | Follow build order in B10; update this table at the phase boundary. |
 
 Phase-1 verification notes:
 
@@ -106,6 +107,21 @@ Phase-6 verification notes:
 
 - Focused protocol/storage/HTTP/turn/policy tests pass at 68 tests. The canonical broader boundary suite passes 356 tests across every workshop module plus agent cache, platform policy, config, completion delivery, and pinned-session handling. Ruff and `git diff --check` pass.
 - The repository-wide runner completed all 2,139 files with 43,670 passing tests. Only the five unchanged production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH fixture expectations). The same four loaded-host files reached the runner's 300-second per-file cap (`test_25107_stale_base_url_api_mode.py`, `test_primary_runtime_restore.py`, `test_provider_fallback.py`, and `test_run_agent.py`). No phase-6 or adjacent file failed or timed out, and the prior temporary-storage quota failures did not recur.
+
+Phase-7 implementation notes:
+
+- `GatewayRunner` now stamps every durable completion notification with an internal producer type/id. Process incarnations include a digest of their spawn epoch; child and cron identities use their authoritative delegation/execution IDs. The existing async-delegation claim is still released on adapter failure and acknowledged only after adapter acceptance.
+- `WorkshopAdapter.handle_message(internal=True)` creates one autonomous turn per producer before contacting Cloudflare. It installs the live event tail before the outbound POST, so a DO that attaches immediately cannot race an ownerless queued row. A stable `Idempotency-Key` and matching body field bind the callback to the same turn.
+- The callback uses `WORKSHOP_WAKE_TOKEN`, a bounded timeout, disabled redirects, and no response-body/secret logging. Any 2xx marks the durable wake delivered and launches/reuses the queued turn. Network, timeout, 3xx, and 5xx failures keep it pending and raise into the existing claim/retry pipeline. Every 4xx, including 429 per the approved decision, marks a durable dead letter, terminates an unstarted turn as `wake_rejected`, emits a loud structured error, updates live runtime status, and returns acceptance so the producer cannot hot-loop.
+- `GET /api/workshop/v1/health` is protected by `WORKSHOP_API_KEY` and returns `degraded` plus the durable dead-letter count, including after restart. Startup recovery exposes an accepted-but-unfinished autonomous turn as `interrupted`; the producer wake record remains available for audit/retry classification.
+- Pinned child results validate the original session row before use. Producer types without a captured parent epoch (notably cron and legacy process completions) may use only the currently mapped existing active workshop session; they never create or revive one.
+- Autonomous producers have no fresh caller-granted tool catalog, so their turns deliberately receive zero remote workshop tools. Reusing a prior catalog would persist capability authority across turns and is not implemented without an explicit orchestrator decision.
+- The wake body carries the relative `events_path`. Hermes has no authoritative configured public base URL; the DO must resolve this path against the same Hermes API origin it already uses.
+
+Phase-7 verification notes:
+
+- The focused workshop plus completion/session-routing suite is green at 137 tests; the final canonical wake slice is 64/64. Tests cover exact outbound auth/idempotency, 2xx/4xx/5xx/transport classification, durable attempt transitions, retry with the same turn, immediate DO attachment ownership, empty autonomous catalog, current/pinned epochs, permanent dead-letter no-hot-loop behavior, authenticated health, and restart-visible interruption. Ruff, byte compilation, and `git diff --check` pass.
+- The repository-wide runner completed all 2,140 files with 43,704 passing tests. The same five production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH fixture expectations). The three known loaded-host files `test_25107_stale_base_url_api_mode.py`, `test_primary_runtime_restore.py`, and `test_run_agent.py` reached the runner's per-file cap; no phase-7 or adjacent file failed or timed out.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 
@@ -482,7 +498,7 @@ Use the existing child/cron fresh-turn pipeline, with stronger workshop acceptan
 1. A `spawn_result` is claimed by the existing watcher and routed to the original `Platform("workshop")` source with pinned parent session ID.
 2. `WorkshopAdapter.handle_message(internal=True)` creates a durable autonomous workshop turn keyed by producer identity (`spawn_result/delegation_id`, `cron_result/execution_id`, or another stable ID).
 3. It POSTs the configured public HTTPS wake URL with `workspace_id`, `chat_id`, Hermes `session_id`, `turn_id`, event-stream URL, producer type/ID, and idempotency key.
-4. Only after a 2xx acknowledgement does it call/schedule the base processing path and return success. A retryable network/5xx failure raises so `_deliver_completion_notification()` releases the child claim. A permanent 4xx records a loud terminal delivery failure and must not hot-loop.
+4. The adapter installs a live event tail before the POST. Only after a 2xx acknowledgement does it launch the adapter-owned workshop execution path and return success. A retryable network/3xx/5xx failure raises so `_deliver_completion_notification()` releases the child claim. A permanent 4xx records a loud terminal delivery failure and does not hot-loop.
 5. The DO attaches to `GET .../events?after_seq=...`; events produced before attachment are replayed from the ledger.
 
 This recommended direction means wake announces an already-created autonomous Hermes turn. It is better aligned with the current claim/ack pipeline than asking the DO to POST a second no-input turn. The latter creates two authorities for turn creation and a race between producer acknowledgement and callback ingress.
@@ -619,6 +635,8 @@ Suggested build order inside Hermes:
 - **Feedback loops:** workspace-delta turns must not automatically mutate the workspace merely because the delta arrived. Narrow remote tools and make the DO's own gatekeeper/idempotency authoritative.
 - **Tool count drift in the design doc:** it says 13 tools (`cloudflare-os-integration.md:89-92`) but also describes adding `renderUI` later (`cloudflare-os-integration.md:142-168`). Treat schemas as versioned runtime input, not a hard-coded count, while enforcing a maximum.
 - **Ingress wording:** “outbound-only” at `cloudflare-os-integration.md:122-124` can only describe the wake call. Turns, tool results, deltas, and controls are inbound through the existing public tunnel.
+- **Autonomous catalog authority is unspecified:** client tool schemas are granted on each caller-created turn. A child/cron wake has no new schema grant. Hermes therefore runs autonomous turns with zero remote workshop tools; silently reusing the previous catalog would turn transient per-turn input into durable capability authority.
+- **Hermes has no public-origin setting for wake event URLs:** the callback can truthfully provide a relative `events_path`, but cannot construct an absolute URL from `wake_url` (which identifies Cloudflare, not Hermes). The DO must resolve it against its configured Hermes API origin unless a separate managed public-origin field is approved.
 
 ## (D) Open questions for the orchestrator
 
@@ -640,3 +658,5 @@ Suggested build order inside Hermes:
 16. Are action approvals meant to be workshop tool results, `end_turn` pauses followed by a new turn, or a distinct resumable control exchange? A process-spanning paused SDK generator is not currently durable.
 17. Is profile multiplexing irrelevant in production as currently configured (`gateway.multiplex_profiles: false`), or must workshop route/profile prefixes be designed now for future multi-profile use?
 18. Should completed workshop events live in the shared `state.db` for Litestream recovery (recommended) or a separate database? A separate database would require new backup/restore operations and weaken the stated durability story.
+19. May an autonomous wake turn invoke workshop-remote tools? If yes, what fresh signed/catalog grant authorizes them: catalog embedded in the producer record, a catalog returned by the wake 2xx, or a new caller turn? Hermes currently supplies zero remote tools rather than persisting stale authority.
+20. The wake payload currently returns a relative `events_path`. Will the DO resolve it against its configured Hermes API origin, or should managed configuration add an explicit Hermes public base URL for an absolute `events_url`?

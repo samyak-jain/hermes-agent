@@ -5,13 +5,15 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from types import SimpleNamespace
 import time
+from unittest.mock import MagicMock
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import build_session_key
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource, build_session_key
 from agent.codex_runtime import make_codex_app_server_event_bridge
 from plugins.platforms.workshop.adapter import WorkshopAdapter
 from plugins.platforms.workshop.auth import WorkshopAuthenticator
@@ -20,6 +22,10 @@ from plugins.platforms.workshop.storage import WorkshopLedger
 from plugins.platforms.workshop.turns import (
     WorkshopRemoteCallTimeout,
     WorkshopTurnCoordinator,
+)
+from plugins.platforms.workshop.wake import (
+    WorkshopWakeRejectedError,
+    WorkshopWakeRetryableError,
 )
 
 
@@ -130,6 +136,48 @@ def _sse_records(body: str):
         for line in body.splitlines()
         if line.startswith("data: ")
     ]
+
+
+class _FakeWakeClient:
+    def __init__(self, outcomes=None, before_deliver=None):
+        self.outcomes = list(outcomes or [None])
+        self.before_deliver = before_deliver
+        self.calls = []
+
+    async def deliver(self, payload, *, idempotency_key):
+        if self.before_deliver is not None:
+            self.before_deliver(payload)
+        self.calls.append((payload, idempotency_key))
+        outcome = self.outcomes.pop(0) if self.outcomes else None
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+
+def _wake_event(*, producer_type="spawn_result", producer_id="delegation-1"):
+    return MessageEvent(
+        text="[SYSTEM: A delegated task completed]",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform("workshop"),
+            chat_id="workspace-1",
+            thread_id="chat-1",
+            chat_type="thread",
+            profile=None,
+        ),
+        message_id=f"wake:{producer_id}",
+        internal=True,
+        metadata={
+            "gateway_session_id": "session-1",
+            "_completion_producer_type": producer_type,
+            "_completion_producer_id": producer_id,
+        },
+    )
+
+
+async def _await_turn(adapter, turn_id):
+    live = adapter.turns._live.get(turn_id)
+    if live is not None and live.task is not None:
+        await live.task
 
 
 @pytest.mark.asyncio
@@ -953,3 +1001,121 @@ async def test_turn_duration_cap_aborts_and_interrupts(tmp_path):
 
     assert records[-1]["status"] == "aborted"
     assert records[-1]["stop_reason"] == "turn_timeout"
+
+
+@pytest.mark.asyncio
+async def test_wake_announces_durable_turn_before_launch_and_uses_empty_catalog(
+    tmp_path,
+):
+    captured = {}
+
+    async def handler(event):
+        captured["metadata"] = event.metadata
+        return {"final_response": "Autonomous follow-up complete"}
+
+    adapter, _runner, store = _adapter(tmp_path, handler)
+    store.current = "session-1"
+
+    def before_deliver(payload):
+        record = adapter.ledger.get_turn(payload["turn_id"])
+        assert record is not None
+        assert record.state == "queued"
+        assert payload["turn_id"] in adapter.turns._live
+
+    wake_client = _FakeWakeClient(before_deliver=before_deliver)
+    adapter._wake_client = wake_client
+    await adapter.handle_message(_wake_event())
+
+    payload, idempotency_key = wake_client.calls[0]
+    await _await_turn(adapter, payload["turn_id"])
+    turn = adapter.ledger.get_turn(payload["turn_id"])
+    wake = adapter.ledger.get_wake("spawn_result", "delegation-1")
+
+    assert payload["events_path"] == (
+        f"/api/workshop/v1/turns/{payload['turn_id']}/events"
+    )
+    assert payload["session_id"] == "session-1"
+    assert payload["idempotency_key"] == idempotency_key
+    assert turn is not None and turn.state == "completed"
+    assert wake is not None and (wake.state, wake.attempts) == ("delivered", 1)
+    assert captured["metadata"]["workshop_tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_retryable_wake_reuses_turn_and_defers_completion_ack(tmp_path):
+    async def handler(_event):
+        return {"final_response": "done"}
+
+    adapter, _runner, store = _adapter(tmp_path, handler)
+    store.current = "session-1"
+    adapter._wake_client = _FakeWakeClient(
+        outcomes=[WorkshopWakeRetryableError("temporary"), None]
+    )
+    event = _wake_event(producer_id="delegation-retry")
+
+    with pytest.raises(WorkshopWakeRetryableError):
+        await adapter.handle_message(event)
+    first = adapter.ledger.get_wake("spawn_result", "delegation-retry")
+    assert first is not None and (first.state, first.attempts) == ("pending", 1)
+
+    await adapter.handle_message(event)
+    payloads = [call[0] for call in adapter._wake_client.calls]
+    assert payloads[0]["turn_id"] == payloads[1]["turn_id"]
+    await _await_turn(adapter, payloads[1]["turn_id"])
+    delivered = adapter.ledger.get_wake("spawn_result", "delegation-retry")
+    assert delivered is not None and (delivered.state, delivered.attempts) == (
+        "delivered",
+        2,
+    )
+    turn = adapter.ledger.get_turn(payloads[1]["turn_id"])
+    assert turn is not None and turn.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_unpinned_cron_wake_uses_only_the_current_existing_epoch(tmp_path):
+    async def handler(_event):
+        return {"final_response": "done"}
+
+    adapter, _runner, store = _adapter(tmp_path, handler)
+    store.current = "session-1"
+    adapter._wake_client = _FakeWakeClient()
+    event = _wake_event(producer_type="cron_result", producer_id="execution-1")
+    event.metadata.pop("gateway_session_id")
+
+    await adapter.handle_message(event)
+    payload = adapter._wake_client.calls[0][0]
+    await _await_turn(adapter, payload["turn_id"])
+
+    assert payload["session_id"] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_permanent_wake_rejection_dead_letters_without_hot_loop(
+    tmp_path, caplog
+):
+    async def handler(_event):
+        raise AssertionError("dead-lettered turn must not launch")
+
+    adapter, runner, store = _adapter(tmp_path, handler)
+    store.current = "session-1"
+    runner._update_platform_runtime_status = MagicMock()
+    adapter._wake_client = _FakeWakeClient(
+        outcomes=[WorkshopWakeRejectedError(403)]
+    )
+    event = _wake_event(producer_type="cron_result", producer_id="execution-denied")
+
+    with caplog.at_level("ERROR"):
+        await adapter.handle_message(event)
+        await adapter.handle_message(event)
+
+    assert len(adapter._wake_client.calls) == 1
+    wake = adapter.ledger.get_wake("cron_result", "execution-denied")
+    assert wake is not None and (wake.state, wake.attempts) == (
+        "dead_letter",
+        1,
+    )
+    turn = adapter.ledger.get_turn(wake.turn_id)
+    assert turn is not None and turn.state == "error"
+    assert turn.stop_reason == "wake_rejected"
+    assert "workshop_wake_dead_letter" in caplog.text
+    runner._update_platform_runtime_status.assert_called_once()

@@ -131,6 +131,21 @@ class WorkshopDeltaRecord:
         return cls(**dict(row))
 
 
+@dataclass(frozen=True)
+class WorkshopWakeRecord:
+    producer_type: str
+    producer_id: str
+    turn_id: str
+    state: str
+    attempts: int
+    last_error: str | None
+    updated_at: float
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "WorkshopWakeRecord":
+        return cls(**dict(row))
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS workshop_turns (
     turn_id TEXT PRIMARY KEY,
@@ -959,6 +974,68 @@ class WorkshopLedger:
                        last_error=?, updated_at=?
                    WHERE producer_type=? AND producer_id=?""",
                 (error[:2048], time.time(), producer_type, producer_id),
+            )
+            if cursor.rowcount != 1:
+                raise WorkshopNotFoundError("unknown workshop wake")
+
+        self._write(write)
+
+    def get_wake(
+        self, producer_type: str, producer_id: str
+    ) -> WorkshopWakeRecord | None:
+        def read(conn: sqlite3.Connection):
+            row = conn.execute(
+                """SELECT * FROM workshop_wakes
+                   WHERE producer_type=? AND producer_id=?""",
+                (producer_type, producer_id),
+            ).fetchone()
+            return WorkshopWakeRecord.from_row(row) if row is not None else None
+
+        return self._read(read)
+
+    def mark_wake_retryable(
+        self, *, producer_type: str, producer_id: str, error: str
+    ) -> None:
+        self._mark_wake_attempt(
+            producer_type=producer_type,
+            producer_id=producer_id,
+            state="pending",
+            error=error,
+        )
+
+    def mark_wake_delivered(
+        self, *, producer_type: str, producer_id: str
+    ) -> None:
+        self._mark_wake_attempt(
+            producer_type=producer_type,
+            producer_id=producer_id,
+            state="delivered",
+            error=None,
+        )
+
+    def _mark_wake_attempt(
+        self,
+        *,
+        producer_type: str,
+        producer_id: str,
+        state: str,
+        error: str | None,
+    ) -> None:
+        if state not in {"pending", "delivered"}:
+            raise ValueError(f"invalid workshop wake state: {state}")
+
+        def write(conn: sqlite3.Connection) -> None:
+            cursor = conn.execute(
+                """UPDATE workshop_wakes
+                   SET state=?, attempts=attempts+1, last_error=?, updated_at=?
+                   WHERE producer_type=? AND producer_id=?""",
+                (
+                    state,
+                    error[:2048] if error else None,
+                    time.time(),
+                    producer_type,
+                    producer_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise WorkshopNotFoundError("unknown workshop wake")
