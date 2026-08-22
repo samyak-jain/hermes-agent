@@ -74,6 +74,21 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         assert agent._interrupt_thread_signal_pending is True
         agent._codex_session.request_interrupt.assert_called_once_with()
 
+    def test_raising_codex_session_does_not_swallow_discord_interrupt(self):
+        agent = self._make_bare_agent()
+        agent.platform = "discord"
+        agent._codex_session = MagicMock()
+        agent._codex_session.request_interrupt.side_effect = RuntimeError(
+            "shim unavailable"
+        )
+
+        agent.interrupt("new Discord message")
+
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "new Discord message"
+        assert agent._interrupt_thread_signal_pending is True
+        agent._codex_session.request_interrupt.assert_called_once_with()
+
     def test_cron_interrupt_keeps_inline_abort_and_signals_codex_session(self):
         agent = self._make_bare_agent()
         agent.platform = "cron"

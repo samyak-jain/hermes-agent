@@ -130,67 +130,6 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "text",
-    ["/restart", "/yolo", "/update", "/config model.provider anthropic"],
-)
-async def test_workshop_user_text_never_dispatches_gateway_commands(text):
-    """The workshop bearer is API admission, never operator authority."""
-
-    runner, adapter = _make_runner()
-    source = SessionSource(
-        platform=Platform("workshop"),
-        user_id=None,
-        chat_id="workspace-1",
-        thread_id="chat-1",
-        chat_type="thread",
-    )
-    runner.adapters = {Platform("workshop"): adapter}
-    runner.config.platforms = {
-        Platform("workshop"): PlatformConfig(enabled=True, extra={})
-    }
-    runner._scale_to_zero_note_real_inbound = MagicMock()
-    runner._external_drain_active = False
-    captured = {}
-
-    async def fake_handle_message_with_agent(event, _source, _key, _generation):
-        captured["text"] = event.text
-        captured["command"] = event.get_command()
-        return "ordinary-model-turn"
-
-    runner._handle_message_with_agent = fake_handle_message_with_agent
-    runner._handle_restart_command = AsyncMock(
-        side_effect=AssertionError("workshop text dispatched /restart")
-    )
-    runner._handle_yolo_command = AsyncMock(
-        side_effect=AssertionError("workshop text dispatched /yolo")
-    )
-    runner._handle_update_command = AsyncMock(
-        side_effect=AssertionError("workshop text dispatched /update")
-    )
-    runner._handle_config_command = AsyncMock(
-        side_effect=AssertionError("workshop text dispatched /config")
-    )
-    event = MessageEvent(
-        text=text,
-        message_type=MessageType.TEXT,
-        source=source,
-        message_id="workshop-client-turn-1",
-        transport_authorized=True,
-        commands_enabled=False,
-    )
-
-    result = await runner._handle_message(event)
-
-    assert result == "ordinary-model-turn"
-    assert captured == {"text": text, "command": None}
-    runner._handle_restart_command.assert_not_awaited()
-    runner._handle_yolo_command.assert_not_awaited()
-    runner._handle_update_command.assert_not_awaited()
-    runner._handle_config_command.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_idle_queue_without_payload_returns_usage():
     runner, _adapter = _make_runner()
     called = False

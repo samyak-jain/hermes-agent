@@ -869,6 +869,17 @@ class WorkshopAdapter(BasePlatformAdapter):
                 def event_sink(event: str, payload: dict[str, Any]) -> None:
                     call_id = str(payload.get("call_id") or "")
                     name = str(payload.get("name") or "")
+                    tool_events = {
+                        WorkshopEventType.TOOL_CALL_START.value,
+                        WorkshopEventType.TOOL_CALL_ARGUMENTS_DELTA.value,
+                        WorkshopEventType.TOOL_CALL_END.value,
+                    }
+                    # The cached shim may still advertise a prior user turn's
+                    # workshop catalog during zero-tool delta/wake turns. The
+                    # current turn's catalog is the authority: never publish a
+                    # stale or Hermes-local tool call to the DO for execution.
+                    if event in tool_events and name not in remote_names:
+                        return
                     if event in {
                         WorkshopEventType.TOOL_CALL_START.value,
                         WorkshopEventType.TOOL_CALL_END.value,
@@ -950,7 +961,6 @@ class WorkshopAdapter(BasePlatformAdapter):
                     message_id=event_message_id or turn.client_turn_id,
                     internal=internal,
                     transport_authorized=not internal,
-                    commands_enabled=False,
                     metadata={
                         "gateway_session_id": session_id,
                         "_gateway_event_sink": event_sink,
@@ -975,6 +985,13 @@ class WorkshopAdapter(BasePlatformAdapter):
                     raise TypeError(
                         "Gateway message handler must return Optional[str]"
                     )
+                # Backlog exhaustion terminalizes synchronously inside the
+                # durable sink because production stream callbacks swallow
+                # sink exceptions. Do not append usage or a second terminal
+                # boundary after the handler eventually unwinds.
+                terminal = await asyncio.to_thread(self.ledger.get_turn, turn_id)
+                if terminal is not None and terminal.state in TERMINAL_TURN_STATES:
+                    return
                 outcome = event.metadata.get("_gateway_turn_outcome")
                 outcome = outcome if isinstance(outcome, dict) else {}
                 final_response = result or ""

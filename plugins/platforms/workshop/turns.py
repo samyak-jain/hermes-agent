@@ -13,7 +13,11 @@ import time
 from typing import Any, Awaitable, Callable
 
 from .protocol import WorkshopEvent, WorkshopEventType
-from .storage import TERMINAL_TURN_STATES, WorkshopLedger
+from .storage import (
+    TERMINAL_TURN_STATES,
+    WorkshopBacklogExceeded,
+    WorkshopLedger,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -170,7 +174,25 @@ class WorkshopTurnCoordinator:
         deterministic ordering and applies backlog pressure at the producer.
         """
 
-        item = self.ledger.append_event(turn_id=turn_id, event=event, payload=payload)
+        try:
+            item = self.ledger.append_event(
+                turn_id=turn_id, event=event, payload=payload
+            )
+        except WorkshopBacklogExceeded:
+            # Agent streaming callbacks intentionally swallow producer
+            # exceptions. Persist and publish the terminal boundary here, at
+            # the actual durable-drop site, so completion can never be
+            # reported after a truncated stream.
+            terminal_items = self.ledger.fail_backlog_exhausted(
+                turn_id=turn_id,
+                message="Workshop turn exceeded its durable event backlog limit",
+            )
+            state = self._live.get(turn_id)
+            if state is not None:
+                for terminal_item in terminal_items:
+                    state.publish(terminal_item)
+            self._wake_remote_waiters(turn_id)
+            raise
         state = self._live.get(turn_id)
         if state is not None:
             state.publish(item)

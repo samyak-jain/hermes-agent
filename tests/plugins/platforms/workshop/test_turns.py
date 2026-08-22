@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 from types import SimpleNamespace
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -362,13 +363,28 @@ async def test_provider_failure_emits_error_and_error_terminal_boundary(tmp_path
 @pytest.mark.asyncio
 async def test_backlog_exhaustion_still_emits_a_terminal_error_boundary(tmp_path):
     async def handler(event):
-        event.metadata["_gateway_event_sink"](
-            "text.delta", {"delta": "x" * 4096}
-        )
-        raise AssertionError("the oversized event must fail synchronously")
+        # Exercise the production callback boundary: AIAgent swallows a sink
+        # exception and keeps consuming model deltas.
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.stream_delta_callback = lambda delta: event.metadata[
+            "_gateway_event_sink"
+        ]("text.delta", {"delta": delta})
+        agent._stream_callback = None
+        agent._stream_needs_break = False
+        agent._stream_think_scrubber = None
+        agent._stream_context_scrubber = None
+        agent._current_streamed_assistant_text = ""
+        agent._stream_writer_superseded = lambda: False
+        agent._note_dropped_stream_writer = lambda _source: None
+
+        for _ in range(200):
+            agent._fire_stream_delta("x" * 1024)
+        return _gateway_result(event, agent._current_streamed_assistant_text)
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
-    adapter.ledger.max_event_backlog_bytes = 1024
+    adapter.ledger.max_event_backlog_bytes = 64 * 1024
     async with TestClient(TestServer(_app(adapter))) as client:
         response = await client.post(
             "/api/workshop/v1/turns", json=_body(), headers=_headers()
@@ -379,6 +395,7 @@ async def test_backlog_exhaustion_still_emits_a_terminal_error_boundary(tmp_path
     assert records[-2]["code"] == "event_backlog_exceeded"
     assert records[-1]["status"] == "error"
     assert records[-1]["stop_reason"] == "event_backlog_exceeded"
+    assert adapter.ledger.get_turn(records[0]["turn_id"]).state == "error"
 
 
 @pytest.mark.asyncio
@@ -464,6 +481,196 @@ async def test_workspace_delta_is_internal_idempotent_and_has_no_remote_tools(tm
     assert '<workspace_delta>\n{"data":{"path":"README.md"}' in delta_event.text
     assert event_records[-1]["event"] == "turn.end"
     assert event_records[-1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_delta_stale_remote_tool_is_denied_and_never_published(tmp_path):
+    host_responses = []
+
+    async def handler(event):
+        if event.metadata.get("automated_trigger") != "workshop_delta":
+            return _gateway_result(event, "catalog established")
+
+        from agent.codex_runtime import (
+            _dispatch_app_server_host_tool,
+            make_codex_app_server_event_bridge,
+        )
+        from agent.transports.codex_app_server_session import CodexAppServerSession
+
+        bridge = make_codex_app_server_event_bridge(
+            SimpleNamespace(
+                _external_event_sink=event.metadata["_gateway_event_sink"],
+                _fire_reasoning_delta=None,
+                tool_progress_callback=None,
+                tool_start_callback=None,
+            )
+        )
+        bridge({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "mcpToolCall",
+                    "id": "toolu_stale",
+                    "providerCallId": "toolu_stale",
+                    "server": "agent-runtime",
+                    "tool": "writeFile",
+                    "arguments": {},
+                }
+            },
+        })
+        bridge({
+            "method": "item/toolCall/argumentsDelta",
+            "params": {
+                "callId": "toolu_stale",
+                "name": "writeFile",
+                "delta": '{"path":"a.txt",',
+            },
+        })
+        bridge({
+            "method": "item/toolCall/argumentsCompleted",
+            "params": {
+                "callId": "toolu_stale",
+                "name": "writeFile",
+                "arguments": {"path": "a.txt", "content": "pwn"},
+            },
+        })
+
+        # Mirror the reused AIAgent's per-turn authority reset: the stale shim
+        # can ask, but the current delta turn has no external names and the
+        # host bridge must return an explicit tool error.
+        denied_agent = SimpleNamespace(
+            _external_tool_names=frozenset(),
+            valid_tool_names=set(),
+            _invoke_tool=lambda *_args, **_kwargs: pytest.fail(
+                "denied stale tool entered local dispatch"
+            ),
+        )
+        session = object.__new__(CodexAppServerSession)
+        session._client = SimpleNamespace(
+            respond=lambda _rid, payload: host_responses.append(payload)
+        )
+        session._tool_callback = lambda name, arguments, call_id: (
+            _dispatch_app_server_host_tool(
+                denied_agent, name, arguments, call_id
+            )
+        )
+        session._host_tool_state_lock = threading.Lock()
+        session._host_tool_inflight = 0
+        session._host_tool_end_turn = False
+        session._respond_host_tool({
+            "id": 1,
+            "params": {
+                "name": "writeFile",
+                "arguments": {"path": "a.txt", "content": "pwn"},
+                "toolCallId": "toolu_stale",
+            },
+        })
+        return _gateway_result(event, "stale tool denied")
+
+    user_tools = [
+        {
+            "name": "writeFile",
+            "description": "Write a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        user_response = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(tools=user_tools),
+            headers=_headers(),
+        )
+        await user_response.text()
+        delta_response = await client.post(
+            "/api/workshop/v1/sessions/workspace-1/chat-1/deltas",
+            json=_delta_body(),
+            headers=_headers(),
+        )
+        accepted = await delta_response.json()
+        events_response = await client.get(
+            accepted["events_path"], headers=_headers()
+        )
+        records = _sse_records(await events_response.text())
+
+    assert host_responses and host_responses[-1]["isError"] is True
+    assert "not enabled for this session" in host_responses[-1]["content"]
+    assert not any(item["event"].startswith("tool_call.") for item in records)
+    assert adapter.ledger.get_tool_call(accepted["turn_id"], "toolu_stale") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["/restart", "/yolo", "/update", "/config model.provider anthropic"],
+)
+async def test_workshop_http_turn_is_structurally_not_an_operator_command(
+    tmp_path, text
+):
+    """Exercise HTTP -> adapter event construction -> real gateway dispatch."""
+
+    from tests.gateway.test_gateway_command_dispatch_minimal import _make_runner
+
+    gateway, _transport = _make_runner()
+    captured = {}
+
+    async def model_turn(event, _source, _key, _generation):
+        captured["text"] = event.text
+        captured["command"] = event.get_command()
+        captured["transport_authorized"] = event.transport_authorized
+        captured["platform"] = event.source.platform.value
+        return "ordinary-model-turn"
+
+    gateway._handle_message_with_agent = model_turn
+    gateway._handle_restart_command = AsyncMock(
+        side_effect=AssertionError("workshop text dispatched /restart")
+    )
+    gateway._handle_yolo_command = AsyncMock(
+        side_effect=AssertionError("workshop text dispatched /yolo")
+    )
+    gateway._handle_update_command = AsyncMock(
+        side_effect=AssertionError("workshop text dispatched /update")
+    )
+    gateway._handle_config_command = AsyncMock(
+        side_effect=AssertionError("workshop text dispatched /config")
+    )
+    gateway._is_user_authorized = lambda _source: False
+    gateway._scale_to_zero_note_real_inbound = MagicMock()
+    gateway._external_drain_active = False
+
+    adapter, _placeholder, _store = _adapter(tmp_path, gateway._handle_message)
+    gateway.adapters = {Platform("workshop"): adapter}
+    gateway.config.platforms = {
+        Platform("workshop"): PlatformConfig(enabled=True, extra={})
+    }
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(text=text),
+            headers=_headers(),
+        )
+        records = _sse_records(await response.text())
+
+    assert response.status == 200
+    assert captured == {
+        "text": text,
+        "command": None,
+        "transport_authorized": True,
+        "platform": "workshop",
+    }
+    assert any(item.get("delta") == "ordinary-model-turn" for item in records)
+    gateway._handle_restart_command.assert_not_awaited()
+    gateway._handle_yolo_command.assert_not_awaited()
+    gateway._handle_update_command.assert_not_awaited()
+    gateway._handle_config_command.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -667,12 +874,34 @@ async def test_runtime_raw_events_stream_live_but_only_semantic_events_persist(t
                 "arguments": {"path": "README.md"},
             },
         })
+        event.metadata["_workshop_tool_callback"](
+            "workshop_write",
+            {"path": "README.md"},
+            "toolu_exact_123",
+        )
         return _gateway_result(event, "done")
 
     adapter, _runner, _store = _adapter(tmp_path, handler)
+    adapter.turns.wait_for_remote_result = MagicMock(
+        return_value=SimpleNamespace(content={"ok": True}, is_error=False)
+    )
+    tools = [
+        {
+            "name": "workshop_write",
+            "description": "Write a workshop file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        }
+    ]
     async with TestClient(TestServer(_app(adapter))) as client:
         response = await client.post(
-            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+            "/api/workshop/v1/turns",
+            json=_body(tools=tools),
+            headers=_headers(),
         )
         records = _sse_records(await response.text())
 
