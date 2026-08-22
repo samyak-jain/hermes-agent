@@ -185,7 +185,12 @@ async def test_delta_path_and_body_identity_must_match(tmp_path):
         "delta_id": "delta-1",
         "workspace_id": "workspace-other",
         "chat_id": "chat-1",
-        "payload": {"kind": "file_changed"},
+        "payload": {
+            "type": "file_changed",
+            "version": 1,
+            "timestamp": "2026-08-22T12:00:00Z",
+            "data": {},
+        },
     }
     async with TestClient(TestServer(app)) as client:
         response = await client.post(

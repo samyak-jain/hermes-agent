@@ -153,10 +153,85 @@ def test_delta_requires_body_and_route_safe_ids():
             "delta_id": "delta-1",
             "workspace_id": "workspace-1",
             "chat_id": "chat-1",
-            "payload": {"kind": "file_changed", "path": "README.md"},
+            "payload": {
+                "type": "file_changed",
+                "version": 1,
+                "timestamp": "2026-08-22T12:00:00Z",
+                "data": {"path": "README.md"},
+            },
         }
     )
-    assert delta.payload["kind"] == "file_changed"
+    assert delta.payload["type"] == "file_changed"
+    assert delta.canonical_payload == (
+        '{"data":{"path":"README.md"},"timestamp":"2026-08-22T12:00:00Z",'
+        '"type":"file_changed","version":1}'
+    )
+
+
+@pytest.mark.parametrize(
+    "payload,code",
+    [
+        (
+            {
+                "type": "file_changed",
+                "version": 2,
+                "timestamp": "2026-08-22T12:00:00Z",
+                "data": {},
+            },
+            "unsupported_delta_version",
+        ),
+        (
+            {
+                "type": "file_changed",
+                "version": 1,
+                "timestamp": "2026-08-22T12:00:00",
+                "data": {},
+            },
+            "invalid_delta_timestamp",
+        ),
+        (
+            {
+                "type": "file_changed",
+                "version": 1,
+                "timestamp": "2026-08-22T12:00:00Z",
+                "data": {},
+                "control": {"signal": "abort"},
+            },
+            "unknown_field",
+        ),
+    ],
+)
+def test_delta_envelope_is_strict(payload, code):
+    with pytest.raises(WorkshopProtocolError) as exc:
+        WorkshopDeltaRequest.from_dict(
+            {
+                "protocol_version": 1,
+                "delta_id": "delta-1",
+                "workspace_id": "workspace-1",
+                "chat_id": "chat-1",
+                "payload": payload,
+            }
+        )
+    assert exc.value.code == code
+
+
+def test_delta_data_has_bounded_collection_size():
+    with pytest.raises(WorkshopProtocolError) as exc:
+        WorkshopDeltaRequest.from_dict(
+            {
+                "protocol_version": 1,
+                "delta_id": "delta-1",
+                "workspace_id": "workspace-1",
+                "chat_id": "chat-1",
+                "payload": {
+                    "type": "many_changes",
+                    "version": 1,
+                    "timestamp": "2026-08-22T12:00:00+00:00",
+                    "data": list(range(257)),
+                },
+            }
+        )
+    assert exc.value.code == "delta_too_complex"
 
 
 def test_live_only_events_are_never_persistent():

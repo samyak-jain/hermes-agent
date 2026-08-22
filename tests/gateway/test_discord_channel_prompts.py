@@ -308,3 +308,63 @@ async def test_cron_result_turn_cannot_mutate_cron_jobs(monkeypatch, tmp_path):
     assert policy.allows("terminal")
     assert not policy.allows("cronjob")
     assert policy.source == "gateway.cron_result"
+
+
+@pytest.mark.asyncio
+async def test_workshop_delta_turn_cannot_spawn_children(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"agent": {"tool_policy": {"mode": "unrestricted"}}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {"core", "spawn", "memory"},
+    )
+    source = SessionSource(
+        platform=Platform("workshop"),
+        chat_type="thread",
+        chat_id="workspace-1",
+        thread_id="chat-1",
+    )
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="workspace changed",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="session-1",
+        session_key="agent:main:workshop:thread:workspace-1:chat-1",
+        automated_trigger="workshop_delta",
+        external_tool_schemas=[],
+        external_tool_catalog_version="empty-catalog",
+    )
+
+    assert result["final_response"] == "ok"
+    policy = _CapturingAgent.last_init["tool_policy"]
+    assert policy.allows("memory")
+    assert not policy.allows("spawn_agent")
+    assert policy.source == "gateway.workshop_delta"

@@ -19785,16 +19785,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         tool_policy = _resolve_tool_policy_for_source(user_config, source)
-        if automated_trigger == "cron_result":
+        if automated_trigger in {"cron_result", "workshop_delta"}:
             from agent.tool_policy import deny_tools
 
-            # A routed cron completion is untrusted automation entering an
-            # otherwise interactive session. It may perform useful follow-up
-            # work, but it must not mutate the scheduler that invoked it.
+            denied_names = (
+                {"cronjob"}
+                if automated_trigger == "cron_result"
+                else {"spawn_agent"}
+            )
+            policy_source = f"gateway.{automated_trigger}"
+            # Untrusted automation may perform useful local follow-up work,
+            # but it cannot recursively invoke its own producer class. A
+            # workspace delta also receives an empty external-tool catalog at
+            # ingress, so no remote workshop mutation tool reaches this turn.
             tool_policy = deny_tools(
                 tool_policy,
-                {"cronjob"},
-                source="gateway.cron_result",
+                denied_names,
+                source=policy_source,
             )
         _profile_terminal_registered = False
         _profile_name = str(source.profile or self._active_profile_name() or "default")

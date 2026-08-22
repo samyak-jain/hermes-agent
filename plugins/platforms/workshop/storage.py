@@ -117,6 +117,20 @@ class WorkshopToolCallRecord:
         )
 
 
+@dataclass(frozen=True)
+class WorkshopDeltaRecord:
+    workspace_id: str
+    chat_id: str
+    delta_id: str
+    turn_id: str | None
+    payload_digest: str
+    created_at: float
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "WorkshopDeltaRecord":
+        return cls(**dict(row))
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS workshop_turns (
     turn_id TEXT PRIMARY KEY,
@@ -982,12 +996,33 @@ class WorkshopLedger:
 
         return self._write(write)
 
+    def get_delta(
+        self, workspace_id: str, chat_id: str, delta_id: str
+    ) -> WorkshopDeltaRecord | None:
+        def read(conn: sqlite3.Connection):
+            row = conn.execute(
+                """SELECT * FROM workshop_deltas
+                   WHERE workspace_id=? AND chat_id=? AND delta_id=?""",
+                (workspace_id, chat_id, delta_id),
+            ).fetchone()
+            return WorkshopDeltaRecord.from_row(row) if row is not None else None
+
+        return self._read(read)
+
     def prune_completed(self, *, now: float | None = None) -> int:
         cutoff = (
             time.time() if now is None else now
         ) - self.completed_retention_seconds
 
         def write(conn: sqlite3.Connection) -> int:
+            conn.execute(
+                """DELETE FROM workshop_deltas WHERE turn_id IN (
+                       SELECT turn_id FROM workshop_turns
+                       WHERE state IN ('completed', 'error', 'aborted', 'interrupted')
+                         AND completed_at IS NOT NULL AND completed_at < ?
+                   )""",
+                (cutoff,),
+            )
             cursor = conn.execute(
                 """DELETE FROM workshop_turns
                    WHERE state IN ('completed', 'error', 'aborted', 'interrupted')

@@ -36,7 +36,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | 3. Raw runtime event bridge | Complete | Claude SDK partial events now preserve live thinking, exact provider `tool_use` IDs, raw argument fragments, and complete parsed arguments through the Codex shim into workshop SSE. Semantic events remain replayable while thinking/argument fragments remain live-only. |
 | 4. External tools and result callback | Complete | Strict client schemas merge after the policy-filtered local MCP surface with full registry collision rejection. Catalog digests bust the cached-agent signature; the superseded app-server is retired and the shim rebinds the same Claude session with the new catalog. Remote calls use exact provider IDs, durable pending rows, bounded parallel callback workers, idempotent result POSTs, typed errors/timeouts, and never enter local dispatch. |
 | 5. Controls, timeout, disconnect, replay | Complete | Durable idempotent controls implement `after_current_call` and `immediate`, including typed cancellation, exact caller stop reasons, startup-safe runtime interruption, the hard turn cap, and non-cancelling observer disconnects. |
-| 6-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
+| 6. Workspace-delta turns | Complete | Strict versioned delta envelopes are safety-scanned, idempotently attached only to existing workshop sessions, queued on the chat lane as durable internal turns, and run with zero client tools plus local `spawn_agent` denied. |
+| 7-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
 
 Phase-1 verification notes:
 
@@ -92,6 +93,19 @@ Phase-5 verification notes:
 
 - The focused control/runtime/storage suite is green at 104 tests after the final parallel-response barrier; the earlier broader phase slice passed 339 tests and the canonical modified-file slice passed 144. Ruff and `git diff --check` pass.
 - The repository-wide runner completed all 2,139 files with 43,603 passing tests. Fifty-nine tool failures were caused by the host `/tmp` quota; all 164 affected tests outside the known SSH baseline passed after removing only pytest-owned temporary directories and rerunning in isolation. The unchanged SSH file retains its production-base restricted-PATH/control-socket failures. The known Bedrock/model-catalog assertions remain, and four large baseline files hit the 300-second per-file cap under host load; the newly observed `test_primary_runtime_restore.py` hang isolates to its Nous-provider environment case, outside workshop control execution. No changed phase-5 file failed or timed out.
+
+Phase-6 implementation notes:
+
+- Delta ingress now requires a strict outer payload `{type, version: 1, timestamp, data}`. Type is route-safe, timestamp must be timezone-aware ISO 8601, and opaque `data` is bounded to 256 KiB, 16 levels, 4,096 nodes, 256 members per collection, and 64 KiB per string. Unknown outer fields, non-finite JSON, unsupported versions, and over-limit content fail before state mutation.
+- Canonical JSON is passed through the same loose assembled-content scanner used for cron re-entry. Instruction-like content and invisible-Unicode rewriting are rejected rather than silently transformed. The accepted payload is framed as an explicitly untrusted `<workspace_delta>` user turn; it never enters the cached system prompt.
+- Ingress resolves the deterministic workshop routing key with `peek_session_id()` and checks the active SQLite row when available. It never calls `get_or_create_session`; a missing or ended session returns 409. The DO can retry after its first user turn has established the lane.
+- A delta creates a normal durable workshop turn with the SHA-256 digest of the empty client catalog, records `(workspace, chat, delta_id, digest, turn_id)` before scheduling, and returns a stable event-stream path. Matching retries return the same turn; content reuse returns 409. The shared workshop lane serializes deltas behind user turns, and retention pruning removes delta identities with their completed turns.
+- The internal event is pinned to the resolved session, marked `automated_trigger="workshop_delta"`, and uses `workshop-delta:<delta_id>` as its stable message ID. Its external schema list is always empty. Gateway policy derives `gateway.workshop_delta` and denies local `spawn_agent` while retaining the rest of the approved local policy.
+
+Phase-6 verification notes:
+
+- Focused protocol/storage/HTTP/turn/policy tests pass at 68 tests. The canonical broader boundary suite passes 356 tests across every workshop module plus agent cache, platform policy, config, completion delivery, and pinned-session handling. Ruff and `git diff --check` pass.
+- The repository-wide runner completed all 2,139 files with 43,670 passing tests. Only the five unchanged production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH fixture expectations). The same four loaded-host files reached the runner's 300-second per-file cap (`test_25107_stale_base_url_api_mode.py`, `test_primary_runtime_restore.py`, `test_provider_fallback.py`, and `test_run_agent.py`). No phase-6 or adjacent file failed or timed out, and the prior temporary-storage quota failures did not recur.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 

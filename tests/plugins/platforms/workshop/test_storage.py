@@ -60,6 +60,38 @@ def test_turn_creation_is_idempotent_but_conflicting_reuse_fails(tmp_path):
         _turn(ledger, request_digest="different")
 
 
+def test_delta_record_is_idempotent_and_bound_to_one_turn(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+
+    assert ledger.record_delta(
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        delta_id="delta-1",
+        payload_digest="payload-a",
+        turn_id=turn.turn_id,
+    ) is True
+    assert ledger.record_delta(
+        workspace_id="workspace-1",
+        chat_id="chat-1",
+        delta_id="delta-1",
+        payload_digest="payload-a",
+        turn_id=turn.turn_id,
+    ) is False
+    record = ledger.get_delta("workspace-1", "chat-1", "delta-1")
+    assert record is not None
+    assert record.turn_id == turn.turn_id
+
+    with pytest.raises(WorkshopConflictError):
+        ledger.record_delta(
+            workspace_id="workspace-1",
+            chat_id="chat-1",
+            delta_id="delta-1",
+            payload_digest="payload-b",
+            turn_id=turn.turn_id,
+        )
+
+
 def test_replay_persists_text_and_complete_args_but_not_live_only_deltas(tmp_path):
     ledger = _ledger(tmp_path)
     turn, _ = _turn(ledger)

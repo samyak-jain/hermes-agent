@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import hashlib
 import json
@@ -25,7 +26,11 @@ MAX_ID_LENGTH = 128
 MAX_TOOL_NAME_LENGTH = 128
 MAX_TOOL_DESCRIPTION_LENGTH = 8 * 1024
 MAX_TURN_TEXT_BYTES = 1024 * 1024
-MAX_DELTA_BYTES = 1024 * 1024
+MAX_DELTA_BYTES = 256 * 1024
+MAX_DELTA_NODES = 4096
+MAX_DELTA_DEPTH = 16
+MAX_DELTA_COLLECTION_ITEMS = 256
+MAX_DELTA_STRING_BYTES = 64 * 1024
 MAX_METADATA_BYTES = 16 * 1024
 MAX_SCHEMA_DEPTH = 16
 MAX_SCHEMA_NODES = 4096
@@ -68,6 +73,7 @@ _TOOL_RESULT_FIELDS = frozenset({"protocol_version", "result", "is_error"})
 _DELTA_FIELDS = frozenset(
     {"protocol_version", "delta_id", "workspace_id", "chat_id", "payload"}
 )
+_DELTA_PAYLOAD_FIELDS = frozenset({"type", "version", "timestamp", "data"})
 
 # Deliberately matches only the semantics implemented by the current
 # jsonSchemaToZod converter.  Representative CF OS fixtures may justify adding
@@ -174,6 +180,68 @@ def _version(value: Any) -> int:
             f"protocol_version must be {PROTOCOL_VERSION}",
         )
     return PROTOCOL_VERSION
+
+
+def _validate_delta_data(
+    value: Any,
+    *,
+    path: str = "payload.data",
+    depth: int = 0,
+    counter: list[int] | None = None,
+) -> None:
+    """Bound opaque workspace data without interpreting it as control."""
+
+    if counter is None:
+        counter = [0]
+    counter[0] += 1
+    if depth > MAX_DELTA_DEPTH or counter[0] > MAX_DELTA_NODES:
+        raise WorkshopProtocolError(
+            "delta_too_complex", f"{path} exceeds the delta complexity limit"
+        )
+    if value is None or isinstance(value, (bool, int, float)):
+        canonical_json(value)
+        return
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > MAX_DELTA_STRING_BYTES:
+            raise WorkshopProtocolError(
+                "delta_value_too_large", f"{path} string is too large"
+            )
+        return
+    if isinstance(value, list):
+        if len(value) > MAX_DELTA_COLLECTION_ITEMS:
+            raise WorkshopProtocolError(
+                "delta_too_complex",
+                f"{path} may contain at most {MAX_DELTA_COLLECTION_ITEMS} items",
+            )
+        for index, item in enumerate(value):
+            _validate_delta_data(
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                counter=counter,
+            )
+        return
+    if isinstance(value, Mapping):
+        if len(value) > MAX_DELTA_COLLECTION_ITEMS:
+            raise WorkshopProtocolError(
+                "delta_too_complex",
+                f"{path} may contain at most {MAX_DELTA_COLLECTION_ITEMS} fields",
+            )
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key.encode("utf-8")) > 128:
+                raise WorkshopProtocolError(
+                    "invalid_delta", f"{path} contains an invalid field name"
+                )
+            _validate_delta_data(
+                item,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+                counter=counter,
+            )
+        return
+    raise WorkshopProtocolError(
+        "invalid_delta", f"{path} contains a non-JSON value"
+    )
 
 
 def _validate_schema(
@@ -490,7 +558,42 @@ class WorkshopDeltaRequest:
         value = _mapping(raw, "request")
         _reject_unknown(value, _DELTA_FIELDS, "request")
         _version(value.get("protocol_version"))
-        payload = dict(_mapping(value.get("payload"), "payload"))
+        payload_raw = _mapping(value.get("payload"), "payload")
+        _reject_unknown(payload_raw, _DELTA_PAYLOAD_FIELDS, "payload")
+        delta_type = _identifier(payload_raw.get("type"), "payload.type")
+        delta_version = payload_raw.get("version")
+        if isinstance(delta_version, bool) or delta_version != 1:
+            raise WorkshopProtocolError(
+                "unsupported_delta_version", "payload.version must be 1"
+            )
+        timestamp = payload_raw.get("timestamp")
+        if not isinstance(timestamp, str) or len(timestamp.encode("utf-8")) > 64:
+            raise WorkshopProtocolError(
+                "invalid_delta_timestamp",
+                "payload.timestamp must be a timezone-aware ISO 8601 string",
+            )
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise WorkshopProtocolError(
+                "invalid_delta_timestamp",
+                "payload.timestamp must be a timezone-aware ISO 8601 string",
+            ) from exc
+        if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+            raise WorkshopProtocolError(
+                "invalid_delta_timestamp",
+                "payload.timestamp must include a timezone offset",
+            )
+        if "data" not in payload_raw:
+            raise WorkshopProtocolError("invalid_delta", "payload.data is required")
+        data = payload_raw["data"]
+        _validate_delta_data(data)
+        payload = {
+            "type": delta_type,
+            "version": 1,
+            "timestamp": timestamp,
+            "data": data,
+        }
         if _byte_length(payload) > MAX_DELTA_BYTES:
             raise WorkshopProtocolError("delta_too_large", "payload is too large", status=413)
         return cls(
@@ -499,6 +602,14 @@ class WorkshopDeltaRequest:
             chat_id=_identifier(value.get("chat_id"), "chat_id"),
             payload=payload,
         )
+
+    @property
+    def canonical_payload(self) -> str:
+        return canonical_json(self.payload)
+
+    @property
+    def payload_digest(self) -> str:
+        return hashlib.sha256(self.canonical_payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
