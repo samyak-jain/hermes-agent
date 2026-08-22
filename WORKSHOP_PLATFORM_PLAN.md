@@ -9,7 +9,7 @@ These decisions supersede the open questions in section D:
 3. Workshop JSON Schema ingress is strict. Unsupported keywords are rejected; the shim converter grows only to cover representative Cloudflare OS fixtures under `fixtures/workshop-tool-schemas/` when supplied.
 4. `thinking.delta` is live-only and is never persisted in the workshop ledger.
 5. SSE disconnect never aborts a turn; only explicit control can abort.
-6. Replay is semantically complete. Persist all events except `thinking.delta` and `tool_call.arguments.delta`; persist `text.delta`, and carry complete arguments in `tool_call.end`.
+6. Replay is semantically complete. Persist all events except `thinking.delta` and `tool_call.arguments.delta`; persist `text.delta`. Remote workshop tools use `tool_call.*` and carry complete arguments in `tool_call.end` because the DO executes them. Hermes-local tools use a separate persisted `tool_activity` event containing only an allowlisted local tool name and `status: "started" | "completed" | "error"`; local call IDs, arguments, fragments, and results never cross the Kumo boundary.
 7. Client schemas may change mid-chat. A canonical schema digest participates in the cached-agent signature; a real change causes one cache miss and Claude-session rebind. `turn.started` returns the digest as `catalog_version`.
 8. Workshop-local authority is exactly `clarify`, `spawn_agent`, `memory`, `skills_list`, `skill_view`, `skill_manage`, `session_search`, `config`, and `soul`; its platform toolsets use `no_mcp` and exclude Discord.
 9. `workspace_delta` turns receive no remote tools and additionally deny local `spawn_agent`.
@@ -366,6 +366,7 @@ thinking.delta
 tool_call.start          {call_id, name}
 tool_call.arguments.delta {call_id, delta}
 tool_call.end            {call_id, arguments}
+tool_activity            {name, status}  # Hermes-local, structurally redacted
 usage
 turn.end                 {status, stop_reason, final_text?}
 error                    {code, message, retryable}
@@ -459,6 +460,7 @@ Add an explicit external-tool surface to `AIAgent`; do not mutate `agent.tools` 
   - change `_invoke_host_tool()` to route names in the immutable external map to `external_tool_dispatcher` and all others through the existing `valid_tool_names` plus `_invoke_tool()` path;
   - never let an external name fall back to local dispatch and never let a local name be shadowed;
   - extend event bridging for raw argument fragments with the provider tool-use ID/call ID.
+  - construct a separate name/status-only lifecycle signal for Hermes-local tools. The Workshop adapter must reconstruct its wire payload from the approved local-name and status allowlists; it must never filter or forward the runtime payload, arguments, result, preview, or call ID.
 - `agent/transports/codex_app_server_session.py`: carry schema origin/server metadata over `thread/start`; preserve a stable tool call ID from the shim; allow structured `{content,isError}` results without double-stringifying. Add a controlled schema-refresh/restart API only if the chosen cache strategy needs it.
 
 Recommended schema-change strategy: canonicalize/sort the remote definitions, hash them, put that digest in the cached-agent signature, and rebuild the cached `AIAgent`/app-server session only when the digest changes. A new shim process can re-bind the same Hermes host session and resume the stored Claude session while updating tools. Close the retired process before replacement. This trades one cache miss on a real schema change for a byte-stable tool surface during normal turns. Do not send a tools-update call every turn.

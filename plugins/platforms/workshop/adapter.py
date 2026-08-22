@@ -25,6 +25,7 @@ from .auth import (
 from .http import create_api_routes
 from .protocol import (
     COMPLETED_EVENT_RETENTION_SECONDS,
+    HERMES_WORKSHOP_LOCAL_TOOL_NAMES,
     MAX_ACTIVE_TURNS,
     MAX_CLIENT_TOOLS,
     MAX_EVENT_BACKLOG_BYTES,
@@ -861,6 +862,9 @@ class WorkshopAdapter(BasePlatformAdapter):
                 )
 
                 remote_names = frozenset(tool.name for tool in turn.tools)
+                local_names = HERMES_WORKSHOP_LOCAL_TOOL_NAMES
+                if automated_trigger == "workshop_delta":
+                    local_names = local_names - {"spawn_agent"}
                 lifecycle_lock = threading.Lock()
                 emitted_starts: set[str] = set()
                 emitted_ends: set[str] = set()
@@ -869,7 +873,7 @@ class WorkshopAdapter(BasePlatformAdapter):
                 def event_sink(event: str, payload: dict[str, Any]) -> None:
                     call_id = str(payload.get("call_id") or "")
                     name = str(payload.get("name") or "")
-                    tool_events = {
+                    remote_tool_events = {
                         WorkshopEventType.TOOL_CALL_START.value,
                         WorkshopEventType.TOOL_CALL_ARGUMENTS_DELTA.value,
                         WorkshopEventType.TOOL_CALL_END.value,
@@ -878,7 +882,25 @@ class WorkshopAdapter(BasePlatformAdapter):
                     # workshop catalog during zero-tool delta/wake turns. The
                     # current turn's catalog is the authority: never publish a
                     # stale or Hermes-local tool call to the DO for execution.
-                    if event in tool_events and name not in remote_names:
+                    if event in remote_tool_events:
+                        if name not in remote_names:
+                            return
+                    elif event == WorkshopEventType.TOOL_ACTIVITY.value:
+                        status = payload.get("status")
+                        if name not in local_names or status not in {
+                            "started",
+                            "completed",
+                            "error",
+                        }:
+                            return
+                        # This allowlist construction is the privacy boundary.
+                        # Never copy the runtime payload: it may grow sensitive
+                        # argument/result fields in a future adapter version.
+                        self.turns.emit_sync(
+                            turn_id,
+                            WorkshopEventType.TOOL_ACTIVITY,
+                            {"name": name, "status": status},
+                        )
                         return
                     if event in {
                         WorkshopEventType.TOOL_CALL_START.value,

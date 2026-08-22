@@ -1832,7 +1832,9 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        if self.source is not None and self.source.platform.value == "workshop":
+        platform = getattr(self.source, "platform", None)
+        platform_value = getattr(platform, "value", platform)
+        if platform_value == "workshop":
             return False
         return self.text.startswith("/")
     

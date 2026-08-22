@@ -18,7 +18,7 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 | M2 terminal event on backlog exhaustion | Fixed | `fail_backlog_exhausted` atomically writes a bounded `error` + `turn.end{status:error}` pair even when normal quota is exhausted; ordinary writes remain strictly capped. Storage and SSE tests cover the terminal guarantee. |
 | M3 hard duration deadline | Fixed | The 15-minute control deadline now has a fixed 5-second grace after interrupt, then cancels the handler task and persists `turn.end{status:aborted,stop_reason:turn_timeout}`. The test uses an uncooperative handler and a shortened grace. |
 | M4 internal-turn cache churn | Fixed | A durable `workshop_chat_catalogs` row tracks the last admitted user catalog digest. Delta/wake turns reuse that digest for cached-agent identity while installing an empty schema list and no callback, so authority remains zero without alternating cache eviction. Existing wake retries pin their original turn digest. |
-| M5 `after_seq` validation | Fixed | POST start and GET replay accept only ASCII decimal non-negative sequences at HTTP ingress, return typed 400 for invalid values, and pass the parsed integer into the stream coordinator (no second raw parse). |
+| M5 `after_seq` validation | Fixed | POST start and GET replay accept only bounded ASCII decimal non-negative sequences at HTTP ingress, reject values beyond SQLite's signed 64-bit range, return typed 400 for invalid/oversized values, and pass the parsed integer into the stream coordinator (no second raw parse). |
 
 ## Re-review at `39a7e85`
 
@@ -34,6 +34,26 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 - R2: replacing the drop-site terminalization with a plain ledger append makes the production-callback overflow test fail: the callback swallows the quota exception and the observed tail becomes `usage` + completed `turn.end` instead of `error` + error `turn.end`.
 - R3: removing the Workshop platform exclusion makes all four real HTTP cases fail. `/restart`, `/yolo`, and `/update` enter their gateway control handlers; `/config ...` enters slash-command routing instead of the model path.
 - The reviewer-requested raising-Codex case is retained: a `request_interrupt()` exception does not prevent Discord's legacy interrupt flag, message, or thread signal from being set. Existing cron coverage continues to assert its inline abort plus Codex-session signal.
+
+## Post-merge fast-follow
+
+| Finding | State | Evidence / disposition |
+| --- | --- | --- |
+| N1 redacted Hermes-local activity | Fixed | Remote client tools retain executable `tool_call.*` events with complete arguments. Approved Hermes-local tools instead emit persisted `tool_activity` records constructed from exactly `{name, status}`. The runtime constructs no argument/result fields, and the Workshop adapter independently reconstructs rather than filters the payload. A real HTTP → adapter → Codex-event-bridge test sends a `memory` call with distinct secrets in its arguments and result and proves neither secret, nor `arguments`, `result`, or `call_id`, appears in SSE or ledger replay. Stale remote tools on zero-tool delta turns remain outside both the current remote catalog and approved local-name set, so R1 still suppresses them completely. |
+| F1 bridge-layer redaction contract | Fixed | A bridge-only test now drives a secret-bearing local `memory` start/completion pair and asserts the exact two `tool_activity` payloads are `{name, status}`. It does not involve the Workshop adapter, so the bridge constructor is independently pinned against argument, result, call-ID, or future-field leakage. |
+| N2 defensive platform identity | Fixed | `MessageEvent.is_command()` now accepts both enum-backed and plain-string platform identities without raising. Either representation of `workshop` remains structurally command-disabled; non-Workshop and source-less events retain the merged legacy behavior. |
+| Oversized `after_seq` | Fixed | HTTP ingress rejects more than 19 digits and values above `2^63-1` before Python integer conversion or SQLite binding. Tests cover the 4,301-digit CPython limit and the SQLite overflow boundary on both POST and replay routes. |
+
+N1 mutation evidence: replacing the adapter's `{name, status}` constructor with the incoming runtime payload makes `test_local_activity_reconstructs_instead_of_filtering_runtime_payload` fail on leaked `arguments`, `result`, `call_id`, and an unknown future sensitive field. The allowlist constructor was restored before the green run.
+
+F1 mutation evidence: adding `"arguments": item.get("arguments")` directly to the bridge's completed `tool_activity` constructor makes `test_tool_activity_bridge_constructs_name_and_status_only` fail on the extra secret-bearing field. The mutation was removed; the bridge file passes all 8 tests and the expanded Workshop/Codex/gateway regression set passes **374 tests**.
+
+Cross-repo dependency: Cloudflare OS `origin/main` at `24e87942` does not yet recognize `tool_activity` and currently rejects unknown Hermes event types. It must add a non-executable `tool_activity` projection to its existing generic activity UI before this Hermes branch is deployed. Mapping redacted activity back onto `tool_call.*` is forbidden because that path claims and executes DO tools.
+
+Accepted v1 residuals, deliberately deferred until post-launch:
+
+- Workshop initialization failure remains latched for the process lifetime; correcting credentials or a transient ledger failure requires a gateway restart.
+- `workshop_chat_catalogs` is not pruned and can retain one row per workspace/chat indefinitely.
 
 ## Low findings
 
@@ -55,6 +75,8 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 | Codex app-server interrupt propagation | Covered; pre-deploy smoke pending | Explicit tests prove Discord retains the legacy flags/message while signaling Codex, and cron retains `_active_request_abort("interrupt_abort")` while also signaling Codex. This is documented in `WORKSHOP_PLATFORM_PLAN.md` as a deliberate Kumo fork-contract effectiveness change. The orchestrator must mirror that note into external `hermes-fork.md` and run one live Discord interrupt plus one cron turn before rollout. |
 
 ## Verification log
+
+- Post-merge fast-follow focused suite: **331 passed**, covering every Workshop module, Codex live/external event projection, platform command parsing, and the real gateway command boundary. The canonical repository runner, repeated with its temporary directory on the unconstrained home filesystem, completed all 2,140 files with **43,766 passed**. The only six assertion failures are unchanged production-base behavior already recorded below: Bedrock default region (1), model-catalog expectations (2), loaded-host MoA timing (1), and restricted-PATH SSH fixtures (2). `test_provider_fallback.py` and `test_run_agent.py` reached the runner's 300-second per-file deadline after partial progress. All Workshop files, Codex integration, the 197-test platform-base file, MCP OAuth, Kanban, doctor, and every previously quota-contaminated file passed; no changed or adjacent surface failed. The runner retried and passed three unrelated load flakes (`test_25107_stale_base_url_api_mode.py`, `test_tui_gateway_server.py`, and `test_doctor.py`).
 
 - Re-review R1/R2/R3 production-path regression set: **17 passed**. Canonical Workshop/gateway/Codex/interrupt adjacent set: **141 passed**; after the repository run exposed the source-less `MessageEvent` compatibility case, the expanded platform-base plus adjacent set passed **335 tests**. The three controlled production-code mutations above each make their corresponding regression test fail and were reverted before the green runs.
 - Repository-wide runner at the re-review boundary: **43,705 passed across all 2,140 files**. It initially reported 21 assertions: 15 were a genuine R3 compatibility regression caused by dereferencing optional `MessageEvent.source`; the guard was corrected and the entire 194-test platform-base file plus every changed adjacent surface passed in the 335-test rerun. The six remaining assertions are unchanged production-base/environment behavior: Bedrock default region (1), model-catalog expectations (2), loaded-host MoA timing (1), and restricted-PATH SSH fixtures (2). No Workshop, Codex bridge, interrupt, or gateway command-boundary test failed. The unchanged oversized files `test_primary_runtime_restore.py`, `test_provider_fallback.py`, and `test_run_agent.py` reached the runner's 300-second per-file deadline after partial progress; `test_25107_stale_base_url_api_mode.py` did the same. `test_doctor.py` timed out once and passed all 74 tests on the runner's retry.

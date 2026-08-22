@@ -118,6 +118,7 @@ class WorkshopEventType(str, Enum):
     TOOL_CALL_START = "tool_call.start"
     TOOL_CALL_ARGUMENTS_DELTA = "tool_call.arguments.delta"
     TOOL_CALL_END = "tool_call.end"
+    TOOL_ACTIVITY = "tool_activity"
     USAGE = "usage"
     TURN_END = "turn.end"
     ERROR = "error"

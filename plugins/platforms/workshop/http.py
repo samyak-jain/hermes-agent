@@ -22,6 +22,9 @@ from .storage import WorkshopLedger
 logger = logging.getLogger(__name__)
 
 
+_MAX_EVENT_SEQUENCE = (1 << 63) - 1
+
+
 def _web():
     from aiohttp import web
 
@@ -156,12 +159,23 @@ class WorkshopHTTPController:
 
     def _after_seq(self, request) -> int:
         raw = request.query.get("after_seq", "0")
-        if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+        if (
+            not isinstance(raw, str)
+            or not raw.isascii()
+            or not raw.isdecimal()
+            or len(raw) > 19
+        ):
             raise WorkshopProtocolError(
                 "invalid_event_sequence",
                 "after_seq must be a non-negative integer",
             )
-        return int(raw, 10)
+        value = int(raw, 10)
+        if value > _MAX_EVENT_SEQUENCE:
+            raise WorkshopProtocolError(
+                "invalid_event_sequence",
+                "after_seq must be a non-negative integer",
+            )
+        return value
 
     async def start_turn(self, request):
         auth_error = self._authorize(request)

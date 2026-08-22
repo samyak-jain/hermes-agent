@@ -484,6 +484,141 @@ async def test_workspace_delta_is_internal_idempotent_and_has_no_remote_tools(tm
 
 
 @pytest.mark.asyncio
+async def test_local_memory_activity_is_structurally_redacted(tmp_path):
+    secret_argument = "private memory query: swordfish"
+    secret_result = "private memory result: albatross"
+
+    async def handler(event):
+        bridge = make_codex_app_server_event_bridge(
+            SimpleNamespace(
+                _external_event_sink=event.metadata["_gateway_event_sink"],
+                _fire_reasoning_delta=None,
+                tool_progress_callback=None,
+                tool_start_callback=None,
+                tool_complete_callback=None,
+            )
+        )
+        started = {
+            "type": "mcpToolCall",
+            "id": "toolu_local_memory",
+            "providerCallId": "toolu_local_memory",
+            "server": "agent-runtime",
+            "tool": "memory",
+            "arguments": {"action": "read", "query": secret_argument},
+        }
+        bridge({"method": "item/started", "params": {"item": started}})
+        bridge({
+            "method": "item/toolCall/argumentsDelta",
+            "params": {
+                "callId": "toolu_local_memory",
+                "name": "memory",
+                "delta": json.dumps({"query": secret_argument}),
+            },
+        })
+        bridge({
+            "method": "item/toolCall/argumentsCompleted",
+            "params": {
+                "callId": "toolu_local_memory",
+                "name": "memory",
+                "arguments": {"action": "read", "query": secret_argument},
+            },
+        })
+        bridge({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    **started,
+                    "status": "completed",
+                    "result": {"content": [{"type": "text", "text": secret_result}]},
+                }
+            },
+        })
+        return _gateway_result(event, "done")
+
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        response_text = await response.text()
+        records = _sse_records(response_text)
+
+    activities = [item for item in records if item["event"] == "tool_activity"]
+    assert [(item["name"], item["status"]) for item in activities] == [
+        ("memory", "started"),
+        ("memory", "completed"),
+    ]
+    for item in activities:
+        assert set(item) == {
+            "protocol_version",
+            "event",
+            "turn_id",
+            "session_id",
+            "seq",
+            "timestamp",
+            "name",
+            "status",
+        }
+    durable_json = json.dumps(
+        [item.to_wire() for item in adapter.ledger.list_events(records[0]["turn_id"])],
+        sort_keys=True,
+    )
+    for forbidden in (
+        secret_argument,
+        secret_result,
+        "arguments",
+        "result",
+        "call_id",
+    ):
+        assert forbidden not in response_text
+        assert forbidden not in durable_json
+
+
+@pytest.mark.asyncio
+async def test_local_activity_reconstructs_instead_of_filtering_runtime_payload(
+    tmp_path,
+):
+    secret = "future runtime field must stay on kumo"
+
+    async def handler(event):
+        event.metadata["_gateway_event_sink"](
+            "tool_activity",
+            {
+                "name": "memory",
+                "status": "started",
+                "arguments": {"query": secret},
+                "result": secret,
+                "call_id": "toolu_private",
+                "future_sensitive_field": secret,
+            },
+        )
+        return _gateway_result(event, "done")
+
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        response_text = await response.text()
+        records = _sse_records(response_text)
+
+    activity = next(item for item in records if item["event"] == "tool_activity")
+    assert activity["name"] == "memory"
+    assert activity["status"] == "started"
+    assert set(activity) == {
+        "protocol_version",
+        "event",
+        "turn_id",
+        "session_id",
+        "seq",
+        "timestamp",
+        "name",
+        "status",
+    }
+    assert secret not in response_text
+
+
+@pytest.mark.asyncio
 async def test_delta_stale_remote_tool_is_denied_and_never_published(tmp_path):
     host_responses = []
 
