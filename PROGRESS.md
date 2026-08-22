@@ -14,11 +14,11 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 
 | Finding | State | Evidence / disposition |
 | --- | --- | --- |
-| M1 external-tool platform gate | Pending | Require `platform == workshop` at both metadata ingestion and cached-agent installation; reject/ignore external authority elsewhere with tests. |
-| M2 terminal event on backlog exhaustion | Pending | Add a bounded terminal-write path so exhaustion always yields `error` and `turn.end`. |
-| M3 hard duration deadline | Pending | Add bounded post-interrupt grace followed by hard task cancellation and terminalization. |
-| M4 internal-turn cache churn | Pending | Preserve the established chat catalog digest for internal turns while passing zero external schemas/callback authority. This does not require a design change because the schema list, not the digest, grants remote-tool authority. |
-| M5 `after_seq` validation | Pending | Validate once at HTTP ingress for both POST and GET and pass the parsed integer to the stream coordinator. |
+| M1 external-tool platform gate | Fixed | Both event-metadata extraction and `_run_agent_inner` reject schemas/catalog/callback authority unless `source.platform == workshop`. A direct Discord runtime test proves fail-closed behavior before agent construction. |
+| M2 terminal event on backlog exhaustion | Fixed | `fail_backlog_exhausted` atomically writes a bounded `error` + `turn.end{status:error}` pair even when normal quota is exhausted; ordinary writes remain strictly capped. Storage and SSE tests cover the terminal guarantee. |
+| M3 hard duration deadline | Fixed | The 15-minute control deadline now has a fixed 5-second grace after interrupt, then cancels the handler task and persists `turn.end{status:aborted,stop_reason:turn_timeout}`. The test uses an uncooperative handler and a shortened grace. |
+| M4 internal-turn cache churn | Fixed | A durable `workshop_chat_catalogs` row tracks the last admitted user catalog digest. Delta/wake turns reuse that digest for cached-agent identity while installing an empty schema list and no callback, so authority remains zero without alternating cache eviction. Existing wake retries pin their original turn digest. |
+| M5 `after_seq` validation | Fixed | POST start and GET replay accept only ASCII decimal non-negative sequences at HTTP ingress, return typed 400 for invalid values, and pass the parsed integer into the stream coordinator (no second raw parse). |
 
 ## Low findings
 
@@ -42,4 +42,5 @@ Source: PR #68 `MERGE-AFTER-FIXES` review in the sibling review worktree. This f
 ## Verification log
 
 - Blocker-focused integration set: **63 passed** (`test_adapter`, `test_http`, `test_turns`, minimal real gateway command dispatch, shared API route composition).
-- Medium/low remediation and full-suite rerun remain pending.
+- Medium-focused integration set: **70 passed** (storage, turn/SSE, HTTP ingress, platform policy/runtime).
+- Low remediation and full-suite rerun remain pending.

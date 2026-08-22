@@ -214,6 +214,14 @@ CREATE TABLE IF NOT EXISTS workshop_deltas (
     PRIMARY KEY(workspace_id, chat_id, delta_id)
 );
 
+CREATE TABLE IF NOT EXISTS workshop_chat_catalogs (
+    workspace_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    catalog_version TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(workspace_id, chat_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_workshop_turns_session
     ON workshop_turns(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_workshop_turns_state
@@ -319,6 +327,7 @@ class WorkshopLedger:
         turn_id: str | None = None,
         state: str = "queued",
         max_active_turns: int | None = None,
+        establish_catalog: bool = False,
     ) -> tuple[WorkshopTurnRecord, bool]:
         if state not in ACTIVE_TURN_STATES:
             raise ValueError(f"invalid initial workshop turn state: {state}")
@@ -370,6 +379,16 @@ class WorkshopLedger:
                     now,
                 ),
             )
+            if establish_catalog:
+                conn.execute(
+                    """INSERT INTO workshop_chat_catalogs
+                       (workspace_id, chat_id, catalog_version, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(workspace_id, chat_id) DO UPDATE SET
+                           catalog_version=excluded.catalog_version,
+                           updated_at=excluded.updated_at""",
+                    (workspace_id, chat_id, catalog_version, now),
+                )
             row = conn.execute(
                 "SELECT * FROM workshop_turns WHERE turn_id=?", (candidate_id,)
             ).fetchone()
@@ -377,6 +396,17 @@ class WorkshopLedger:
             return WorkshopTurnRecord.from_row(row), True
 
         return self._write(write)
+
+    def get_chat_catalog(self, workspace_id: str, chat_id: str) -> str | None:
+        def read(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                """SELECT catalog_version FROM workshop_chat_catalogs
+                   WHERE workspace_id=? AND chat_id=?""",
+                (workspace_id, chat_id),
+            ).fetchone()
+            return str(row["catalog_version"]) if row is not None else None
+
+        return self._read(read)
 
     def bind_queued_turn_session(
         self,
@@ -762,6 +792,111 @@ class WorkshopLedger:
                 (state, stop_reason, item.seq + 1, added_bytes, now, now, turn_id),
             )
             return item
+
+        return self._write(write)
+
+    def fail_backlog_exhausted(
+        self,
+        *,
+        turn_id: str,
+        message: str,
+        timestamp: float | None = None,
+    ) -> tuple[WorkshopEvent, WorkshopEvent]:
+        """Atomically persist the bounded terminal pair after quota exhaustion.
+
+        Ordinary events remain subject to the exact backlog cap.  This one
+        fixed-size error boundary may exceed it by only the serialized error
+        and turn.end records; without that reserve a caller could observe a
+        silently truncated stream with no semantic terminal event.
+        """
+
+        now = time.time() if timestamp is None else float(timestamp)
+        safe_message = str(message or "Workshop event backlog exhausted")[:512]
+
+        def write(conn: sqlite3.Connection):
+            row = conn.execute(
+                "SELECT session_id, state, next_seq FROM workshop_turns WHERE turn_id=?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
+            if row["state"] in TERMINAL_TURN_STATES:
+                events = conn.execute(
+                    """SELECT event_json FROM workshop_events
+                       WHERE turn_id=? AND event_type IN (?, ?)
+                       ORDER BY seq DESC LIMIT 2""",
+                    (
+                        turn_id,
+                        WorkshopEventType.ERROR.value,
+                        WorkshopEventType.TURN_END.value,
+                    ),
+                ).fetchall()
+                decoded = [self._event_from_json(item["event_json"]) for item in events]
+                by_type = {item.event: item for item in decoded}
+                if (
+                    row["state"] == "error"
+                    and WorkshopEventType.ERROR.value in by_type
+                    and WorkshopEventType.TURN_END.value in by_type
+                ):
+                    return (
+                        by_type[WorkshopEventType.ERROR.value],
+                        by_type[WorkshopEventType.TURN_END.value],
+                    )
+                raise WorkshopConflictError(
+                    "workshop turn already finished differently"
+                )
+
+            next_seq = int(row["next_seq"])
+            error_item = WorkshopEvent.create(
+                turn_id=turn_id,
+                session_id=row["session_id"],
+                seq=next_seq,
+                event=WorkshopEventType.ERROR,
+                payload={
+                    "code": "event_backlog_exceeded",
+                    "message": safe_message,
+                    "retryable": False,
+                },
+                timestamp=now,
+            )
+            end_item = WorkshopEvent.create(
+                turn_id=turn_id,
+                session_id=row["session_id"],
+                seq=next_seq + 1,
+                event=WorkshopEventType.TURN_END,
+                payload={
+                    "status": "error",
+                    "stop_reason": "event_backlog_exceeded",
+                },
+                timestamp=now,
+            )
+            total_added = 0
+            for item in (error_item, end_item):
+                serialized = canonical_json(item.to_wire())
+                event_bytes = len(serialized.encode("utf-8"))
+                total_added += event_bytes
+                conn.execute(
+                    """INSERT INTO workshop_events
+                       (turn_id, seq, event_type, event_json, event_bytes, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        turn_id,
+                        item.seq,
+                        item.event,
+                        serialized,
+                        event_bytes,
+                        now,
+                    ),
+                )
+            conn.execute(
+                """UPDATE workshop_turns
+                   SET state='error', stop_reason='event_backlog_exceeded',
+                       next_seq=?, event_bytes=event_bytes+?,
+                       updated_at=?, completed_at=?
+                   WHERE turn_id=?""",
+                (next_seq + 2, total_added, now, now, turn_id),
+            )
+            return error_item, end_item
 
         return self._write(write)
 

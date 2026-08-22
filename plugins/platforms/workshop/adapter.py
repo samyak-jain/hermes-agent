@@ -59,6 +59,20 @@ from .wake import (
 logger = logging.getLogger(__name__)
 
 
+_TURN_HARD_CANCEL_GRACE_SECONDS = 5.0
+
+
+class WorkshopTurnHardTimeout(TimeoutError):
+    pass
+
+
+def _consume_background_task_result(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 _BEHAVIOR_CONFIG_FIELDS = frozenset({
     "wake_url",
     "remote_tool_timeout_seconds",
@@ -332,19 +346,37 @@ class WorkshopAdapter(BasePlatformAdapter):
 
         # Caller-supplied schemas are per-turn capabilities. An autonomous
         # producer has not supplied fresh authority, so this turn receives no
-        # remote workshop tools. Persisting the previous catalog would widen
-        # a security boundary across turns.
-        _empty_tools, empty_catalog = parse_tool_catalog([])
+        # remote workshop tools. Reusing only the established digest keeps the
+        # cached-agent signature stable; the empty schema list and callback are
+        # the actual authority boundary.
+        _, empty_catalog = parse_tool_catalog([])
         wake_identity = f"{producer_type}\0{producer_id}"
+        wake_client_turn_id = (
+            "wake." + hashlib.sha256(wake_identity.encode("utf-8")).hexdigest()
+        )
+        existing_turn = await asyncio.to_thread(
+            self.ledger.get_turn_for_client,
+            workspace_id,
+            chat_id,
+            wake_client_turn_id,
+        )
+        established_catalog = (
+            existing_turn.catalog_version
+            if existing_turn is not None
+            else (
+                await asyncio.to_thread(
+                    self.ledger.get_chat_catalog, workspace_id, chat_id
+                )
+                or empty_catalog
+            )
+        )
         synthetic = WorkshopTurnRequest(
-            client_turn_id=(
-                "wake." + hashlib.sha256(wake_identity.encode("utf-8")).hexdigest()
-            ),
+            client_turn_id=wake_client_turn_id,
             workspace_id=workspace_id,
             chat_id=chat_id,
             text=text,
             tools=(),
-            catalog_version=empty_catalog,
+            catalog_version=established_catalog,
             metadata={},
         )
         try:
@@ -355,7 +387,7 @@ class WorkshopAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 session_key=session_key,
                 session_id=session_id,
-                catalog_version=empty_catalog,
+                catalog_version=established_catalog,
                 request_digest=synthetic.request_digest,
                 max_active_turns=int(self._behavior["max_active_turns"]),
             )
@@ -394,7 +426,7 @@ class WorkshopAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "turn_id": record.turn_id,
             "events_path": events_path,
-            "catalog_version": empty_catalog,
+            "catalog_version": record.catalog_version,
             "producer": {"type": producer_type, "id": producer_id},
             "idempotency_key": idempotency_key,
         }
@@ -509,6 +541,7 @@ class WorkshopAdapter(BasePlatformAdapter):
         self,
         turn: WorkshopTurnRequest,
         *,
+        after_seq: int,
         request,
         controller,
     ):
@@ -548,7 +581,9 @@ class WorkshopAdapter(BasePlatformAdapter):
                     "client_turn_id was already used with a different request",
                     status=409,
                 )
-            return await self.turns.stream_response(request, existing.turn_id)
+            return await self.turns.stream_response(
+                request, existing.turn_id, after_seq=after_seq
+            )
 
         source = self._source(turn)
         session_key, session_id = await self._resolve_session(source)
@@ -563,6 +598,7 @@ class WorkshopAdapter(BasePlatformAdapter):
                 catalog_version=turn.catalog_version,
                 request_digest=turn.request_digest,
                 max_active_turns=int(self._behavior["max_active_turns"]),
+                establish_catalog=True,
             )
         except WorkshopCapacityError:
             return self._json_error(
@@ -580,7 +616,9 @@ class WorkshopAdapter(BasePlatformAdapter):
                 record.turn_id,
                 lambda: self._execute_turn(record.turn_id, turn, source),
             )
-        return await self.turns.stream_response(request, record.turn_id)
+        return await self.turns.stream_response(
+            request, record.turn_id, after_seq=after_seq
+        )
 
     async def stream_workshop_events(
         self,
@@ -590,7 +628,7 @@ class WorkshopAdapter(BasePlatformAdapter):
         request,
         controller,
     ):
-        del after_seq, controller
+        del controller
         if self.ledger is None or self.turns is None:
             return self._json_error(
                 "workshop_unavailable", "Workshop platform is not connected", status=503
@@ -599,7 +637,9 @@ class WorkshopAdapter(BasePlatformAdapter):
             return self._json_error(
                 "turn_not_found", "Workshop turn not found", status=404
             )
-        return await self.turns.stream_response(request, turn_id)
+        return await self.turns.stream_response(
+            request, turn_id, after_seq=after_seq
+        )
 
     async def ingest_workshop_delta(
         self,
@@ -653,7 +693,13 @@ class WorkshopAdapter(BasePlatformAdapter):
             text = self._prepare_workspace_delta(delta)
         except WorkshopProtocolError as exc:
             return self._json_error(exc.code, str(exc), status=exc.status)
-        _empty_tools, empty_catalog = parse_tool_catalog([])
+        _, empty_catalog = parse_tool_catalog([])
+        established_catalog = (
+            await asyncio.to_thread(
+                self.ledger.get_chat_catalog, delta.workspace_id, delta.chat_id
+            )
+            or empty_catalog
+        )
         identity = f"{delta.workspace_id}\0{delta.chat_id}\0{delta.delta_id}"
         synthetic = WorkshopTurnRequest(
             client_turn_id=(
@@ -664,7 +710,7 @@ class WorkshopAdapter(BasePlatformAdapter):
             chat_id=delta.chat_id,
             text=text,
             tools=(),
-            catalog_version=empty_catalog,
+            catalog_version=established_catalog,
             metadata={},
         )
         try:
@@ -675,7 +721,7 @@ class WorkshopAdapter(BasePlatformAdapter):
                 chat_id=delta.chat_id,
                 session_key=session_key,
                 session_id=session_id,
-                catalog_version=empty_catalog,
+                catalog_version=established_catalog,
                 request_digest=synthetic.request_digest,
                 max_active_turns=int(self._behavior["max_active_turns"]),
             )
@@ -1003,6 +1049,15 @@ class WorkshopAdapter(BasePlatformAdapter):
                     await self.turns.finish(
                         turn_id, state="completed", stop_reason="complete"
                     )
+            except WorkshopTurnHardTimeout:
+                try:
+                    await self.turns.finish(
+                        turn_id,
+                        state="aborted",
+                        stop_reason="turn_timeout",
+                    )
+                except WorkshopConflictError:
+                    pass
             except asyncio.CancelledError:
                 # Gateway shutdown owns cancellation. Persist a replayable
                 # terminal boundary; an SSE observer never cancels this task.
@@ -1017,8 +1072,11 @@ class WorkshopAdapter(BasePlatformAdapter):
                     self._behavior.get("max_event_backlog_bytes"),
                 )
                 try:
-                    await asyncio.to_thread(
-                        self.ledger.set_turn_state, turn_id, "error"
+                    await self.turns.finish_backlog_exhausted(
+                        turn_id,
+                        message=(
+                            "Workshop turn exceeded its durable event backlog limit"
+                        ),
                     )
                 except Exception:
                     logger.exception(
@@ -1071,10 +1129,12 @@ class WorkshopAdapter(BasePlatformAdapter):
             self._behavior.get("turn_timeout_seconds", MAX_TURN_SECONDS)
         )
         timeout_applied = False
+        hard_cancel_at: float | None = None
         interrupt_sent: tuple[str, str, str] | None = None
         try:
             while not task.done():
-                remaining = deadline - asyncio.get_running_loop().time()
+                now = asyncio.get_running_loop().time()
+                remaining = deadline - now
                 if remaining <= 0 and not timeout_applied:
                     record, _created, affected = await asyncio.to_thread(
                         self.turns.request_control,
@@ -1097,6 +1157,19 @@ class WorkshopAdapter(BasePlatformAdapter):
                     ):
                         interrupt_sent = timeout_signature
                     timeout_applied = True
+                    hard_cancel_at = now + _TURN_HARD_CANCEL_GRACE_SECONDS
+
+                if (
+                    timeout_applied
+                    and hard_cancel_at is not None
+                    and now >= hard_cancel_at
+                    and not task.done()
+                ):
+                    task.cancel()
+                    task.add_done_callback(_consume_background_task_result)
+                    raise WorkshopTurnHardTimeout(
+                        "Workshop turn exceeded its hard duration deadline"
+                    )
 
                 record = await asyncio.to_thread(self.ledger.get_turn, turn_id)
                 if record is not None and record.control_signal is not None:

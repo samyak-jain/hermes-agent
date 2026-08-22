@@ -13701,6 +13701,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _event_metadata = event.metadata or {}
+            _external_tool_schemas = _event_metadata.get("workshop_tools")
+            _external_tool_catalog_version = str(
+                _event_metadata.get("workshop_catalog_version") or ""
+            )
+            _external_tool_callback = _event_metadata.get(
+                "_workshop_tool_callback"
+            )
+            _source_platform = str(
+                getattr(source.platform, "value", source.platform) or ""
+            )
+            if _source_platform != "workshop" and (
+                _external_tool_schemas
+                or _external_tool_catalog_version
+                or _external_tool_callback is not None
+            ):
+                raise PermissionError(
+                    "External tool authority is restricted to the workshop platform"
+                )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -13720,15 +13739,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 external_event_sink=(event.metadata or {}).get(
                     "_gateway_event_sink"
                 ),
-                external_tool_schemas=(event.metadata or {}).get(
-                    "workshop_tools"
-                ),
-                external_tool_catalog_version=str(
-                    (event.metadata or {}).get("workshop_catalog_version") or ""
-                ),
-                external_tool_callback=(event.metadata or {}).get(
-                    "_workshop_tool_callback"
-                ),
+                external_tool_schemas=_external_tool_schemas,
+                external_tool_catalog_version=_external_tool_catalog_version,
+                external_tool_callback=_external_tool_callback,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -19825,6 +19838,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Supports interruption via new messages.
         """
         # ---- Proxy mode: delegate to remote API server ----
+        _source_platform = str(
+            getattr(source.platform, "value", source.platform) or ""
+        )
+        if _source_platform != "workshop" and (
+            external_tool_schemas
+            or external_tool_catalog_version
+            or external_tool_callback is not None
+        ):
+            raise PermissionError(
+                "External tool authority is restricted to the workshop platform"
+            )
+
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message,

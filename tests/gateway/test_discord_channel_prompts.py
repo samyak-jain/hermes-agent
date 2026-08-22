@@ -311,6 +311,30 @@ async def test_cron_result_turn_cannot_mutate_cron_jobs(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_non_workshop_platform_cannot_install_external_tool_authority():
+    runner = _make_runner()
+
+    with pytest.raises(PermissionError, match="restricted to the workshop platform"):
+        await runner._run_agent(
+            message="ordinary Discord input",
+            context_prompt="",
+            history=[],
+            source=_make_source(),
+            session_id="session-1",
+            session_key="agent:main:discord:thread:12345",
+            external_tool_schemas=[
+                {
+                    "name": "writeFile",
+                    "description": "remote mutation",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+            external_tool_catalog_version="attacker-catalog",
+            external_tool_callback=lambda *_args: None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_workshop_delta_turn_cannot_spawn_children(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()

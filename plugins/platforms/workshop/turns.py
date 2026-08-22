@@ -182,6 +182,21 @@ class WorkshopTurnCoordinator:
         self._wake_remote_waiters(turn_id)
         return item
 
+    async def finish_backlog_exhausted(
+        self, turn_id: str, *, message: str
+    ) -> tuple[WorkshopEvent, WorkshopEvent]:
+        items = await asyncio.to_thread(
+            self.ledger.fail_backlog_exhausted,
+            turn_id=turn_id,
+            message=message,
+        )
+        live = self._live.get(turn_id)
+        if live is not None:
+            for item in items:
+                live.publish(item)
+        self._wake_remote_waiters(turn_id)
+        return items
+
     def _waiter_for(self, turn_id: str, call_id: str) -> threading.Event:
         key = (turn_id, call_id)
         with self._remote_waiters_lock:
@@ -333,7 +348,9 @@ class WorkshopTurnCoordinator:
         state = self._live.get(turn_id)
         return state.task if state is not None else None
 
-    async def stream_response(self, request: Any, turn_id: str):
+    async def stream_response(
+        self, request: Any, turn_id: str, *, after_seq: int
+    ):
         """Replay durable events, then tail the live task until turn.end.
 
         The turn task is never awaited or cancelled by this method.  An HTTP
@@ -345,8 +362,6 @@ class WorkshopTurnCoordinator:
         turn = await asyncio.to_thread(self.ledger.get_turn, turn_id)
         if turn is None:
             raise KeyError(turn_id)
-        raw_after = request.query.get("after_seq", "0")
-        after_seq = int(raw_after)
         response = web.StreamResponse(
             status=200,
             headers={

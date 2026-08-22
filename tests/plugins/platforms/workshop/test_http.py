@@ -227,6 +227,32 @@ async def test_valid_turn_is_strictly_parsed_before_adapter_availability(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_after", ["-1", "abc", "1.5", "+1", ""])
+async def test_after_seq_is_validated_at_http_ingress_for_post_and_get(
+    tmp_path, raw_after
+):
+    app, _ledger = _app(tmp_path)
+    suffix = f"?after_seq={raw_after}"
+    async with TestClient(TestServer(app)) as client:
+        started = await client.post(
+            f"/api/workshop/v1/turns{suffix}",
+            json=_turn_body(),
+            headers=_headers(),
+        )
+        replay = await client.get(
+            f"/api/workshop/v1/turns/wturn_valid/events{suffix}",
+            headers=_headers(),
+        )
+        started_body = await started.json()
+        replay_body = await replay.json()
+
+    assert started.status == 400
+    assert started_body["error"]["code"] == "invalid_event_sequence"
+    assert replay.status == 400
+    assert replay_body["error"]["code"] == "invalid_event_sequence"
+
+
+@pytest.mark.asyncio
 async def test_completed_turn_replay_is_available_without_live_adapter(tmp_path):
     app, ledger = _app(tmp_path)
     turn, _created = ledger.create_turn(

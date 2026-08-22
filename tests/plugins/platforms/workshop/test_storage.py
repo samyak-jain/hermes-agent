@@ -234,6 +234,31 @@ def test_backlog_limit_fails_without_advancing_sequence(tmp_path):
     assert record.event_bytes == 0
 
 
+def test_backlog_exhaustion_terminal_pair_has_a_bounded_quota_bypass(tmp_path):
+    ledger = _ledger(tmp_path, max_event_backlog_bytes=250)
+    turn, _ = _turn(ledger)
+
+    error, terminal = ledger.fail_backlog_exhausted(
+        turn_id=turn.turn_id,
+        message="durable stream limit reached",
+    )
+
+    assert error.event == "error"
+    assert error.payload["code"] == "event_backlog_exceeded"
+    assert terminal.event == "turn.end"
+    assert terminal.payload == {
+        "status": "error",
+        "stop_reason": "event_backlog_exceeded",
+    }
+    record = ledger.get_turn(turn.turn_id)
+    assert record is not None and record.state == "error"
+    assert [item.event for item in ledger.list_events(turn.turn_id)] == [
+        "error",
+        "turn.end",
+    ]
+    assert record.event_bytes > ledger.max_event_backlog_bytes
+
+
 def test_pending_tool_calls_are_bounded_and_results_are_idempotent(tmp_path):
     ledger = _ledger(tmp_path, max_pending_calls=2)
     turn, _ = _turn(ledger)

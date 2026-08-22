@@ -129,6 +129,7 @@ class WorkshopHTTPController:
         parser: Callable[[Any], Any],
         method_name: str,
         *args,
+        delegate_kwargs: dict[str, Any] | None = None,
     ):
         auth_error = self._authorize(request)
         if auth_error is not None:
@@ -145,11 +146,36 @@ class WorkshopHTTPController:
                 "Workshop platform is not connected",
                 status=503,
             )
-        return await handler(*args, parsed, request=request, controller=self)
+        return await handler(
+            *args,
+            parsed,
+            request=request,
+            controller=self,
+            **(delegate_kwargs or {}),
+        )
+
+    def _after_seq(self, request) -> int:
+        raw = request.query.get("after_seq", "0")
+        if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+            raise WorkshopProtocolError(
+                "invalid_event_sequence",
+                "after_seq must be a non-negative integer",
+            )
+        return int(raw, 10)
 
     async def start_turn(self, request):
+        auth_error = self._authorize(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            after_seq = self._after_seq(request)
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=400)
         return await self._parse_and_delegate(
-            request, WorkshopTurnRequest.from_dict, "start_workshop_turn"
+            request,
+            WorkshopTurnRequest.from_dict,
+            "start_workshop_turn",
+            delegate_kwargs={"after_seq": after_seq},
         )
 
     async def health(self, request):
@@ -200,14 +226,9 @@ class WorkshopHTTPController:
             return auth_error
         try:
             turn_id = validate_identifier(request.match_info.get("turn_id"), "turn_id")
-            raw_after = request.query.get("after_seq", "0")
-            after_seq = int(raw_after)
-            if after_seq < 0:
-                raise ValueError
-        except (WorkshopProtocolError, TypeError, ValueError) as exc:
-            message = str(exc) if isinstance(exc, WorkshopProtocolError) else "after_seq must be non-negative"
-            code = exc.code if isinstance(exc, WorkshopProtocolError) else "invalid_event_sequence"
-            return self._error(code, message, status=400)
+            after_seq = self._after_seq(request)
+        except WorkshopProtocolError as exc:
+            return self._error(exc.code, str(exc), status=400)
 
         adapter = self._adapter(request)
         stream = getattr(adapter, "stream_workshop_events", None) if adapter is not None else None
