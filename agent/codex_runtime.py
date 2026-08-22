@@ -133,6 +133,7 @@ def _dispatch_app_server_host_tool(
             return HostToolResult(
                 content=remote.content,
                 is_error=bool(remote.is_error),
+                end_turn=bool(getattr(remote, "end_turn", False)),
             )
         return remote
 
@@ -945,6 +946,9 @@ def run_codex_app_server_turn(
         turn = agent._codex_session.run_turn(
             user_input=user_message,
             post_tool_quiet_timeout=quiet_timeout,
+            interrupt_check=lambda: bool(
+                getattr(agent, "_interrupt_requested", False)
+            ),
         )
     except Exception as exc:
         logger.exception("codex app-server turn failed")

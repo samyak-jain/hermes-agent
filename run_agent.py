@@ -2813,6 +2813,14 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        _codex_session = getattr(self, "_codex_session", None)
+        if _codex_session is not None:
+            try:
+                _codex_session.request_interrupt()
+            except Exception:
+                logger.debug(
+                    "Failed to signal Codex app-server interrupt", exc_info=True
+                )
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can

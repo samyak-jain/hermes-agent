@@ -35,7 +35,8 @@ Also approved: the generic `api_route_factory` seam with fatal startup collision
 | 2. Stateful adapter and text stream | Complete | Deterministic workspace/chat lanes, execution-epoch session pinning, independent turn tasks, durable ordered SSE text/usage/end events, replay/reattach, disconnect survival, same-lane serialization, cross-lane concurrency, atomic capacity admission, and managed platform-wide tool policy are implemented. Focused phase suite: 262 passed. |
 | 3. Raw runtime event bridge | Complete | Claude SDK partial events now preserve live thinking, exact provider `tool_use` IDs, raw argument fragments, and complete parsed arguments through the Codex shim into workshop SSE. Semantic events remain replayable while thinking/argument fragments remain live-only. |
 | 4. External tools and result callback | Complete | Strict client schemas merge after the policy-filtered local MCP surface with full registry collision rejection. Catalog digests bust the cached-agent signature; the superseded app-server is retired and the shim rebinds the same Claude session with the new catalog. Remote calls use exact provider IDs, durable pending rows, bounded parallel callback workers, idempotent result POSTs, typed errors/timeouts, and never enter local dispatch. |
-| 5-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
+| 5. Controls, timeout, disconnect, replay | Complete | Durable idempotent controls implement `after_current_call` and `immediate`, including typed cancellation, exact caller stop reasons, startup-safe runtime interruption, the hard turn cap, and non-cancelling observer disconnects. |
+| 6-8 | Pending | Follow build order in B10; update this table at every phase boundary. |
 
 Phase-1 verification notes:
 
@@ -79,6 +80,18 @@ Phase-4 verification notes:
 
 - Claude shim: 20 passed. Focused runtime/cache/workshop integration suite: 327 passed. Broad repository Codex plus workshop suite: 827 passed. Ruff and `git diff --check` pass.
 - The isolated full runner completed all 2,139 files: 43,670 tests passed. The five known production-base assertions remain (Bedrock region, two model-catalog expectations, and two restricted-PATH SSH expectations). Relocating pytest's temp root under `/home` to avoid `/tmp` quota caused 17 path-sensitive harness failures (fake-home detection, hidden-directory search, shell fixture paths, and Unix-socket length); all seven affected files pass under the normal temp root, 506 tests total. The three known long files (`test_25107_stale_base_url_api_mode.py`, `test_provider_fallback.py`, and `test_run_agent.py`) hit the per-file timeout under the loaded host; no phase-4 file failed or timed out.
+
+Phase-5 implementation notes:
+
+- Controls are stored transactionally on `workshop_turns`. Repeated identical controls are idempotent, conflicting controls and terminal-turn controls return 409, and an immediate control atomically changes every pending remote call to a typed cancelled result. A queued control wins against session binding/model startup without running the model.
+- `after_current_call` leaves the current parallel remote-call batch resolvable and marks the last completed result as the turn boundary. Immediate cancellation wakes all blocked callback workers. The app-server tracks the whole in-flight host-tool batch and sends every MCP response before requesting provider interruption, so parallel typed cancellation results cannot be preempted.
+- `AIAgent.interrupt()` now propagates to its live Codex app-server session. A pre-start interrupt probe also closes the race where control arrives while the cached agent or SDK process is being prepared. The configured 15-minute cap is enforced as a durable `abort/immediate` control with `turn_timeout` as its stop reason.
+- Caller-provided control reasons are echoed exactly (within the protocol length bound) in `turn.end.stop_reason`; `abort` ends as `aborted` and `end_turn` as `completed`. SSE teardown remains observer-only. Keeping the live coordinator until its owner task finishes fixed a disconnect/replay race exposed by the new control poller.
+
+Phase-5 verification notes:
+
+- The focused control/runtime/storage suite is green at 104 tests after the final parallel-response barrier; the earlier broader phase slice passed 339 tests and the canonical modified-file slice passed 144. Ruff and `git diff --check` pass.
+- The repository-wide runner completed all 2,139 files with 43,603 passing tests. Fifty-nine tool failures were caused by the host `/tmp` quota; all 164 affected tests outside the known SSH baseline passed after removing only pytest-owned temporary directories and rerunning in isolation. The unchanged SSH file retains its production-base restricted-PATH/control-socket failures. The known Bedrock/model-catalog assertions remain, and four large baseline files hit the 300-second per-file cap under host load; the newly observed `test_primary_runtime_restore.py` hang isolates to its Nous-provider environment case, outside workshop control execution. No changed phase-5 file failed or timed out.
 
 Implementation branch: `workshop-platform`. Draft review: `https://github.com/samyak-jain/hermes-agent/pull/68`. Starting point: `db5281cade17b6292f22768ce26123cec7956093`, forked from the production line described by the Kumo fork contract.
 

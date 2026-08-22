@@ -302,6 +302,90 @@ class TestRunTurn:
             )
         ]
 
+    def test_host_tool_after_current_call_responds_before_interrupt(self):
+        from agent.transports.codex_app_server_session import HostToolResult
+
+        client = FakeClient()
+        client.queue_server_request(
+            "agent/tool/call",
+            request_id="tool-request-end",
+            name="writeFile",
+            arguments={"path": "README.md"},
+            toolCallId="toolu_remote_end",
+        )
+        session = make_session(
+            client,
+            tool_callback=lambda *_args: HostToolResult(
+                content={"ok": True}, is_error=False, end_turn=True
+            ),
+        )
+        observed = []
+        original_respond = client.respond
+
+        def respond_then_observe(request_id, response):
+            original_respond(request_id, response)
+            observed.append(("respond", session._interrupt_event.is_set()))
+
+        client.respond = respond_then_observe
+
+        result = session.run_turn("write it", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert observed == [("respond", False)]
+        assert client.responses[0][1] == {
+            "content": '{"ok": true}',
+            "isError": False,
+        }
+
+    def test_parallel_end_turn_waits_for_every_host_tool_response(self):
+        from agent.transports.codex_app_server_session import HostToolResult
+
+        client = FakeClient()
+        for suffix in ("one", "two"):
+            client.queue_server_request(
+                "agent/tool/call",
+                request_id=f"tool-request-{suffix}",
+                name="writeFile",
+                arguments={"path": suffix},
+                toolCallId=f"toolu_{suffix}",
+            )
+        both_entered = threading.Barrier(2)
+        release = threading.Event()
+        session = None
+        observed = []
+
+        def invoke(_name, arguments, _tool_call_id):
+            both_entered.wait(timeout=1)
+            release.wait(timeout=1)
+            return HostToolResult(
+                content={"path": arguments["path"]}, end_turn=True
+            )
+
+        session = make_session(
+            client,
+            tool_callback=invoke,
+            concurrent_tool_names={"writeFile"},
+        )
+        original_respond = client.respond
+
+        def respond_then_observe(request_id, response):
+            original_respond(request_id, response)
+            observed.append((request_id, session._interrupt_event.is_set()))
+
+        client.respond = respond_then_observe
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        try:
+            result = session.run_turn("write both", turn_timeout=2.0)
+        finally:
+            timer.cancel()
+
+        assert result.interrupted is True
+        assert sorted(observed) == [
+            ("tool-request-one", False),
+            ("tool-request-two", False),
+        ]
+
     def test_external_host_tools_can_wait_concurrently(self):
         client = FakeClient()
         for index in (1, 2):
@@ -532,6 +616,15 @@ class TestRunTurn:
         assert "model_provider 'azure_foundry' not configured" in r.error
         assert r.should_retire is True
         assert r.final_text == ""
+
+    def test_prestart_interrupt_check_skips_provider_turn(self):
+        client = FakeClient()
+        result = make_session(client).run_turn(
+            "hello", interrupt_check=lambda: True
+        )
+
+        assert result.interrupted is True
+        assert [method for method, _params in client.requests] == ["thread/start"]
 
     def test_interrupt_during_turn_issues_turn_interrupt(self):
         client = FakeClient()

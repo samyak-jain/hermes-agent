@@ -54,6 +54,14 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         assert is_interrupted() is False
         assert parent._interrupt_thread_signal_pending is True
 
+    def test_interrupt_signals_active_codex_app_server_session(self):
+        parent = self._make_bare_agent()
+        parent._codex_session = MagicMock()
+
+        parent.interrupt("workshop stop")
+
+        parent._codex_session.request_interrupt.assert_called_once_with()
+
     def test_child_clear_interrupt_at_start_clears_thread(self):
         """child.clear_interrupt() at start of run_conversation clears the
         bound execution thread's interrupt flag.

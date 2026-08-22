@@ -25,6 +25,7 @@ _MAX_RECENT_EVENT_BYTES = 512 * 1024
 class WorkshopRemoteResult:
     content: Any
     is_error: bool
+    end_turn: bool = False
 
 
 class WorkshopRemoteCallTimeout(TimeoutError):
@@ -114,7 +115,11 @@ class WorkshopTurnCoordinator:
 
     def _discard_if_idle(self, turn_id: str) -> None:
         state = self._live.get(turn_id)
-        if state is not None and state.subscribers == 0:
+        if (
+            state is not None
+            and state.subscribers == 0
+            and (state.task is None or state.task.done())
+        ):
             self._live.pop(turn_id, None)
 
     def emit_sync(
@@ -212,9 +217,23 @@ class WorkshopTurnCoordinator:
                         f"remote tool call disappeared: {call_id}"
                     )
                 if record.state == "resolved":
+                    turn = self.ledger.get_turn(turn_id)
+                    end_turn = bool(
+                        turn is not None
+                        and turn.control_signal is not None
+                        and turn.control_mode == "after_current_call"
+                        and self.ledger.count_pending_tool_calls(turn_id) == 0
+                    )
                     return WorkshopRemoteResult(
                         content=record.result,
                         is_error=bool(record.is_error),
+                        end_turn=end_turn,
+                    )
+                if record.state == "cancelled":
+                    return WorkshopRemoteResult(
+                        content=record.result,
+                        is_error=True,
+                        end_turn=True,
                     )
                 if record.state != "pending":
                     raise WorkshopRemoteCallCancelled(
@@ -257,6 +276,29 @@ class WorkshopTurnCoordinator:
         )
         self._wake_remote_waiters(turn_id, call_id)
         return created
+
+    def request_control(
+        self,
+        *,
+        turn_id: str,
+        signal: str,
+        mode: str,
+        reason: str,
+        replace: bool = False,
+    ):
+        record, created, affected_calls = self.ledger.request_turn_control(
+            turn_id=turn_id,
+            signal=signal,
+            mode=mode,
+            reason=reason,
+            replace=replace,
+        )
+        if mode == "immediate":
+            self._wake_remote_waiters(turn_id)
+        live = self._live.get(turn_id)
+        if live is not None:
+            live.loop.call_soon_threadsafe(live.changed.set)
+        return record, created, affected_calls
 
     def emitted_text(self, turn_id: str) -> str:
         state = self._live.get(turn_id)

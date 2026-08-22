@@ -67,6 +67,10 @@ class WorkshopTurnRecord:
     next_seq: int
     event_bytes: int
     stop_reason: str | None
+    control_signal: str | None
+    control_mode: str | None
+    control_reason: str | None
+    control_requested_at: float | None
     created_at: float
     updated_at: float
     completed_at: float | None
@@ -127,6 +131,10 @@ CREATE TABLE IF NOT EXISTS workshop_turns (
     next_seq INTEGER NOT NULL DEFAULT 1,
     event_bytes INTEGER NOT NULL DEFAULT 0,
     stop_reason TEXT,
+    control_signal TEXT,
+    control_mode TEXT,
+    control_reason TEXT,
+    control_requested_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     completed_at REAL,
@@ -228,6 +236,20 @@ class WorkshopLedger:
     def _initialize(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(workshop_turns)").fetchall()
+            }
+            for name, declaration in (
+                ("control_signal", "TEXT"),
+                ("control_mode", "TEXT"),
+                ("control_reason", "TEXT"),
+                ("control_requested_at", "REAL"),
+            ):
+                if name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE workshop_turns ADD COLUMN {name} {declaration}"
+                    )
 
     def _read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         with self._lock, self._connect() as conn:
@@ -456,6 +478,142 @@ class WorkshopLedger:
             return WorkshopTurnRecord.from_row(updated)
 
         return self._write(write)
+
+    def start_turn(self, turn_id: str) -> bool:
+        """Atomically promote a queued turn unless a control won the race."""
+
+        now = time.time()
+
+        def write(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT state FROM workshop_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
+            if row["state"] != "queued":
+                return False
+            cursor = conn.execute(
+                """UPDATE workshop_turns SET state='running', updated_at=?
+                   WHERE turn_id=? AND state='queued'""",
+                (now, turn_id),
+            )
+            return cursor.rowcount == 1
+
+        return self._write(write)
+
+    def request_turn_control(
+        self,
+        *,
+        turn_id: str,
+        signal: str,
+        mode: str,
+        reason: str,
+        replace: bool = False,
+    ) -> tuple[WorkshopTurnRecord, bool, int]:
+        """Persist one control request and atomically cancel pending calls.
+
+        ``replace`` is reserved for the server-enforced duration cap. It lets
+        that hard safety boundary supersede a softer after-current request.
+        Ordinary callers get strict idempotency and cannot rewrite controls.
+        """
+
+        if signal not in {"abort", "end_turn"}:
+            raise ValueError(f"invalid workshop control signal: {signal}")
+        if mode not in {"after_current_call", "immediate"}:
+            raise ValueError(f"invalid workshop control mode: {mode}")
+        now = time.time()
+        typed_error = canonical_json(
+            {
+                "error": {
+                    "code": "workshop_turn_controlled",
+                    "signal": signal,
+                    "mode": mode,
+                    "reason": reason,
+                }
+            }
+        )
+
+        def write(conn: sqlite3.Connection):
+            row = conn.execute(
+                "SELECT * FROM workshop_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkshopNotFoundError(f"unknown workshop turn: {turn_id}")
+            if row["state"] in TERMINAL_TURN_STATES:
+                raise WorkshopConflictError("workshop turn is already terminal")
+            existing = row["control_signal"]
+            if existing is not None and not replace:
+                same = (
+                    existing == signal
+                    and row["control_mode"] == mode
+                    and row["control_reason"] == reason
+                )
+                if not same:
+                    raise WorkshopConflictError(
+                        "workshop turn already has a different control request"
+                    )
+                pending = int(
+                    conn.execute(
+                        """SELECT COUNT(*) FROM workshop_tool_calls
+                           WHERE turn_id=? AND state='pending'""",
+                        (turn_id,),
+                    ).fetchone()[0]
+                )
+                return WorkshopTurnRecord.from_row(row), False, pending
+
+            conn.execute(
+                """UPDATE workshop_turns
+                   SET state='ending', control_signal=?, control_mode=?,
+                       control_reason=?, control_requested_at=?, updated_at=?
+                   WHERE turn_id=?""",
+                (signal, mode, reason, now, now, turn_id),
+            )
+            cancelled = 0
+            if mode == "immediate":
+                cursor = conn.execute(
+                    """UPDATE workshop_tool_calls
+                       SET state='cancelled', result_json=?, is_error=1,
+                           resolved_at=?
+                       WHERE turn_id=? AND state='pending'""",
+                    (typed_error, now, turn_id),
+                )
+                cancelled = int(cursor.rowcount)
+            pending = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM workshop_tool_calls
+                       WHERE turn_id=? AND state='pending'""",
+                    (turn_id,),
+                ).fetchone()[0]
+            )
+            updated = conn.execute(
+                "SELECT * FROM workshop_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+            assert updated is not None
+            return WorkshopTurnRecord.from_row(updated), True, pending + cancelled
+
+        return self._write(write)
+
+    def count_pending_tool_calls(self, turn_id: str) -> int:
+        return self._read(
+            lambda conn: int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM workshop_tool_calls
+                       WHERE turn_id=? AND state='pending'""",
+                    (turn_id,),
+                ).fetchone()[0]
+            )
+        )
+
+    def count_cancelled_tool_calls(self, turn_id: str) -> int:
+        return self._read(
+            lambda conn: int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM workshop_tool_calls
+                       WHERE turn_id=? AND state='cancelled'""",
+                    (turn_id,),
+                ).fetchone()[0]
+            )
+        )
 
     def append_event(
         self,

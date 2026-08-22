@@ -85,6 +85,7 @@ def _adapter(tmp_path, handler, *, session_ids=None, max_active=4):
         adapters={Platform("workshop"): adapter},
         async_session_store=store,
         _session_key_for_source=lambda source: build_session_key(source),
+        _running_agents={},
     )
     adapter.gateway_runner = runner
     return adapter, runner, store
@@ -584,3 +585,216 @@ def test_simultaneous_remote_calls_resolve_independently(tmp_path):
 
         assert first.result(timeout=1).content == {"order": 1}
         assert second.result(timeout=1).content == {"order": 2}
+
+
+@pytest.mark.asyncio
+async def test_immediate_abort_during_generation_echoes_reason(tmp_path):
+    interrupted = asyncio.Event()
+    reasons = []
+
+    async def handler(_event):
+        await interrupted.wait()
+        return {
+            "interrupted": True,
+            "interrupt_message": reasons[-1],
+            "final_response": "",
+        }
+
+    adapter, runner, _store = _adapter(tmp_path, handler)
+    lane = "agent:main:workshop:thread:workspace-1:chat-1"
+
+    class Agent:
+        def interrupt(self, reason):
+            reasons.append(reason)
+            interrupted.set()
+
+    runner._running_agents[lane] = Agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        first = None
+        while first is None:
+            line = (await response.content.readline()).decode()
+            if line.startswith("data: "):
+                first = json.loads(line.removeprefix("data: "))
+        controlled = await client.post(
+            f"/api/workshop/v1/turns/{first['turn_id']}/control",
+            json={
+                "protocol_version": 1,
+                "signal": "abort",
+                "mode": "immediate",
+                "reason": "user_clicked_stop",
+            },
+            headers=_headers(),
+        )
+        records = [first, *_sse_records(await response.text())]
+
+    assert controlled.status == 200
+    assert reasons == ["user_clicked_stop"]
+    assert records[-1]["event"] == "turn.end"
+    assert records[-1]["status"] == "aborted"
+    assert records[-1]["stop_reason"] == "user_clicked_stop"
+
+
+@pytest.mark.asyncio
+async def test_after_current_call_allows_remote_result_then_ends(tmp_path):
+    callback_entered = asyncio.Event()
+    remote_result = {}
+    loop = asyncio.get_running_loop()
+
+    async def handler(event):
+        def invoke():
+            loop.call_soon_threadsafe(callback_entered.set)
+            return event.metadata["_workshop_tool_callback"](
+                "writeFile",
+                {"path": "README.md"},
+                "toolu_after_current",
+            )
+
+        remote_result["value"] = await asyncio.to_thread(invoke)
+        return {"final_response": "paused"}
+
+    tools = [
+        {
+            "name": "writeFile",
+            "description": "Write a file",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(tools=tools),
+            headers=_headers(),
+        )
+        await asyncio.wait_for(callback_entered.wait(), timeout=1)
+        events = []
+        while not any(item["event"] == "tool_call.end" for item in events):
+            line = (await response.content.readline()).decode()
+            if line.startswith("data: "):
+                events.append(json.loads(line.removeprefix("data: ")))
+        turn_id = events[0]["turn_id"]
+        controlled = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/control",
+            json={
+                "protocol_version": 1,
+                "signal": "end_turn",
+                "reason": "approval_required",
+            },
+            headers=_headers(),
+        )
+        assert adapter.ledger.get_tool_call(
+            turn_id, "toolu_after_current"
+        ).state == "pending"
+        result_response = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/tool-results/toolu_after_current",
+            json={"protocol_version": 1, "result": {"ok": True}},
+            headers=_headers(),
+        )
+        events.extend(_sse_records(await response.text()))
+
+    assert controlled.status == 200
+    assert result_response.status == 200
+    assert remote_result["value"].content == {"ok": True}
+    assert remote_result["value"].end_turn is True
+    assert events[-1]["status"] == "completed"
+    assert events[-1]["stop_reason"] == "approval_required"
+
+
+@pytest.mark.asyncio
+async def test_immediate_end_turn_cancels_remote_call_with_typed_error(tmp_path):
+    callback_entered = asyncio.Event()
+    remote_result = {}
+    loop = asyncio.get_running_loop()
+
+    async def handler(event):
+        def invoke():
+            loop.call_soon_threadsafe(callback_entered.set)
+            return event.metadata["_workshop_tool_callback"](
+                "writeFile", {}, "toolu_immediate"
+            )
+
+        remote_result["value"] = await asyncio.to_thread(invoke)
+        return {"interrupted": True}
+
+    tools = [
+        {
+            "name": "writeFile",
+            "description": "Write a file",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    adapter, _runner, _store = _adapter(tmp_path, handler)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns",
+            json=_body(tools=tools),
+            headers=_headers(),
+        )
+        await asyncio.wait_for(callback_entered.wait(), timeout=1)
+        first = None
+        while first is None:
+            line = (await response.content.readline()).decode()
+            if line.startswith("data: "):
+                first = json.loads(line.removeprefix("data: "))
+        turn_id = first["turn_id"]
+        controlled = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/control",
+            json={
+                "protocol_version": 1,
+                "signal": "end_turn",
+                "mode": "immediate",
+                "reason": "connection_required",
+            },
+            headers=_headers(),
+        )
+        records = [first, *_sse_records(await response.text())]
+        late = await client.post(
+            f"/api/workshop/v1/turns/{turn_id}/tool-results/toolu_immediate",
+            json={"protocol_version": 1, "result": {"late": True}},
+            headers=_headers(),
+        )
+
+    value = remote_result["value"]
+    assert controlled.status == 200
+    assert value.is_error is True and value.end_turn is True
+    assert value.content == {
+        "error": {
+            "code": "workshop_turn_controlled",
+            "signal": "end_turn",
+            "mode": "immediate",
+            "reason": "connection_required",
+        }
+    }
+    assert late.status == 409
+    assert records[-1]["status"] == "completed"
+    assert records[-1]["stop_reason"] == "connection_required"
+
+
+@pytest.mark.asyncio
+async def test_turn_duration_cap_aborts_and_interrupts(tmp_path):
+    interrupted = asyncio.Event()
+
+    async def handler(_event):
+        await interrupted.wait()
+        return {"interrupted": True}
+
+    adapter, runner, _store = _adapter(tmp_path, handler)
+    adapter._behavior["turn_timeout_seconds"] = 0.02
+    lane = "agent:main:workshop:thread:workspace-1:chat-1"
+
+    class Agent:
+        def interrupt(self, _reason):
+            interrupted.set()
+
+    runner._running_agents[lane] = Agent()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/workshop/v1/turns", json=_body(), headers=_headers()
+        )
+        records = _sse_records(await response.text())
+
+    assert records[-1]["status"] == "aborted"
+    assert records[-1]["stop_reason"] == "turn_timeout"

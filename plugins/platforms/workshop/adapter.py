@@ -337,16 +337,45 @@ class WorkshopAdapter(BasePlatformAdapter):
         lane = self.turns.lane_lock(initial_key)
         async with lane:
             try:
+                admitted = await asyncio.to_thread(self.ledger.get_turn, turn_id)
+                if admitted is None or admitted.state in {
+                    "completed",
+                    "error",
+                    "aborted",
+                    "interrupted",
+                }:
+                    return
+                if admitted.control_signal is not None:
+                    await self._finish_controlled_turn(admitted)
+                    return
                 # Re-resolve after waiting: an earlier turn in this lane may
                 # have rotated to a compressed child session.
                 session_key, session_id = await self._resolve_session(source)
-                await asyncio.to_thread(
-                    self.ledger.bind_queued_turn_session,
-                    turn_id=turn_id,
-                    session_key=session_key,
-                    session_id=session_id,
-                )
-                await asyncio.to_thread(self.ledger.set_turn_state, turn_id, "running")
+                try:
+                    await asyncio.to_thread(
+                        self.ledger.bind_queued_turn_session,
+                        turn_id=turn_id,
+                        session_key=session_key,
+                        session_id=session_id,
+                    )
+                except WorkshopConflictError:
+                    controlled = await asyncio.to_thread(
+                        self.ledger.get_turn, turn_id
+                    )
+                    if controlled is not None and controlled.control_signal is not None:
+                        await self._finish_controlled_turn(controlled)
+                        return
+                    raise
+                if not await asyncio.to_thread(self.ledger.start_turn, turn_id):
+                    controlled = await asyncio.to_thread(
+                        self.ledger.get_turn, turn_id
+                    )
+                    if controlled is not None and controlled.control_signal is not None:
+                        await self._finish_controlled_turn(controlled)
+                        return
+                    raise WorkshopConflictError(
+                        "workshop turn could not enter running state"
+                    )
                 await self.turns.emit(
                     turn_id,
                     WorkshopEventType.TURN_STARTED,
@@ -461,7 +490,11 @@ class WorkshopAdapter(BasePlatformAdapter):
                 handler = getattr(self, "_message_handler", None)
                 if not callable(handler):
                     raise RuntimeError("Workshop message handler is unavailable")
-                result = await handler(event)
+                result = await self._run_handler_with_controls(
+                    turn_id=turn_id,
+                    event=event,
+                    handler=handler,
+                )
                 result = result if isinstance(result, dict) else {}
                 final_response = str(result.get("final_response") or "")
                 streamed = self.turns.emitted_text(turn_id)
@@ -492,7 +525,18 @@ class WorkshopAdapter(BasePlatformAdapter):
                         "model": result.get("model"),
                     },
                 )
-                if result.get("interrupted"):
+                controlled = await asyncio.to_thread(self.ledger.get_turn, turn_id)
+                if controlled is not None and controlled.control_signal is not None:
+                    await self.turns.finish(
+                        turn_id,
+                        state=(
+                            "aborted"
+                            if controlled.control_signal == "abort"
+                            else "completed"
+                        ),
+                        stop_reason=str(controlled.control_reason or "controlled")[:1024],
+                    )
+                elif result.get("interrupted"):
                     stop_reason = str(result.get("interrupt_message") or "interrupted")[
                         :1024
                     ]
@@ -543,6 +587,146 @@ class WorkshopAdapter(BasePlatformAdapter):
                     code="turn_execution_failed",
                     message=str(exc)[:2048] or type(exc).__name__,
                 )
+
+    def _interrupt_active_agent(self, session_key: str, reason: str) -> bool:
+        runner = self._runner()
+        agent = getattr(runner, "_running_agents", {}).get(session_key)
+        interrupt = getattr(agent, "interrupt", None)
+        if not callable(interrupt):
+            return False
+        interrupt(reason)
+        return True
+
+    async def _finish_controlled_turn(self, record) -> None:
+        assert self.turns is not None
+        await self.turns.finish(
+            record.turn_id,
+            state="aborted" if record.control_signal == "abort" else "completed",
+            stop_reason=str(record.control_reason or "controlled")[:1024],
+        )
+
+    async def _run_handler_with_controls(self, *, turn_id: str, event, handler):
+        """Keep the gateway turn alive while enforcing controls and its cap."""
+
+        assert self.ledger is not None and self.turns is not None
+        task = asyncio.create_task(handler(event))
+        deadline = asyncio.get_running_loop().time() + float(
+            self._behavior.get("turn_timeout_seconds", MAX_TURN_SECONDS)
+        )
+        timeout_applied = False
+        interrupt_sent: tuple[str, str, str] | None = None
+        try:
+            while not task.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0 and not timeout_applied:
+                    record, _created, affected = await asyncio.to_thread(
+                        self.turns.request_control,
+                        turn_id=turn_id,
+                        signal="abort",
+                        mode="immediate",
+                        reason="turn_timeout",
+                        replace=True,
+                    )
+                    if affected == 0 and self._interrupt_active_agent(
+                        record.session_key, "turn_timeout"
+                    ):
+                        interrupt_sent = (
+                            str(record.control_signal),
+                            str(record.control_mode),
+                            str(record.control_reason),
+                        )
+                    timeout_applied = True
+
+                record = await asyncio.to_thread(self.ledger.get_turn, turn_id)
+                if record is not None and record.control_signal is not None:
+                    pending = await asyncio.to_thread(
+                        self.ledger.count_pending_tool_calls, turn_id
+                    )
+                    cancelled = await asyncio.to_thread(
+                        self.ledger.count_cancelled_tool_calls, turn_id
+                    )
+                    signature = (
+                        str(record.control_signal),
+                        str(record.control_mode),
+                        str(record.control_reason),
+                    )
+                    if (
+                        signature != interrupt_sent
+                        and (
+                            (
+                                record.control_mode == "immediate"
+                                and cancelled == 0
+                            )
+                            or (
+                                record.control_mode == "after_current_call"
+                                and pending == 0
+                            )
+                        )
+                    ):
+                        sent = self._interrupt_active_agent(
+                            record.session_key,
+                            str(record.control_reason or "controlled"),
+                        )
+                        if sent:
+                            interrupt_sent = signature
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+                except TimeoutError:
+                    continue
+            return await task
+        except BaseException:
+            if not task.done():
+                task.cancel()
+            raise
+
+    async def control_workshop_turn(
+        self,
+        turn_id: str,
+        control,
+        *,
+        request,
+        controller,
+    ):
+        del request, controller
+        if self.ledger is None or self.turns is None or not self._running:
+            return self._json_error(
+                "workshop_unavailable",
+                "Workshop platform is not connected",
+                status=503,
+            )
+        try:
+            record, created, affected_calls = await asyncio.to_thread(
+                self.turns.request_control,
+                turn_id=turn_id,
+                signal=control.signal,
+                mode=control.mode,
+                reason=control.reason,
+            )
+        except WorkshopNotFoundError as exc:
+            return self._json_error("turn_not_found", str(exc), status=404)
+        except WorkshopConflictError as exc:
+            return self._json_error("turn_control_conflict", str(exc), status=409)
+
+        cancelled = await asyncio.to_thread(
+            self.ledger.count_cancelled_tool_calls, turn_id
+        )
+        if (control.mode == "immediate" and cancelled == 0) or (
+            control.mode == "after_current_call" and affected_calls == 0
+        ):
+            self._interrupt_active_agent(record.session_key, control.reason)
+
+        from aiohttp import web
+
+        return web.json_response(
+            {
+                "ok": True,
+                "turn_id": turn_id,
+                "signal": control.signal,
+                "mode": control.mode,
+                "reason": control.reason,
+                "duplicate": not created,
+            }
+        )
 
     async def resolve_workshop_tool_call(
         self,

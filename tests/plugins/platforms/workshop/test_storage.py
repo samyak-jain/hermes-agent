@@ -202,6 +202,44 @@ def test_pending_tool_call_timeout_is_terminal_and_rejects_late_result(tmp_path)
         )
 
 
+def test_turn_control_is_idempotent_and_immediate_cancel_is_atomic(tmp_path):
+    ledger = _ledger(tmp_path)
+    turn, _ = _turn(ledger)
+    ledger.register_tool_call(
+        turn_id=turn.turn_id,
+        call_id="call-controlled",
+        name="writeFile",
+        arguments={"path": "README.md"},
+    )
+
+    controlled, created, affected = ledger.request_turn_control(
+        turn_id=turn.turn_id,
+        signal="end_turn",
+        mode="immediate",
+        reason="approval_required",
+    )
+    repeated, repeated_created, _ = ledger.request_turn_control(
+        turn_id=turn.turn_id,
+        signal="end_turn",
+        mode="immediate",
+        reason="approval_required",
+    )
+
+    assert created is True and repeated_created is False
+    assert affected == 1
+    assert controlled.control_reason == repeated.control_reason == "approval_required"
+    call = ledger.get_tool_call(turn.turn_id, "call-controlled")
+    assert call is not None and call.state == "cancelled"
+    assert call.result["error"]["code"] == "workshop_turn_controlled"
+    with pytest.raises(WorkshopConflictError):
+        ledger.request_turn_control(
+            turn_id=turn.turn_id,
+            signal="abort",
+            mode="immediate",
+            reason="different",
+        )
+
+
 def test_dead_letter_and_retention_are_durable(tmp_path):
     ledger = _ledger(tmp_path, completed_retention_seconds=10)
     turn, _ = _turn(ledger)

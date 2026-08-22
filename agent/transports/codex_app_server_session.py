@@ -102,6 +102,7 @@ class HostToolResult:
 
     content: Any
     is_error: bool = False
+    end_turn: bool = False
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -267,6 +268,9 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        self._host_tool_state_lock = threading.Lock()
+        self._host_tool_inflight = 0
+        self._host_tool_end_turn = False
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
         # bridge when codex sends item/fileChange/requestApproval. The
@@ -422,6 +426,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        interrupt_check: Optional[Callable[[], bool]] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -453,6 +458,9 @@ class CodexAppServerSession:
         result.thread_id = self._thread_id
 
         self._interrupt_event.clear()
+        if interrupt_check is not None and interrupt_check():
+            result.interrupted = True
+            return result
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
@@ -961,11 +969,15 @@ class CodexAppServerSession:
                 {"content": "Host tool bridge is unavailable", "isError": True},
             )
             return
+        with self._host_tool_state_lock:
+            self._host_tool_inflight += 1
         try:
             output = self._tool_callback(name, arguments, tool_call_id)
             is_error = False
+            end_turn = False
             if isinstance(output, HostToolResult):
                 is_error = output.is_error
+                end_turn = output.end_turn
                 output = output.content
             if not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False, default=str)
@@ -973,12 +985,28 @@ class CodexAppServerSession:
                 rid,
                 {"content": output, "isError": is_error},
             )
+            if end_turn:
+                with self._host_tool_state_lock:
+                    self._host_tool_end_turn = True
         except Exception as exc:
             logger.exception("app-server host tool %s failed", name)
             client.respond(
                 rid,
                 {"content": f"Tool {name} failed: {exc}", "isError": True},
             )
+        finally:
+            with self._host_tool_state_lock:
+                self._host_tool_inflight -= 1
+                interrupt = (
+                    self._host_tool_inflight == 0 and self._host_tool_end_turn
+                )
+                if interrupt:
+                    self._host_tool_end_turn = False
+            if interrupt:
+                # Every in-flight MCP response must cross JSON-RPC before the
+                # provider turn is interrupted. This covers parallel workshop
+                # calls as well as the single after-current-call case.
+                self.request_interrupt()
 
     def _decide_exec_approval(self, params: dict) -> str:
         if self._routing.auto_approve_exec:
