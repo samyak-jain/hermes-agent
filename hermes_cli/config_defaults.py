@@ -5,6 +5,12 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
 DEFAULT_CONFIG = {
+    # Agent access to the operator-owned, profile-scoped GOALS.md broker.
+    # Explicit opt-in and per-write approval are both fail-closed defaults.
+    "goals_edit": {
+        "enabled": False,
+        "require_approval": True,
+    },
     "model": "",
     "providers": {},
     "fallback_providers": [],

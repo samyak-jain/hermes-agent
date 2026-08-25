@@ -106,6 +106,12 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
     # Basic toolsets - individual tool categories
+    "goals": {
+        "description": "Audited operator long-term goals for the active profile",
+        "tools": ["goals"],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],

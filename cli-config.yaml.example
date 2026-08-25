@@ -812,6 +812,13 @@ prompt_caching:
 # =============================================================================
 # Persistent Memory
 # =============================================================================
+# Operator-owned long-term goals broker. Disabled unless explicitly enabled;
+# updates and rollbacks ask for approval by default. GOALS.md is profile-scoped,
+# audited, and limited to 8 KiB. The model cannot choose a path or profile.
+goals_edit:
+  enabled: false
+  require_approval: true
+
 # Bounded curated memory injected into the system prompt every session.
 # Two stores: MEMORY.md (agent's notes) and USER.md (user profile).
 # Character limits keep the memory small and focused. The agent manages
