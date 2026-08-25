@@ -28,6 +28,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -49,6 +50,21 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LIFE_MEMORY_TURNS: "weakref.WeakValueDictionary[str, TurnContext]" = weakref.WeakValueDictionary()
+_LIFE_MEMORY_TURNS_LOCK = threading.Lock()
+
+
+def mark_external_memory_loaded(task_id: str) -> bool:
+    """Mark the live turn that loaded external-origin episodic memory."""
+    if not task_id:
+        return False
+    with _LIFE_MEMORY_TURNS_LOCK:
+        turn = _LIFE_MEMORY_TURNS.get(task_id)
+        if turn is None:
+            return False
+        turn.external_memory_loaded = True
+        return True
 
 
 def compose_user_api_content(
@@ -426,6 +442,8 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # B4 provenance groundwork: enforcement is intentionally a follow-up PR.
+    external_memory_loaded: bool = False
 
 
 def build_turn_context(
@@ -1452,7 +1470,7 @@ def build_turn_context(
     # because every surface enters the turn through this prologue.
     _maybe_title_session_at_turn_start(agent, messages)
 
-    return TurnContext(
+    turn_context = TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
         messages=messages,
@@ -1466,3 +1484,6 @@ def build_turn_context(
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )
+    with _LIFE_MEMORY_TURNS_LOCK:
+        _LIFE_MEMORY_TURNS[effective_task_id] = turn_context
+    return turn_context

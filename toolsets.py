@@ -68,6 +68,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Durable episodic retrieval (config-gated; absent unless explicitly enabled).
+    "life_memory",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -254,6 +256,12 @@ TOOLSETS = {
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
+        "includes": []
+    },
+
+    "life_memory": {
+        "description": "Zero-LLM retrieval over durable ingested episodic memory",
+        "tools": ["life_memory"],
         "includes": []
     },
 
