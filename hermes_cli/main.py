@@ -413,6 +413,7 @@ from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.composio import build_composio_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
@@ -4461,6 +4462,13 @@ def cmd_webhook(args):
     from hermes_cli.webhook import webhook_command
 
     webhook_command(args)
+
+
+def cmd_composio(args):
+    """Composio connection and action management."""
+    from hermes_cli.composio import composio_command
+
+    return composio_command(args)
 
 
 def cmd_slack(args):
@@ -13617,6 +13625,7 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+    build_composio_parser(subparsers, cmd_composio=cmd_composio)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing

@@ -1003,6 +1003,12 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "composio": {
+        "enabled": False,
+        "apps": [],
+        "user_id": "default",
+        "api_key": None,
+    },
     # Service-gated, policy-filtered configuration broker for conversational
     # agents. Disabled unless an operator explicitly enables it. ``allowlist``
     # preserves the narrow explicit-path policy; ``unmanaged`` makes every
