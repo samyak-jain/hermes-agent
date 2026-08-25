@@ -274,6 +274,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)
     "tool.acp": ("agent-client-protocol==0.9.0",),
+    # Composio direct-mode SDK. Only installed when the explicitly-enabled
+    # tool/CLI is first used; the API key remains runtime-provided.
+    "tool.composio": ("composio==0.15.0",),
     # Dashboard (`hermes dashboard`)
     "tool.dashboard": (
         "fastapi==0.133.1",
