@@ -2378,6 +2378,20 @@ DEFAULT_CONFIG = {
         "ssh_background_ttl_seconds": 86400,
     },
 
+    # Durable episodic memory populated by explicit ingestion connectors.
+    # Off by default; retrieval is deterministic and makes no LLM calls.
+    "life_memory": {
+        "enabled": False,
+        "home": "",  # empty = <HERMES_HOME>/life_memory
+        "source_defaults": {
+            "max_items_per_sync": 500,
+            "max_tokens_per_sync": 100_000,
+            "max_cost_per_sync_usd": 0.0,
+            "sync_depth_days": 30,
+        },
+        "sources": {},
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
