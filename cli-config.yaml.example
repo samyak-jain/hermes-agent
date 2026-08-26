@@ -585,6 +585,19 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+# Durable episodic store for email, Slack, calendar, and other connector data.
+# Disabled by default. An empty home uses <HERMES_HOME>/life_memory. Individual
+# entries under sources may override these per-sync budget placeholders.
+life_memory:
+  enabled: false
+  home: ""
+  source_defaults:
+    max_items_per_sync: 500
+    max_tokens_per_sync: 100000
+    max_cost_per_sync_usd: 0.0
+    sync_depth_days: 30
+  sources: {}
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

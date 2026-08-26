@@ -237,6 +237,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "life_memory": {
+        "description": "Zero-LLM retrieval over durable ingested episodic memory",
+        "tools": ["life_memory"],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],

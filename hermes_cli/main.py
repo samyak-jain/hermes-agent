@@ -11615,6 +11615,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "security",
         "acp",
         "webhook",
+        "life-memory",
         "memory",
         "dump",
         "debug",
@@ -12850,7 +12851,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
-        "journey", "memory-graph", "learning",
+        "journey", "memory-graph", "learning", "life-memory",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -13490,6 +13491,9 @@ def main():
         return 0
 
     secrets_parser.set_defaults(func=_dispatch_secrets)
+
+    from hermes_cli.life_memory import register_cli as _life_memory_register
+    _life_memory_register(subparsers)
 
     # =========================================================================
     # migrate command
