@@ -107,6 +107,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "goals": {
+        "description": "Validated operator-goals access for the active profile",
+        "tools": ["goals"],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
