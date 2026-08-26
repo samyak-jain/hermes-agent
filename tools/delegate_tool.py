@@ -52,6 +52,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "config",  # no writes to gateway-owned configuration
         "soul",  # no writes to the parent profile's system-prompt identity
+        "goals",  # no writes to the operator's long-term goals
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name

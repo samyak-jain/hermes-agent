@@ -1027,6 +1027,12 @@ DEFAULT_CONFIG = {
         "max_bytes": 65_536,
         "read_only_profiles": [],
     },
+    # Service-gated broker for operator-owned, profile-scoped GOALS.md.
+    # Explicit opt-in and per-write approval both fail closed.
+    "goals_edit": {
+        "enabled": False,
+        "require_approval": True,
+    },
     # SQLite defaults to WAL on local filesystems. Network-filesystem
     # deployments can explicitly select a rollback journal for every Hermes
     # connection (TRUNCATE avoids a directory-entry mutation per commit).
