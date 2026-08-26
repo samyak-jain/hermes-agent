@@ -1027,6 +1027,12 @@ DEFAULT_CONFIG = {
         "max_bytes": 65_536,
         "read_only_profiles": [],
     },
+    # Service-gated broker for operator-owned, profile-scoped GOALS.md.
+    # Explicit opt-in and per-write approval both fail closed.
+    "goals_edit": {
+        "enabled": False,
+        "require_approval": True,
+    },
     # SQLite defaults to WAL on local filesystems. Network-filesystem
     # deployments can explicitly select a rollback journal for every Hermes
     # connection (TRUNCATE avoids a directory-entry mutation per commit).
@@ -2376,6 +2382,20 @@ DEFAULT_CONFIG = {
         "ssh_systemd_slice": "",
         "ssh_command_memory_max_mb": 0,
         "ssh_background_ttl_seconds": 86400,
+    },
+
+    # Durable episodic memory populated by explicit ingestion connectors.
+    # Off by default; retrieval is deterministic and makes no LLM calls.
+    "life_memory": {
+        "enabled": False,
+        "home": "",  # empty = <HERMES_HOME>/life_memory
+        "source_defaults": {
+            "max_items_per_sync": 500,
+            "max_tokens_per_sync": 100_000,
+            "max_cost_per_sync_usd": 0.0,
+            "sync_depth_days": 30,
+        },
+        "sources": {},
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

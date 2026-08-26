@@ -553,6 +553,10 @@ def _assert_path_allowed(path: str, config: dict, *, for_write: bool) -> str:
         raise AgentConfigError(
             "The configuration broker cannot edit the SOUL access policy."
         )
+    if path == "goals_edit" or path.startswith("goals_edit."):
+        raise AgentConfigError(
+            "The configuration broker cannot edit the GOALS access policy."
+        )
     if _secret_shaped_path(path):
         raise AgentConfigError(
             f"'{path}' is credential-shaped. Secrets must use the authentication "
@@ -617,7 +621,7 @@ def inspect_config(path: Optional[str] = None) -> dict:
     settings = []
     for dotted in sorted(effective_flat):
         top = dotted.split(".", 1)[0]
-        if top.startswith("_") or top in {"agent_config", "soul_edit"}:
+        if top.startswith("_") or top in {"agent_config", "soul_edit", "goals_edit"}:
             continue
         classification = _path_class(dotted, effective)
         if classification is None or _secret_shaped_path(dotted):

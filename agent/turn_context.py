@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -39,6 +40,21 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LIFE_MEMORY_TURNS: "weakref.WeakValueDictionary[str, TurnContext]" = weakref.WeakValueDictionary()
+_LIFE_MEMORY_TURNS_LOCK = threading.Lock()
+
+
+def mark_external_memory_loaded(task_id: str) -> bool:
+    """Mark the live turn that loaded external-origin episodic memory."""
+    if not task_id:
+        return False
+    with _LIFE_MEMORY_TURNS_LOCK:
+        turn = _LIFE_MEMORY_TURNS.get(task_id)
+        if turn is None:
+            return False
+        turn.external_memory_loaded = True
+        return True
 
 
 def compose_user_api_content(
@@ -263,6 +279,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # B4 provenance groundwork: enforcement is intentionally a follow-up PR.
+    external_memory_loaded: bool = False
 
 
 def build_turn_context(
@@ -887,7 +905,7 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
-    return TurnContext(
+    turn_context = TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
         messages=messages,
@@ -900,3 +918,6 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )
+    with _LIFE_MEMORY_TURNS_LOCK:
+        _LIFE_MEMORY_TURNS[effective_task_id] = turn_context
+    return turn_context

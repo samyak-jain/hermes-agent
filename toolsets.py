@@ -107,6 +107,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "goals": {
+        "description": "Validated operator-goals access for the active profile",
+        "tools": ["goals"],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
@@ -234,6 +240,12 @@ TOOLSETS = {
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
+        "includes": []
+    },
+
+    "life_memory": {
+        "description": "Zero-LLM retrieval over durable ingested episodic memory",
+        "tools": ["life_memory"],
         "includes": []
     },
 
