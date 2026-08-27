@@ -186,6 +186,44 @@ def authorize_agent_tool(agent: Any, name: str) -> str | None:
     return None
 
 
+_BACKGROUND_ORIGIN_PLATFORMS = frozenset({"cron", "webhook", "msgraph_webhook"})
+
+
+def authorize_turn_tool(agent: Any, name: str, task_id: str) -> str | None:
+    """Apply exact-name policy plus the external-memory background gate.
+
+    Once an unattended turn has retrieved externally synced memory, it may
+    continue to use tools proven read-only but cannot invoke an effect-capable
+    tool. This closes the prompt-injection laundering path from synced content
+    to a later autonomous action without changing the stable tool schema.
+    """
+    blocked = authorize_agent_tool(agent, name)
+    if blocked is not None:
+        return blocked
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    if platform not in _BACKGROUND_ORIGIN_PLATFORMS:
+        return None
+    from agent.turn_context import external_memory_loaded_for_task
+    from agent.tool_result_classification import tool_may_have_side_effect
+
+    if (
+        external_memory_loaded_for_task(task_id)
+        and tool_may_have_side_effect(name)
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"Tool {name!r} is blocked because this unattended turn "
+                    "loaded externally synced memory. Ask the operator before "
+                    "taking an external or state-changing action."
+                ),
+                "code": "external_memory_effect_blocked",
+            },
+            ensure_ascii=False,
+        )
+    return None
+
+
 def allowed_tool_names_for_dispatch(agent: Any) -> frozenset[str] | None:
     """Return the strict dispatch boundary, or ``None`` for legacy behavior."""
     policy = getattr(agent, "tool_policy", LEGACY_TOOL_POLICY)

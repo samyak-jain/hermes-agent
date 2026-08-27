@@ -57,6 +57,15 @@ def mark_external_memory_loaded(task_id: str) -> bool:
         return True
 
 
+def external_memory_loaded_for_task(task_id: str) -> bool:
+    """Return whether this live turn retrieved external-sync memory."""
+    if not task_id:
+        return False
+    with _LIFE_MEMORY_TURNS_LOCK:
+        turn = _LIFE_MEMORY_TURNS.get(task_id)
+        return bool(turn is not None and turn.external_memory_loaded)
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
