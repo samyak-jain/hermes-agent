@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ class ComposioSettings:
     user_id: str
     api_key: str | None
     allowed_actions: Mapping[str, frozenset[str]] | None = None
+    approval_actions: Mapping[str, frozenset[str]] | None = None
     scopes: Mapping[str, tuple[str, ...]] | None = None
 
     @classmethod
@@ -82,6 +84,19 @@ class ComposioSettings:
             if not app or app not in normalized or not isinstance(raw_values, (list, tuple, set, frozenset)):
                 continue
             allowed_actions[app] = frozenset(
+                str(value).strip().upper()
+                for value in raw_values
+                if str(value).strip()
+            )
+        raw_approvals = block.get("approval_actions") or {}
+        if not isinstance(raw_approvals, dict):
+            raw_approvals = {}
+        approval_actions: dict[str, frozenset[str]] = {}
+        for raw_app, raw_values in raw_approvals.items():
+            app = str(raw_app).strip().lower()
+            if not app or app not in normalized or not isinstance(raw_values, (list, tuple, set, frozenset)):
+                continue
+            approval_actions[app] = frozenset(
                 str(value).strip().upper()
                 for value in raw_values
                 if str(value).strip()
@@ -111,6 +126,7 @@ class ComposioSettings:
             user_id,
             str(api_key).strip() if api_key else None,
             allowed_actions,
+            approval_actions,
             scopes,
         )
 
@@ -154,6 +170,12 @@ class ComposioClient:
             )
         return action_slug
 
+    def action_requires_approval(self, app: str, action: str) -> bool:
+        """Return whether an already-allowlisted action needs human approval."""
+        slug = self.require_app(app)
+        action_slug = self.require_action(slug, action)
+        return action_slug in (self.settings.approval_actions or {}).get(slug, frozenset())
+
     def list_toolkits(self) -> list[dict[str, Any]]:
         self.require_enabled()
         if not self.settings.apps:
@@ -169,7 +191,11 @@ class ComposioClient:
 
     def _auth_config_id(self, app: str) -> str:
         response = self.sdk.auth_configs.list(toolkit_slug=app, is_composio_managed=True, limit=1000)
-        config_name = f"Hermes {app} scoped"
+        configured_scopes = (self.settings.scopes or {}).get(app, ())
+        scope_fingerprint = hashlib.sha256(
+            "\n".join(configured_scopes).encode("utf-8")
+        ).hexdigest()[:10]
+        config_name = f"Hermes {app} scoped {scope_fingerprint}"
         configs = [
             config for config in _items(response)
             if str(_nested(config, "name") or "") == config_name
@@ -179,7 +205,6 @@ class ComposioClient:
                 "type": "use_composio_managed_auth",
                 "name": config_name,
             }
-            configured_scopes = (self.settings.scopes or {}).get(app, ())
             if configured_scopes:
                 options["credentials"] = {"scopes": ",".join(configured_scopes)}
             created = self.sdk.auth_configs.create(app, options)

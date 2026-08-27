@@ -6,6 +6,7 @@ import pytest
 
 from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
 from tools.composio_client import ComposioClient, ComposioError, ComposioSettings
+from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS
 from toolsets import resolve_toolset
 
 
@@ -20,6 +21,7 @@ def settings(
     enabled=True,
     api_key="test-key",
     allowed_actions=None,
+    approval_actions=None,
     scopes=None,
 ):
     return ComposioSettings(
@@ -30,6 +32,7 @@ def settings(
         allowed_actions if allowed_actions is not None else {
             "gmail": frozenset({"GMAIL_GET_PROFILE"}),
         },
+        approval_actions or {},
         scopes or {},
     )
 
@@ -43,6 +46,7 @@ def test_settings_prefers_environment_key(monkeypatch):
     assert loaded.api_key == "from-env"
     assert loaded.apps == ("gmail",)
     assert loaded.allowed_actions == {}
+    assert loaded.approval_actions == {}
     assert loaded.scopes == {}
 
 
@@ -55,6 +59,10 @@ def test_settings_normalizes_action_allowlist(monkeypatch):
                 "GMAIL": ["gmail_get_profile", " GMAIL_FETCH_EMAILS "],
                 "slack": ["SLACK_FETCH_CONVERSATIONS"],
             },
+            "approval_actions": {
+                "GMAIL": ["gmail_send_email", " GMAIL_CREATE_DRAFT "],
+                "slack": ["SLACK_SEND_MESSAGE"],
+            },
             "scopes": {
                 "GMAIL": ["gmail.readonly", "gmail.readonly", " profile "],
                 "slack": ["channels:read"],
@@ -64,6 +72,9 @@ def test_settings_normalizes_action_allowlist(monkeypatch):
     loaded = ComposioSettings.load()
     assert loaded.allowed_actions == {
         "gmail": frozenset({"GMAIL_GET_PROFILE", "GMAIL_FETCH_EMAILS"}),
+    }
+    assert loaded.approval_actions == {
+        "gmail": frozenset({"GMAIL_SEND_EMAIL", "GMAIL_CREATE_DRAFT"}),
     }
     assert loaded.scopes == {"gmail": ("gmail.readonly", "profile")}
 
@@ -88,9 +99,30 @@ def test_managed_auth_config_uses_operator_scopes():
     assert result["id"] == "ca_1"
     assert calls == [("gmail", {
         "type": "use_composio_managed_auth",
-        "name": "Hermes gmail scoped",
+        "name": "Hermes gmail scoped f7a5315214",
         "credentials": {"scopes": "gmail.readonly,profile"},
     })]
+
+
+def test_changed_scopes_create_a_new_versioned_auth_config():
+    calls = []
+    sdk = SimpleNamespace(
+        auth_configs=Resource(
+            list=lambda **kw: SimpleNamespace(items=[
+                {"id": "ac_old", "name": "Hermes gmail scoped 0000000000"},
+            ]),
+            create=lambda *args: calls.append(args) or {"id": "ac_new"},
+        ),
+        connected_accounts=Resource(
+            link=lambda user, auth, **kw: SimpleNamespace(
+                id=auth, status="INITIATED", redirect_url="https://example.invalid/connect",
+            ),
+        ),
+    )
+    result = ComposioClient(settings(scopes={"gmail": ("gmail.modify",)}), sdk=sdk).initiate_connection("gmail")
+    assert result["id"] == "ac_new"
+    assert calls[0][1]["name"].startswith("Hermes gmail scoped ")
+    assert calls[0][1]["name"] != "Hermes gmail scoped 0000000000"
 
 
 def test_auth_config_does_not_reuse_unscoped_default():
@@ -220,6 +252,7 @@ def test_composio_stays_out_of_unattended_safe_toolsets():
     assert "composio" in resolve_toolset("hermes-cli")
     assert "composio" not in resolve_toolset("hermes-cron")
     assert "composio" not in resolve_toolset("hermes-webhook")
+    assert "composio" in DELEGATE_BLOCKED_TOOLS
 
 
 def test_composio_results_use_canonical_untrusted_framing():
