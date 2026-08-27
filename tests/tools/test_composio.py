@@ -23,6 +23,9 @@ def settings(
     allowed_actions=None,
     approval_actions=None,
     scopes=None,
+    backend="platform",
+    consumer_api_key=None,
+    accounts=None,
 ):
     return ComposioSettings(
         enabled,
@@ -34,6 +37,10 @@ def settings(
         },
         approval_actions or {},
         scopes or {},
+        backend,
+        consumer_api_key,
+        "composio-connect",
+        accounts or {},
     )
 
 
@@ -77,6 +84,100 @@ def test_settings_normalizes_action_allowlist(monkeypatch):
         "gmail": frozenset({"GMAIL_SEND_EMAIL", "GMAIL_CREATE_DRAFT"}),
     }
     assert loaded.scopes == {"gmail": ("gmail.readonly", "profile")}
+
+
+def test_settings_loads_consumer_backend_and_account_aliases(monkeypatch):
+    monkeypatch.setenv("COMPOSIO_CONSUMER_API_KEY", "ck_test")
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "composio": {
+            "enabled": True,
+            "backend": "consumer_mcp",
+            "apps": ["GMAIL", "github"],
+            "accounts": {
+                "GMAIL": {"Personal": "gmail_personal", "Loopedin": "gmail_work"},
+                "slack": {"loopedin": "slack_hidden"},
+            },
+        }
+    })
+    loaded = ComposioSettings.load()
+    assert loaded.backend == "consumer_mcp"
+    assert loaded.consumer_api_key == "ck_test"
+    assert loaded.accounts == {
+        "gmail": {"personal": "gmail_personal", "loopedin": "gmail_work"},
+    }
+
+
+def test_consumer_requires_explicit_alias_for_multi_account_app():
+    client = ComposioClient(settings(
+        backend="consumer_mcp",
+        consumer_api_key="ck_test",
+        accounts={"gmail": {"personal": "gmail_personal", "loopedin": "gmail_work"}},
+    ))
+    with pytest.raises(ComposioError, match="account is required"):
+        client.resolve_account("gmail", None)
+    assert client.resolve_account("gmail", "personal") == "gmail_personal"
+    with pytest.raises(ComposioError, match="Unknown account"):
+        client.resolve_account("gmail", "test")
+
+
+def test_consumer_execute_checks_action_before_mcp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool.call_mcp_server_tool",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or '{"ok":true}',
+    )
+    client = ComposioClient(settings(
+        backend="consumer_mcp",
+        consumer_api_key="ck_test",
+        accounts={"gmail": {"personal": "gmail_personal"}},
+    ))
+    with pytest.raises(ComposioError, match="operator allowlist"):
+        client.execute("gmail", "GMAIL_SEND_EMAIL", {}, connected_account_id="personal")
+    assert calls == []
+
+
+def test_consumer_execute_uses_internal_mcp_and_resolved_account(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool.call_mcp_server_tool",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or '{"data":{"ok":true}}',
+    )
+    client = ComposioClient(settings(
+        backend="consumer_mcp",
+        consumer_api_key="ck_test",
+        accounts={"gmail": {"personal": "gmail_personal"}},
+    ))
+    result = client.execute(
+        "gmail",
+        "GMAIL_GET_PROFILE",
+        {},
+        connected_account_id="personal",
+        context={"task_id": "turn-1"},
+    )
+    assert result == {"data": {"ok": True}}
+    assert calls[0][0][0:2] == ("composio-connect", "COMPOSIO_MULTI_EXECUTE_TOOL")
+    assert calls[0][0][2]["tools"] == [{
+        "tool_slug": "GMAIL_GET_PROFILE",
+        "arguments": {},
+        "account": "gmail_personal",
+    }]
+    assert calls[0][1]["task_id"] == "turn-1"
+
+
+def test_schema_discovery_rejects_unlisted_action_before_mcp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool.call_mcp_server_tool",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    client = ComposioClient(settings(
+        backend="consumer_mcp",
+        consumer_api_key="ck_test",
+        accounts={"gmail": {"personal": "gmail_personal"}},
+    ))
+    with pytest.raises(ComposioError, match="not in any operator allowlist"):
+        client.get_tool_schemas(["GMAIL_DELETE_USER"])
+    assert calls == []
 
 
 def test_managed_auth_config_uses_operator_scopes():

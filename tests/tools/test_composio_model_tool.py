@@ -7,7 +7,7 @@ import tools.composio_tool as module
 
 def test_model_schema_has_no_connection_mutations():
     operations = module.COMPOSIO_SCHEMA["parameters"]["properties"]["operation"]["enum"]
-    assert operations == ["list_toolkits", "list_connections", "execute"]
+    assert operations == ["list_toolkits", "list_connections", "search", "get_schemas", "execute"]
     assert "callback_url" not in module.COMPOSIO_SCHEMA["parameters"]["properties"]
 
 
@@ -99,3 +99,68 @@ def test_approval_fingerprint_is_bound_to_exact_payload(monkeypatch):
     assert captured[0]["rule_key"] != captured[1]["rule_key"]
     assert captured[0]["allow_permanent"] is False
     assert captured[0]["allow_yolo"] is False
+
+
+def test_consumer_mcp_write_relies_on_provider_elicitation_without_duplicate_approval(monkeypatch):
+    executed = []
+
+    class Client:
+        consumer_mcp = True
+
+        def __init__(self):
+            pass
+
+        def require_app(self, app):
+            return "gmail"
+
+        def require_action(self, app, action):
+            return "GMAIL_SEND_EMAIL"
+
+        def action_requires_approval(self, app, action):
+            raise AssertionError("local approval must not run for consumer MCP")
+
+        def execute(self, *args, **kwargs):
+            executed.append((args, kwargs))
+            return {"ok": True}
+
+    monkeypatch.setattr(module, "ComposioClient", Client)
+    monkeypatch.setattr(
+        module,
+        "_approval_request",
+        lambda *args: (_ for _ in ()).throw(AssertionError("duplicate approval")),
+    )
+    result = json.loads(module.composio_tool({
+        "operation": "execute",
+        "app": "gmail",
+        "action": "GMAIL_SEND_EMAIL",
+        "params": {"to": "person@example.com"},
+        "account": "personal",
+    }, task_id="turn-1"))
+    assert result["success"] is True
+    assert executed[0][1]["connected_account_id"] == "personal"
+    assert executed[0][1]["context"] == {"task_id": "turn-1"}
+
+
+def test_account_and_connection_id_must_not_disagree(monkeypatch):
+    class Client:
+        consumer_mcp = True
+
+        def __init__(self):
+            pass
+
+        def require_app(self, app):
+            return "gmail"
+
+        def require_action(self, app, action):
+            return "GMAIL_GET_PROFILE"
+
+    monkeypatch.setattr(module, "ComposioClient", Client)
+    result = json.loads(module.composio_tool({
+        "operation": "execute",
+        "app": "gmail",
+        "action": "GMAIL_GET_PROFILE",
+        "params": {},
+        "account": "personal",
+        "connection_id": "loopedin",
+    }))
+    assert "disagree" in result["error"]

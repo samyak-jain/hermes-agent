@@ -155,6 +155,23 @@ Behavior:
 - no tool registration
 - config remains in place for later reuse
 
+## `expose_tools: false`
+
+```yaml
+mcp_servers:
+  internal_transport:
+    url: "https://mcp.example.com"
+    expose_tools: false
+    tools:
+      include: [search, execute]
+```
+
+This keeps the MCP session connected, including elicitation callbacks, but
+does not register any of its tools for model use. Built-in policy brokers can
+call only the names in `tools.include` through Hermes's internal MCP API. Use
+this when a narrower native tool must remain the capability boundary in front
+of an MCP transport.
+
 ## Empty result behavior
 
 If filtering removes all server-native tools and no utility tools are registered, Hermes does not create an empty MCP runtime toolset for that server.

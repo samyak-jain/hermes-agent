@@ -5032,6 +5032,15 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     """
     from tools.registry import registry
 
+    # Some built-in brokers use an MCP server as a transport while keeping a
+    # narrower, host-reviewed model schema as the capability boundary.  Such
+    # servers must remain connected (including elicitation callbacks) without
+    # registering their raw tools into the global registry, where broad cron
+    # or child policies could otherwise expose them accidentally.
+    if not _parse_boolish(config.get("expose_tools", True), default=True):
+        logger.info("MCP server '%s': connected as an internal-only transport", name)
+        return []
+
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
 
@@ -5277,6 +5286,56 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.info(summary)
 
     return _existing_tool_names()
+
+
+def call_mcp_server_tool(
+    server_name: str,
+    tool_name: str,
+    arguments: dict,
+    **kwargs,
+) -> str | dict:
+    """Call a connected MCP tool without exposing it to the model registry.
+
+    This is intended for built-in, policy-enforcing brokers backed by an MCP
+    transport.  The requested tool must be present in the server's configured
+    ``tools.include`` list, so the broker cannot turn an internal-only server
+    into an unrestricted escape hatch.
+    """
+    server = _get_connected_server_for_call(server_name)
+    if server is None:
+        # Discovery normally runs after built-in registration and before the
+        # first model turn.  Retry once for CLI/test call paths that invoke a
+        # built-in broker directly.
+        discover_mcp_tools()
+        server = _get_connected_server_for_call(server_name)
+    if server is None:
+        return json.dumps({"error": f"MCP server '{server_name}' is not connected"})
+
+    if _parse_boolish(server._config.get("expose_tools", True), default=True):
+        return json.dumps({
+            "error": f"MCP server '{server_name}' is not configured as internal-only"
+        }, ensure_ascii=False)
+
+    tools_filter = server._config.get("tools") or {}
+    include_set = _normalize_name_filter(
+        tools_filter.get("include"),
+        f"mcp_servers.{server_name}.tools.include",
+    )
+    if not include_set or tool_name not in include_set:
+        return json.dumps({
+            "error": (
+                f"MCP tool '{tool_name}' is not in the internal allowlist "
+                f"for server '{server_name}'"
+            )
+        }, ensure_ascii=False)
+
+    advertised = {str(getattr(tool, "name", "")) for tool in server._tools}
+    if tool_name not in advertised:
+        return json.dumps({
+            "error": f"MCP server '{server_name}' does not advertise tool '{tool_name}'"
+        }, ensure_ascii=False)
+
+    return _make_tool_handler(server_name, tool_name, server.tool_timeout)(arguments, **kwargs)
 
 
 def discover_mcp_tools() -> List[str]:
