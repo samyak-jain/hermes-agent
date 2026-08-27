@@ -7,6 +7,7 @@ from agent.tool_policy import (
     ToolAccessPolicy,
     allowed_tool_names_for_dispatch,
     authorize_agent_tool,
+    authorize_turn_tool,
     deny_tools,
     parse_tool_policy,
 )
@@ -155,6 +156,35 @@ def test_fabricated_disallowed_call_is_rejected_before_dispatch():
         )
     )
     assert direct["code"] == "tool_not_allowed_by_policy"
+
+
+def test_external_memory_blocks_effects_for_unattended_turns(monkeypatch):
+    agent = SimpleNamespace(
+        platform="cron",
+        tool_policy=ToolAccessPolicy(mode="unrestricted"),
+        valid_tool_names={"life_memory", "composio"},
+    )
+    monkeypatch.setattr(
+        "agent.turn_context.external_memory_loaded_for_task",
+        lambda task_id: task_id == "cron-task",
+    )
+
+    assert authorize_turn_tool(agent, "life_memory", "cron-task") is None
+    blocked = json.loads(authorize_turn_tool(agent, "composio", "cron-task"))
+    assert blocked["code"] == "external_memory_effect_blocked"
+
+
+def test_external_memory_gate_does_not_change_operator_turns(monkeypatch):
+    agent = SimpleNamespace(
+        platform="discord",
+        tool_policy=ToolAccessPolicy(mode="unrestricted"),
+        valid_tool_names={"composio"},
+    )
+    monkeypatch.setattr(
+        "agent.turn_context.external_memory_loaded_for_task",
+        lambda _task_id: True,
+    )
+    assert authorize_turn_tool(agent, "composio", "operator-task") is None
 
 
 def _parent():

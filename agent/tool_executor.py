@@ -432,8 +432,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        from agent.tool_policy import authorize_agent_tool
-        _policy_block = authorize_agent_tool(agent, function_name)
+        from agent.tool_policy import authorize_turn_tool
+        _policy_block = authorize_turn_tool(
+            agent, function_name, effective_task_id,
+        )
         if _policy_block is not None:
             parsed_calls.append(
                 (tool_call, function_name, function_args, [], _policy_block, False)
@@ -1117,8 +1119,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        from agent.tool_policy import authorize_agent_tool
-        _policy_block = authorize_agent_tool(agent, function_name)
+        from agent.tool_policy import authorize_turn_tool
+        _policy_block = authorize_turn_tool(
+            agent, function_name, effective_task_id,
+        )
         if _policy_block is not None:
             messages.append(make_tool_result_message(
                 function_name, _policy_block, tool_call.id,
