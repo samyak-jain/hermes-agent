@@ -19,3 +19,83 @@ def test_hidden_connection_mutation_cannot_be_called(monkeypatch):
     monkeypatch.setattr(module, "ComposioClient", Client)
     result = json.loads(module.composio_tool({"operation": "delete_connection", "connection_id": "ca_1"}))
     assert "Unknown Composio operation" in result["error"]
+
+
+def test_approval_action_is_denied_before_execution(monkeypatch):
+    calls = []
+
+    class Client:
+        def __init__(self):
+            pass
+
+        def require_app(self, app):
+            return "gmail"
+
+        def require_action(self, app, action):
+            return "GMAIL_SEND_EMAIL"
+
+        def action_requires_approval(self, app, action):
+            return True
+
+        def execute(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(module, "ComposioClient", Client)
+    monkeypatch.setattr(module, "_approval_request", lambda *args: {
+        "approved": False,
+        "message": "denied",
+    })
+    result = json.loads(module.composio_tool({
+        "operation": "execute",
+        "app": "gmail",
+        "action": "GMAIL_SEND_EMAIL",
+        "params": {"to": "person@example.com"},
+    }))
+    assert result["error"] == "denied"
+    assert calls == []
+
+
+def test_approved_action_executes_and_read_bypasses_approval(monkeypatch):
+    executed = []
+    approvals = []
+
+    class Client:
+        def __init__(self):
+            pass
+
+        def require_app(self, app):
+            return "gmail"
+
+        def require_action(self, app, action):
+            return str(action).upper()
+
+        def action_requires_approval(self, app, action):
+            return action == "GMAIL_SEND_EMAIL"
+
+        def execute(self, app, action, params, connected_account_id=None):
+            executed.append((app, action, params, connected_account_id))
+            return {"ok": True}
+
+    monkeypatch.setattr(module, "ComposioClient", Client)
+    monkeypatch.setattr(module, "_approval_request", lambda *args: approvals.append(args) or {"approved": True})
+
+    sent = json.loads(module.composio_tool({
+        "operation": "execute", "app": "gmail", "action": "gmail_send_email",
+        "params": {"to": "person@example.com"}, "connection_id": "ca_1",
+    }))
+    read = json.loads(module.composio_tool({
+        "operation": "execute", "app": "gmail", "action": "gmail_get_profile", "params": {},
+    }))
+    assert sent["success"] is True and read["success"] is True
+    assert len(approvals) == 1
+    assert [item[1] for item in executed] == ["GMAIL_SEND_EMAIL", "GMAIL_GET_PROFILE"]
+
+
+def test_approval_fingerprint_is_bound_to_exact_payload(monkeypatch):
+    captured = []
+    monkeypatch.setattr("tools.approval.request_tool_approval", lambda *args, **kwargs: captured.append(kwargs) or {"approved": True})
+    module._approval_request("gmail", "GMAIL_SEND_EMAIL", {"to": "a@example.com"}, "ca_1")
+    module._approval_request("gmail", "GMAIL_SEND_EMAIL", {"to": "b@example.com"}, "ca_1")
+    assert captured[0]["rule_key"] != captured[1]["rule_key"]
+    assert captured[0]["allow_permanent"] is False
+    assert captured[0]["allow_yolo"] is False

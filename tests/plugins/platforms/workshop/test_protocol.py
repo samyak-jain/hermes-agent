@@ -78,7 +78,9 @@ def test_representative_cloudflare_catalog_is_accepted_without_schema_weakening(
     assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == digest
 
 
-@pytest.mark.parametrize("name", ["spawn_agent", "memory", "mcp__workshop__writeFile"])
+@pytest.mark.parametrize(
+    "name", ["spawn_agent", "memory", "composio", "mcp__workshop__writeFile"]
+)
 def test_remote_tool_cannot_shadow_local_or_reserved_names(name):
     with pytest.raises(WorkshopProtocolError) as exc:
         parse_tool_catalog([_tool(name)])

@@ -57,6 +57,7 @@ HERMES_WORKSHOP_LOCAL_TOOL_NAMES = frozenset(
         "session_search",
         "config",
         "soul",
+        "composio",
     }
 )
 
