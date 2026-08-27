@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 class ComposioError(RuntimeError):
@@ -63,6 +63,10 @@ class ComposioSettings:
     allowed_actions: Mapping[str, frozenset[str]] | None = None
     approval_actions: Mapping[str, frozenset[str]] | None = None
     scopes: Mapping[str, tuple[str, ...]] | None = None
+    backend: str = "platform"
+    consumer_api_key: str | None = None
+    mcp_server_name: str = "composio-connect"
+    accounts: Mapping[str, Mapping[str, str]] | None = None
 
     @classmethod
     def load(cls) -> "ComposioSettings":
@@ -116,10 +120,33 @@ class ComposioSettings:
                     if str(value).strip()
                 )
             )
+        raw_accounts = block.get("accounts") or {}
+        if not isinstance(raw_accounts, dict):
+            raw_accounts = {}
+        accounts: dict[str, dict[str, str]] = {}
+        for raw_app, raw_values in raw_accounts.items():
+            app = str(raw_app).strip().lower()
+            if not app or app not in normalized or not isinstance(raw_values, dict):
+                continue
+            aliases = {
+                str(alias).strip().lower(): str(account_id).strip()
+                for alias, account_id in raw_values.items()
+                if str(alias).strip() and str(account_id).strip()
+            }
+            if aliases:
+                accounts[app] = aliases
         # ``entity_id`` is accepted as a compatibility spelling, but the current
         # SDK calls this stable external identity ``user_id``.
         user_id = str(block.get("user_id") or block.get("entity_id") or "default").strip()
         api_key = os.environ.get("COMPOSIO_API_KEY") or block.get("api_key")
+        consumer_api_key = (
+            os.environ.get("COMPOSIO_CONSUMER_API_KEY")
+            or block.get("consumer_api_key")
+        )
+        backend = str(block.get("backend") or "platform").strip().lower()
+        if backend not in {"platform", "consumer_mcp"}:
+            backend = "platform"
+        mcp_server_name = str(block.get("mcp_server_name") or "composio-connect").strip()
         return cls(
             block.get("enabled") is True,
             normalized,
@@ -128,6 +155,10 @@ class ComposioSettings:
             allowed_actions,
             approval_actions,
             scopes,
+            backend,
+            str(consumer_api_key).strip() if consumer_api_key else None,
+            mcp_server_name,
+            accounts,
         )
 
 
@@ -136,6 +167,15 @@ class ComposioClient:
         self.settings = settings or ComposioSettings.load()
         if not self.settings.enabled:
             raise ComposioError("Composio is disabled; set composio.enabled: true in config.yaml.")
+        self.consumer_mcp = self.settings.backend == "consumer_mcp"
+        if self.consumer_mcp:
+            if not self.settings.consumer_api_key:
+                raise ComposioError(
+                    "Composio consumer key is missing "
+                    "(set COMPOSIO_CONSUMER_API_KEY)."
+                )
+            self.sdk = None
+            return
         if not self.settings.api_key:
             raise ComposioError("Composio API key is missing (set COMPOSIO_API_KEY or composio.api_key).")
         if sdk is None:
@@ -170,6 +210,136 @@ class ComposioClient:
             )
         return action_slug
 
+    def resolve_account(self, app: str, account: str | None) -> str:
+        """Resolve a host-managed alias to a consumer connected-account id."""
+        slug = self.require_app(app)
+        configured = dict((self.settings.accounts or {}).get(slug, {}))
+        if not configured:
+            raise ComposioError(f"No approved Composio accounts are configured for '{slug}'.")
+
+        selector = str(account or "").strip().lower()
+        if selector:
+            if selector in configured:
+                return configured[selector]
+            matching_ids = [value for value in configured.values() if value == str(account).strip()]
+            if matching_ids:
+                return matching_ids[0]
+            allowed = ", ".join(sorted(configured))
+            raise ComposioError(
+                f"Unknown account '{account}' for '{slug}' (allowed aliases: {allowed})."
+            )
+
+        if len(configured) == 1:
+            return next(iter(configured.values()))
+        allowed = ", ".join(sorted(configured))
+        raise ComposioError(
+            f"account is required for '{slug}' because multiple approved accounts exist "
+            f"(choose: {allowed})."
+        )
+
+    def _consumer_call(self, tool_name: str, arguments: dict[str, Any], **context: Any) -> Any:
+        from tools.mcp_tool import call_mcp_server_tool
+
+        raw = call_mcp_server_tool(
+            self.settings.mcp_server_name,
+            tool_name,
+            arguments,
+            **context,
+        )
+        if not isinstance(raw, str):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        # The Connect MCP router wraps its JSON payload in a text block, which
+        # the generic MCP renderer exposes as ``{"result": "<json>"}``.
+        # Unwrap that transport envelope so the native broker returns normal
+        # structured data to the model.
+        for _ in range(2):
+            if not (
+                isinstance(parsed, dict)
+                and set(parsed) == {"result"}
+                and isinstance(parsed["result"], str)
+            ):
+                break
+            try:
+                parsed = json.loads(parsed["result"])
+            except json.JSONDecodeError:
+                break
+        if isinstance(parsed, dict) and parsed.get("error"):
+            raise ComposioError(str(parsed["error"]))
+        return parsed
+
+    def search_tools(
+        self,
+        queries: Sequence[Mapping[str, Any]],
+        *,
+        session_id: str | None = None,
+        model: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if not self.consumer_mcp:
+            raise ComposioError("Tool search requires the Composio consumer MCP backend.")
+        normalized_queries = []
+        for query in queries:
+            if not isinstance(query, Mapping):
+                raise ComposioError("Each Composio search query must be an object.")
+            use_case = str(query.get("use_case") or "").strip()
+            if not use_case:
+                raise ComposioError("Each Composio search query requires use_case.")
+            item = {"use_case": use_case}
+            known_fields = str(query.get("known_fields") or "").strip()
+            if known_fields:
+                item["known_fields"] = known_fields
+            normalized_queries.append(item)
+        if not normalized_queries:
+            raise ComposioError("At least one Composio search query is required.")
+        arguments: dict[str, Any] = {
+            "queries": normalized_queries,
+            "session": {"id": session_id} if session_id else {"generate_id": True},
+            "search_strategy": "tool_search",
+        }
+        if model:
+            arguments["model"] = model
+        return self._consumer_call(
+            "COMPOSIO_SEARCH_TOOLS",
+            arguments,
+            **dict(context or {}),
+        )
+
+    def get_tool_schemas(
+        self,
+        actions: Sequence[str],
+        *,
+        session_id: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if not self.consumer_mcp:
+            raise ComposioError("Schema discovery requires the Composio consumer MCP backend.")
+        slugs = [str(action).strip().upper() for action in actions if str(action).strip()]
+        if not slugs:
+            raise ComposioError("At least one action is required for schema discovery.")
+        # Schema discovery cannot be used to inspect capabilities outside the
+        # host-reviewed action catalog.
+        for slug in slugs:
+            matching_apps = [
+                app for app in self.settings.apps
+                if slug in (self.settings.allowed_actions or {}).get(app, frozenset())
+            ]
+            if not matching_apps:
+                raise ComposioError(
+                    f"Composio action '{slug}' is not in any operator allowlist."
+                )
+        arguments: dict[str, Any] = {"tool_slugs": slugs, "include": ["input_schema"]}
+        if session_id:
+            arguments["session_id"] = session_id
+        return self._consumer_call(
+            "COMPOSIO_GET_TOOL_SCHEMAS",
+            arguments,
+            **dict(context or {}),
+        )
+
     def action_requires_approval(self, app: str, action: str) -> bool:
         """Return whether an already-allowlisted action needs human approval."""
         slug = self.require_app(app)
@@ -180,6 +350,14 @@ class ComposioClient:
         self.require_enabled()
         if not self.settings.apps:
             return []
+        if self.consumer_mcp:
+            return [
+                {
+                    "slug": app,
+                    "accounts": sorted((self.settings.accounts or {}).get(app, {})),
+                }
+                for app in self.settings.apps
+            ]
         response = self.sdk.toolkits.list(limit=1000, managed_by="all", sort_by="alphabetically")
         result = []
         for item in _items(response):
@@ -217,6 +395,10 @@ class ComposioClient:
 
     def initiate_connection(self, app: str, *, callback_url: str | None = None) -> dict[str, Any]:
         self.require_enabled()
+        if self.consumer_mcp:
+            raise ComposioError(
+                "Consumer connections are operator-managed in the Composio For You dashboard."
+            )
         slug = self.require_app(app)
         auth_config_id = self._auth_config_id(slug)
         request = self.sdk.connected_accounts.link(
@@ -235,6 +417,16 @@ class ComposioClient:
         self.require_enabled()
         if not self.settings.apps:
             return []
+        if self.consumer_mcp:
+            return [
+                {
+                    "app": app,
+                    "aliases": sorted((self.settings.accounts or {}).get(app, {})),
+                    "requires_explicit_account": len((self.settings.accounts or {}).get(app, {})) > 1,
+                }
+                for app in self.settings.apps
+                if (self.settings.accounts or {}).get(app)
+            ]
         response = self.sdk.connected_accounts.list(
             user_ids=[self.settings.user_id], toolkit_slugs=list(self.settings.apps), limit=1000
         )
@@ -265,6 +457,10 @@ class ComposioClient:
 
     def delete_connection(self, connection_id: str) -> dict[str, Any]:
         self.require_enabled()
+        if self.consumer_mcp:
+            raise ComposioError(
+                "Consumer connections are operator-managed in the Composio For You dashboard."
+            )
         target = str(connection_id or "").strip()
         # Fetch first and enforce toolkit + user ownership against the
         # authoritative account before the destructive request.
@@ -272,10 +468,40 @@ class ComposioClient:
         response = self.sdk.connected_accounts.delete(target)
         return {"deleted": True, "connection_id": target, "result": _as_dict(response)}
 
-    def execute(self, app: str, action: str, params: dict[str, Any], *, connected_account_id: str | None = None) -> dict[str, Any]:
+    def execute(
+        self,
+        app: str,
+        action: str,
+        params: dict[str, Any],
+        *,
+        connected_account_id: str | None = None,
+        session_id: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.require_enabled()
         slug = self.require_app(app)
         action_slug = self.require_action(slug, action)
+        if self.consumer_mcp:
+            account_id = self.resolve_account(slug, connected_account_id)
+            arguments: dict[str, Any] = {
+                "tools": [{
+                    "tool_slug": action_slug,
+                    "arguments": params,
+                    "account": account_id,
+                }],
+                "thought": f"Execute approved {slug} action {action_slug}",
+                "sync_response_to_workbench": False,
+                "current_step": "EXECUTING_ACTION",
+                "current_step_metric": "0/1 actions",
+            }
+            if session_id:
+                arguments["session_id"] = session_id
+            result = self._consumer_call(
+                "COMPOSIO_MULTI_EXECUTE_TOOL",
+                arguments,
+                **dict(context or {}),
+            )
+            return _as_dict(result)
         raw_tool = self.sdk.tools.get_raw_composio_tool_by_slug(action_slug)
         actual_app = str(_nested(raw_tool, "toolkit.slug", "toolkit_slug", "app_name") or "").lower()
         if actual_app != slug:

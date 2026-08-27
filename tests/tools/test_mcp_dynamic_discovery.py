@@ -35,6 +35,35 @@ class TestRegisterServerTools:
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
 
+    def test_internal_only_server_registers_no_model_tools(self, mock_registry):
+        server = MCPServerTask("internal")
+        server._tools = [_make_mcp_tool("execute", "desc")]
+        server.session = MagicMock()
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools(
+                "internal",
+                server,
+                {"expose_tools": False, "tools": {"include": ["execute"]}},
+            )
+        assert registered == []
+        assert mock_registry.get_all_tool_names() == []
+
+    def test_internal_call_requires_configured_include(self):
+        from tools import mcp_tool
+
+        server = MCPServerTask("internal")
+        server._tools = [_make_mcp_tool("execute", "desc")]
+        server.session = MagicMock()
+        server._config = {"expose_tools": False, "tools": {"include": ["execute"]}}
+        with (
+            patch.dict(mcp_tool._servers, {"internal": server}, clear=True),
+            patch.object(mcp_tool, "_make_tool_handler", return_value=lambda args, **kw: "ok") as make,
+        ):
+            assert mcp_tool.call_mcp_server_tool("internal", "execute", {"x": 1}) == "ok"
+            denied = mcp_tool.call_mcp_server_tool("internal", "manage", {})
+        assert "not in the internal allowlist" in denied
+        make.assert_called_once_with("internal", "execute", server.tool_timeout)
+
 
 class TestRefreshTools:
     """Tests for MCPServerTask._refresh_tools nuke-and-repave cycle."""
