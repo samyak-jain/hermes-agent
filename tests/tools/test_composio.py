@@ -14,8 +14,22 @@ class Resource:
         self.__dict__.update(methods)
 
 
-def settings(*, apps=("gmail",), enabled=True, api_key="test-key"):
-    return ComposioSettings(enabled, apps, "operator", api_key)
+def settings(
+    *,
+    apps=("gmail",),
+    enabled=True,
+    api_key="test-key",
+    allowed_actions=None,
+):
+    return ComposioSettings(
+        enabled,
+        apps,
+        "operator",
+        api_key,
+        allowed_actions if allowed_actions is not None else {
+            "gmail": frozenset({"GMAIL_GET_PROFILE"}),
+        },
+    )
 
 
 def test_settings_prefers_environment_key(monkeypatch):
@@ -26,6 +40,24 @@ def test_settings_prefers_environment_key(monkeypatch):
     loaded = ComposioSettings.load()
     assert loaded.api_key == "from-env"
     assert loaded.apps == ("gmail",)
+    assert loaded.allowed_actions == {}
+
+
+def test_settings_normalizes_action_allowlist(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "composio": {
+            "enabled": True,
+            "apps": ["GMAIL"],
+            "allowed_actions": {
+                "GMAIL": ["gmail_get_profile", " GMAIL_FETCH_EMAILS "],
+                "slack": ["SLACK_FETCH_CONVERSATIONS"],
+            },
+        }
+    })
+    loaded = ComposioSettings.load()
+    assert loaded.allowed_actions == {
+        "gmail": frozenset({"GMAIL_GET_PROFILE", "GMAIL_FETCH_EMAILS"}),
+    }
 
 
 def test_disabled_fails_before_sdk_initialization():
@@ -55,12 +87,24 @@ def test_disallowed_action_is_rejected_before_http():
         client.execute("slack", "SLACK_SEND_MESSAGE", {})
 
 
+def test_unlisted_action_in_allowed_app_is_rejected_before_http():
+    sdk = SimpleNamespace(tools=Resource(
+        get_raw_composio_tool_by_slug=lambda slug: pytest.fail("metadata HTTP must not run"),
+        execute=lambda *a, **kw: pytest.fail("execute must not run"),
+    ))
+    client = ComposioClient(settings(), sdk=sdk)
+    with pytest.raises(ComposioError, match="operator allowlist"):
+        client.execute("gmail", "GMAIL_SEND_EMAIL", {})
+
+
 def test_action_toolkit_must_match_claimed_app():
     sdk = SimpleNamespace(tools=Resource(
         get_raw_composio_tool_by_slug=lambda slug: {"toolkit": {"slug": "slack"}},
         execute=lambda *a, **kw: pytest.fail("execute must not run"),
     ))
-    client = ComposioClient(settings(), sdk=sdk)
+    client = ComposioClient(settings(
+        allowed_actions={"gmail": frozenset({"SLACK_SEND_MESSAGE"})},
+    ), sdk=sdk)
     with pytest.raises(ComposioError, match="belongs to 'slack'"):
         client.execute("gmail", "SLACK_SEND_MESSAGE", {})
 

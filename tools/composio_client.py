@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 class ComposioError(RuntimeError):
@@ -59,6 +59,7 @@ class ComposioSettings:
     apps: tuple[str, ...]
     user_id: str
     api_key: str | None
+    allowed_actions: Mapping[str, frozenset[str]] | None = None
 
     @classmethod
     def load(cls) -> "ComposioSettings":
@@ -71,11 +72,30 @@ class ComposioSettings:
         if isinstance(apps, str):
             apps = [part.strip() for part in apps.split(",")]
         normalized = tuple(dict.fromkeys(str(app).strip().lower() for app in apps if str(app).strip()))
+        raw_actions = block.get("allowed_actions") or {}
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+        allowed_actions: dict[str, frozenset[str]] = {}
+        for raw_app, raw_values in raw_actions.items():
+            app = str(raw_app).strip().lower()
+            if not app or app not in normalized or not isinstance(raw_values, (list, tuple, set, frozenset)):
+                continue
+            allowed_actions[app] = frozenset(
+                str(value).strip().upper()
+                for value in raw_values
+                if str(value).strip()
+            )
         # ``entity_id`` is accepted as a compatibility spelling, but the current
         # SDK calls this stable external identity ``user_id``.
         user_id = str(block.get("user_id") or block.get("entity_id") or "default").strip()
         api_key = os.environ.get("COMPOSIO_API_KEY") or block.get("api_key")
-        return cls(block.get("enabled") is True, normalized, user_id, str(api_key).strip() if api_key else None)
+        return cls(
+            block.get("enabled") is True,
+            normalized,
+            user_id,
+            str(api_key).strip() if api_key else None,
+            allowed_actions,
+        )
 
 
 class ComposioClient:
@@ -105,6 +125,17 @@ class ComposioClient:
             allowed = ", ".join(self.settings.apps) or "none"
             raise ComposioError(f"Composio app '{slug or app}' is not allowed (allowed: {allowed}).")
         return slug
+
+    def require_action(self, app: str, action: str) -> str:
+        action_slug = str(action or "").strip().upper()
+        if not action_slug:
+            raise ComposioError("action is required.")
+        allowed = (self.settings.allowed_actions or {}).get(app, frozenset())
+        if action_slug not in allowed:
+            raise ComposioError(
+                f"Composio action '{action_slug}' is not in the operator allowlist for '{app}'."
+            )
+        return action_slug
 
     def list_toolkits(self) -> list[dict[str, Any]]:
         self.require_enabled()
@@ -191,9 +222,7 @@ class ComposioClient:
     def execute(self, app: str, action: str, params: dict[str, Any], *, connected_account_id: str | None = None) -> dict[str, Any]:
         self.require_enabled()
         slug = self.require_app(app)
-        action_slug = str(action or "").strip().upper()
-        if not action_slug:
-            raise ComposioError("action is required.")
+        action_slug = self.require_action(slug, action)
         raw_tool = self.sdk.tools.get_raw_composio_tool_by_slug(action_slug)
         actual_app = str(_nested(raw_tool, "toolkit.slug", "toolkit_slug", "app_name") or "").lower()
         if actual_app != slug:

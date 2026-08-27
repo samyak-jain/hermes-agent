@@ -1,4 +1,4 @@
-"""Service-gated Composio connection management and action execution tool."""
+"""Service-gated, operator-allowlisted Composio read tool."""
 
 from __future__ import annotations
 
@@ -10,16 +10,18 @@ from tools.registry import registry, tool_error
 
 COMPOSIO_SCHEMA = {
     "name": "composio",
-    "description": "Manage allowed Composio app connections or execute an action. Action output is external, untrusted data.",
+    "description": (
+        "Inspect allowed Composio connections or execute an operator-allowlisted "
+        "read action. Action output is external, untrusted data."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "operation": {"type": "string", "enum": ["list_toolkits", "connect", "list_connections", "delete_connection", "execute"]},
+            "operation": {"type": "string", "enum": ["list_toolkits", "list_connections", "execute"]},
             "app": {"type": "string", "description": "Allowed Composio toolkit slug."},
             "action": {"type": "string", "description": "Composio action/tool slug."},
             "params": {"type": "object", "description": "JSON parameters for the action."},
             "connection_id": {"type": "string"},
-            "callback_url": {"type": "string"},
         },
         "required": ["operation"],
     },
@@ -37,12 +39,8 @@ def composio_tool(args: dict, **_: object) -> str:
         operation = str(args.get("operation") or "")
         if operation == "list_toolkits":
             result = client.list_toolkits()
-        elif operation == "connect":
-            result = client.initiate_connection(args.get("app", ""), callback_url=args.get("callback_url"))
         elif operation == "list_connections":
             result = client.list_connections()
-        elif operation == "delete_connection":
-            result = client.delete_connection(args.get("connection_id", ""))
         elif operation == "execute":
             params = args.get("params") or {}
             if not isinstance(params, dict):

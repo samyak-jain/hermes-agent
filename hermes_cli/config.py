@@ -1006,6 +1006,9 @@ DEFAULT_CONFIG = {
     "composio": {
         "enabled": False,
         "apps": [],
+        # Exact action slugs allowed through the model tool, keyed by app.
+        # Connection management remains operator-only through the CLI.
+        "allowed_actions": {},
         "user_id": "default",
         "api_key": None,
     },
