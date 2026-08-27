@@ -20,6 +20,7 @@ def settings(
     enabled=True,
     api_key="test-key",
     allowed_actions=None,
+    scopes=None,
 ):
     return ComposioSettings(
         enabled,
@@ -29,6 +30,7 @@ def settings(
         allowed_actions if allowed_actions is not None else {
             "gmail": frozenset({"GMAIL_GET_PROFILE"}),
         },
+        scopes or {},
     )
 
 
@@ -41,6 +43,7 @@ def test_settings_prefers_environment_key(monkeypatch):
     assert loaded.api_key == "from-env"
     assert loaded.apps == ("gmail",)
     assert loaded.allowed_actions == {}
+    assert loaded.scopes == {}
 
 
 def test_settings_normalizes_action_allowlist(monkeypatch):
@@ -52,12 +55,62 @@ def test_settings_normalizes_action_allowlist(monkeypatch):
                 "GMAIL": ["gmail_get_profile", " GMAIL_FETCH_EMAILS "],
                 "slack": ["SLACK_FETCH_CONVERSATIONS"],
             },
+            "scopes": {
+                "GMAIL": ["gmail.readonly", "gmail.readonly", " profile "],
+                "slack": ["channels:read"],
+            },
         }
     })
     loaded = ComposioSettings.load()
     assert loaded.allowed_actions == {
         "gmail": frozenset({"GMAIL_GET_PROFILE", "GMAIL_FETCH_EMAILS"}),
     }
+    assert loaded.scopes == {"gmail": ("gmail.readonly", "profile")}
+
+
+def test_managed_auth_config_uses_operator_scopes():
+    calls = []
+    sdk = SimpleNamespace(
+        auth_configs=Resource(
+            list=lambda **kw: SimpleNamespace(items=[]),
+            create=lambda *args: calls.append(args) or {"id": "ac_scoped"},
+        ),
+        connected_accounts=Resource(
+            link=lambda *args, **kwargs: SimpleNamespace(
+                id="ca_1", status="INITIATED", redirect_url="https://example.invalid/connect",
+            ),
+        ),
+    )
+    client = ComposioClient(settings(
+        scopes={"gmail": ("gmail.readonly", "profile")},
+    ), sdk=sdk)
+    result = client.initiate_connection("gmail")
+    assert result["id"] == "ca_1"
+    assert calls == [("gmail", {
+        "type": "use_composio_managed_auth",
+        "name": "Hermes gmail scoped",
+        "credentials": {"scopes": "gmail.readonly,profile"},
+    })]
+
+
+def test_auth_config_does_not_reuse_unscoped_default():
+    calls = []
+    sdk = SimpleNamespace(
+        auth_configs=Resource(
+            list=lambda **kw: SimpleNamespace(items=[
+                {"id": "ac_default", "name": "Gmail default"},
+            ]),
+            create=lambda *args: calls.append(args) or {"id": "ac_scoped"},
+        ),
+        connected_accounts=Resource(
+            link=lambda user, auth, **kw: SimpleNamespace(
+                id=auth, status="INITIATED", redirect_url="https://example.invalid/connect",
+            ),
+        ),
+    )
+    result = ComposioClient(settings(), sdk=sdk).initiate_connection("gmail")
+    assert result["id"] == "ac_scoped"
+    assert len(calls) == 1
 
 
 def test_disabled_fails_before_sdk_initialization():

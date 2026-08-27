@@ -60,6 +60,7 @@ class ComposioSettings:
     user_id: str
     api_key: str | None
     allowed_actions: Mapping[str, frozenset[str]] | None = None
+    scopes: Mapping[str, tuple[str, ...]] | None = None
 
     @classmethod
     def load(cls) -> "ComposioSettings":
@@ -85,6 +86,21 @@ class ComposioSettings:
                 for value in raw_values
                 if str(value).strip()
             )
+        raw_scopes = block.get("scopes") or {}
+        if not isinstance(raw_scopes, dict):
+            raw_scopes = {}
+        scopes: dict[str, tuple[str, ...]] = {}
+        for raw_app, raw_values in raw_scopes.items():
+            app = str(raw_app).strip().lower()
+            if not app or app not in normalized or not isinstance(raw_values, (list, tuple)):
+                continue
+            scopes[app] = tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in raw_values
+                    if str(value).strip()
+                )
+            )
         # ``entity_id`` is accepted as a compatibility spelling, but the current
         # SDK calls this stable external identity ``user_id``.
         user_id = str(block.get("user_id") or block.get("entity_id") or "default").strip()
@@ -95,6 +111,7 @@ class ComposioSettings:
             user_id,
             str(api_key).strip() if api_key else None,
             allowed_actions,
+            scopes,
         )
 
 
@@ -152,9 +169,20 @@ class ComposioClient:
 
     def _auth_config_id(self, app: str) -> str:
         response = self.sdk.auth_configs.list(toolkit_slug=app, is_composio_managed=True, limit=1000)
-        configs = _items(response)
+        config_name = f"Hermes {app} scoped"
+        configs = [
+            config for config in _items(response)
+            if str(_nested(config, "name") or "") == config_name
+        ]
         if not configs:
-            created = self.sdk.auth_configs.create(app, {"type": "use_composio_managed_auth"})
+            options: dict[str, Any] = {
+                "type": "use_composio_managed_auth",
+                "name": config_name,
+            }
+            configured_scopes = (self.settings.scopes or {}).get(app, ())
+            if configured_scopes:
+                options["credentials"] = {"scopes": ",".join(configured_scopes)}
+            created = self.sdk.auth_configs.create(app, options)
             config_id = _nested(created, "id", "nanoid", "auth_config.id")
         else:
             config_id = _nested(configs[0], "id", "nanoid", "auth_config.id")

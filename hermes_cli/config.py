@@ -1009,6 +1009,9 @@ DEFAULT_CONFIG = {
         # Exact action slugs allowed through the model tool, keyed by app.
         # Connection management remains operator-only through the CLI.
         "allowed_actions": {},
+        # Optional least-privilege OAuth scopes, keyed by app. These are
+        # applied when the operator CLI creates the managed auth config.
+        "scopes": {},
         "user_id": "default",
         "api_key": None,
     },
