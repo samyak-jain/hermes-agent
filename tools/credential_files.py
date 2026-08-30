@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
+import re
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -446,6 +447,75 @@ def map_cache_path_to_container(
     return None
 
 
+def map_cache_path_to_projection(host_path: str, projection_base: str) -> Optional[str]:
+    """Map a host cache path into a narrow cache projection.
+
+    Unlike ``map_cache_path_to_container`` (which projects a whole Hermes home
+    and therefore retains ``cache/``), this maps ``cache/images/x`` directly
+    to ``<projection_base>/images/x``. Kumo uses this for its read-only
+    ``/opt/hermes-cache`` sandbox mounts.
+    """
+    from hermes_constants import get_hermes_dir
+
+    path = Path(host_path)
+    base = projection_base.rstrip("/")
+    if not base:
+        return None
+    for new_subpath, old_name in _CACHE_DIRS:
+        host_dir = get_hermes_dir(new_subpath, old_name)
+        try:
+            rel = path.relative_to(host_dir)
+        except ValueError:
+            continue
+        leaf = new_subpath.split("/", 1)[-1]
+        return posixpath.join(base, leaf, rel.as_posix())
+    return None
+
+
+def map_projected_cache_path_to_host(
+    projected_path: str,
+    projection_base: str,
+) -> Optional[str]:
+    """Inverse of :func:`map_cache_path_to_projection`, fail-closed."""
+    from hermes_constants import get_hermes_dir
+
+    path = Path(projected_path)
+    base = Path(projection_base)
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if not parts:
+        return None
+    category = parts[0]
+    tail = Path(*parts[1:])
+    for new_subpath, old_name in _CACHE_DIRS:
+        if new_subpath.split("/", 1)[-1] != category:
+            continue
+        return str(get_hermes_dir(new_subpath, old_name) / tail)
+    return None
+
+
+def rewrite_cache_paths_for_projection(text: str, projection_base: str) -> str:
+    """Rewrite cache-root prefixes embedded in a child prompt."""
+    if not isinstance(text, str) or not text or not projection_base:
+        return text
+    from hermes_constants import get_hermes_dir
+
+    rewritten = text
+    for new_subpath, old_name in _CACHE_DIRS:
+        host_dir = str(get_hermes_dir(new_subpath, old_name)).rstrip("/")
+        leaf = new_subpath.split("/", 1)[-1]
+        projected = posixpath.join(projection_base.rstrip("/"), leaf)
+        rewritten = re.sub(
+            re.escape(host_dir) + r"(?=$|/)",
+            lambda _match, replacement=projected: replacement,
+            rewritten,
+        )
+    return rewritten
+
+
 def from_agent_visible_cache_path(
     container_path: str,
     container_base: str = "/root/.hermes",
@@ -521,5 +591,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import copy
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -112,37 +113,105 @@ class HostToolResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse Hermes/OpenAI rich content into app-server text input.
+def _image_url_from_turn_part(item: dict[str, Any]) -> str:
+    """Extract one image URL from the rich-content shapes Hermes accepts."""
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    if isinstance(image_url, str) and image_url.strip():
+        return image_url.strip()
 
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
+    for key in ("url", "imageUrl"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        if source.get("type") == "url":
+            value = source.get("url")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if source.get("type") == "base64":
+            media_type = str(source.get("media_type") or "").strip()
+            data = str(source.get("data") or "").strip()
+            if media_type and data:
+                return f"data:{media_type};base64,{data}"
+    return ""
+
+
+def _coerce_turn_input_items(user_input: Any) -> list[dict[str, str]]:
+    """Normalize Hermes rich content into typed app-server turn items.
+
+    Images remain images. In particular, this function never substitutes a
+    textual marker or invents a caption, so image-only and multi-image turns
+    reach the downstream runtime without losing pixels or ordering.
     """
     if isinstance(user_input, str):
-        return user_input
+        return [{"type": "text", "text": user_input}] if user_input else []
     if isinstance(user_input, list):
-        parts: list[str] = []
+        parts: list[dict[str, str]] = []
         for item in user_input:
             if isinstance(item, str):
-                if item.strip():
-                    parts.append(item)
+                if item:
+                    parts.append({"type": "text", "text": item})
                 continue
             if not isinstance(item, dict):
-                if item is not None:
-                    parts.append(str(item))
                 continue
             item_type = item.get("type")
             if item_type in {"text", "input_text"}:
                 text = item.get("text") or item.get("content") or ""
                 if text:
-                    parts.append(str(text))
+                    parts.append({"type": "text", "text": str(text)})
             elif item_type in {"image", "image_url", "input_image"}:
-                parts.append("[image attached]")
-        text = "\n\n".join(p for p in parts if p).strip()
-        return text or "What do you see in this image?"
-    return "" if user_input is None else str(user_input)
+                url = _image_url_from_turn_part(item)
+                if url:
+                    parts.append({"type": "image", "url": url})
+        return parts
+    if user_input is None:
+        return []
+    return [{"type": "text", "text": str(user_input)}]
+
+
+def _prepare_turn_input_items(user_input: Any) -> list[dict[str, str]]:
+    """Apply the existing safe image cap, then preserve typed turn items."""
+    prepared = copy.deepcopy(user_input)
+    if isinstance(prepared, list):
+        try:
+            # The direct provider loops invoke this only after an oversize
+            # rejection. The app-server owns that provider call, so resize
+            # proactively here to keep an immutable Claude session from being
+            # wedged by a >5 MB or >8000 px image block.
+            from agent.conversation_compression import (
+                try_shrink_image_parts_in_messages,
+            )
+
+            try_shrink_image_parts_in_messages(
+                [{"role": "user", "content": prepared}],
+                max_dimension=7900,
+            )
+        except Exception:
+            logger.debug("app-server image preflight resize skipped", exc_info=True)
+    return _coerce_turn_input_items(prepared)
+
+
+def _coerce_host_tool_content(output: Any) -> Any:
+    """Preserve rich tool content while keeping legacy JSON/text behavior."""
+    if (
+        isinstance(output, dict)
+        and output.get("_multimodal") is True
+        and isinstance(output.get("content"), list)
+    ):
+        return output["content"]
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list) and output and all(
+        isinstance(item, dict)
+        and item.get("type") in {"text", "image", "image_url", "input_image"}
+        for item in output
+    ):
+        return output
+    return json.dumps(output, ensure_ascii=False, default=str)
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -463,16 +532,20 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        turn_input = _prepare_turn_input_items(user_input)
+        if not turn_input:
+            result.error = "turn/start failed: input must contain text or an image"
+            return result
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Send typed content through intact. The selected app-server adapter
+        # owns provider-specific conversion (the Claude shim emits Anthropic
+        # text/image blocks); no lossy text fallback is allowed here.
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )
@@ -979,8 +1052,7 @@ class CodexAppServerSession:
                 is_error = output.is_error
                 end_turn = output.end_turn
                 output = output.content
-            if not isinstance(output, str):
-                output = json.dumps(output, ensure_ascii=False, default=str)
+            output = _coerce_host_tool_content(output)
             client.respond(
                 rid,
                 {"content": output, "isError": is_error},

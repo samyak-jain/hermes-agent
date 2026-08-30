@@ -1270,12 +1270,15 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-        tool_policy=agent.tool_policy,
-    )
+    from agent.auxiliary_client import runtime_main_from_agent, scoped_runtime_main
+
+    with scoped_runtime_main(runtime_main_from_agent(agent)):
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+            tool_policy=agent.tool_policy,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()

@@ -291,6 +291,7 @@ def _get_child_terminal_overrides(
         "ssh_key",
         "ssh_known_hosts_file",
         "ssh_systemd_slice",
+        "agent_visible_cache_base",
     ):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
@@ -1508,9 +1509,20 @@ def _build_child_agent(
         child_terminal_overrides.get("cwd")
         or _resolve_workspace_hint(parent_agent)
     )
+    child_goal = goal
+    child_context = context
+    cache_projection = child_terminal_overrides.get("agent_visible_cache_base")
+    if cache_projection:
+        from tools.credential_files import rewrite_cache_paths_for_projection
+
+        child_goal = rewrite_cache_paths_for_projection(goal, cache_projection)
+        if isinstance(context, str):
+            child_context = rewrite_cache_paths_for_projection(
+                context, cache_projection
+            )
     child_prompt = _build_child_system_prompt(
-        goal,
-        context,
+        child_goal,
+        child_context,
         workspace_path=workspace_hint,
         role=effective_role,
         max_spawn_depth=max_spawn,
@@ -1742,7 +1754,7 @@ def _build_child_agent(
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
-    child._subagent_goal = goal
+    child._subagent_goal = child_goal
     child._delegate_terminal_overrides = dict(child_terminal_overrides)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
@@ -2376,7 +2388,7 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             return child.run_conversation(
-                user_message=goal,
+                user_message=getattr(child, "_subagent_goal", goal),
                 task_id=child_task_id,
                 stream_callback=_relay_child_text,
             )

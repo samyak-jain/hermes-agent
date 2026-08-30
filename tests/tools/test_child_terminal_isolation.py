@@ -141,6 +141,21 @@ def test_child_ssh_supervisor_policy_is_propagated():
     assert overrides["ssh_background_ttl_seconds"] == 21600
 
 
+def test_child_cache_projection_is_trusted_prompt_metadata():
+    overrides = _get_child_terminal_overrides(
+        {
+            "child_terminal": {
+                "backend": "ssh",
+                "ssh_host": "10.233.1.2",
+                "ssh_user": "root",
+                "agent_visible_cache_base": "/opt/hermes-cache",
+            }
+        }
+    )
+
+    assert overrides["agent_visible_cache_base"] == "/opt/hermes-cache"
+
+
 def test_task_override_changes_child_not_parent(monkeypatch):
     task_id = "child-isolated"
     monkeypatch.setenv("TERMINAL_ENV", "local")

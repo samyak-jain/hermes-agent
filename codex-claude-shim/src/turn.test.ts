@@ -10,14 +10,20 @@ import {
 import { ThreadStore, type ThreadState } from "./threads.js";
 import {
   createPartialStreamState,
+  claudeContentForTurn,
+  extractTurnInput,
   handleSystemMessage,
   handlePartialStreamEvent,
+  mcpContentFromHost,
   mcpServer,
   promptForTurn,
   systemPromptForThread,
   toolCallIdFromMcpExtra,
   titleForThread,
 } from "./turn.js";
+
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 const thread = (overrides: Partial<ThreadState> = {}): ThreadState => ({
   threadId: "thr_test",
@@ -55,6 +61,86 @@ test("one prompt tier does not add an unnecessary cache boundary", () => {
     "SOUL",
   );
   assert.equal(systemPromptForThread(thread()), "");
+});
+
+test("typed image input becomes a Claude image block without a marker", () => {
+  const input = extractTurnInput([
+    { type: "text", text: "identify the color" },
+    {
+      type: "image",
+      url: `data:image/png;base64,${ONE_PIXEL_PNG}`,
+    },
+  ]);
+  assert.deepEqual(claudeContentForTurn(input), [
+    { type: "text", text: "identify the color" },
+    {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/png",
+        data: ONE_PIXEL_PNG,
+      },
+    },
+  ]);
+});
+
+test("image-only and five-image turns retain every pixel block", () => {
+  const input = extractTurnInput(
+    Array.from({ length: 5 }, () => ({
+      type: "image_url",
+      image_url: { url: `data:image/png;base64,${ONE_PIXEL_PNG}` },
+    })),
+  );
+  const blocks = claudeContentForTurn(input);
+  assert.equal(blocks.length, 5);
+  assert.equal(blocks.filter((block) => block.type === "image").length, 5);
+  assert.equal(blocks.filter((block) => block.type === "text").length, 0);
+});
+
+test("malformed or MIME-mismatched images fail instead of becoming text", () => {
+  assert.throws(
+    () =>
+      claudeContentForTurn([
+        { type: "image", url: "data:image/png;base64,not-base64" },
+      ]),
+    /valid base64|malformed base64/,
+  );
+  assert.throws(
+    () =>
+      claudeContentForTurn([
+        {
+          type: "image",
+          url: `data:image/jpeg;base64,${ONE_PIXEL_PNG}`,
+        },
+      ]),
+    /do not match declared MIME/,
+  );
+  const truncatedPng = Buffer.from(ONE_PIXEL_PNG, "base64")
+    .subarray(0, 20)
+    .toString("base64");
+  assert.throws(
+    () =>
+      claudeContentForTurn([
+        { type: "image", url: `data:image/png;base64,${truncatedPng}` },
+      ]),
+    /truncated or malformed/,
+  );
+});
+
+test("multimodal host results become MCP image content", () => {
+  assert.deepEqual(
+    mcpContentFromHost([
+      { type: "text", text: "inspect" },
+      {
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${ONE_PIXEL_PNG}` },
+      },
+    ]),
+    [
+      { type: "text", text: "inspect" },
+      { type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" },
+    ],
+  );
 });
 
 test("runtime MCP tools do not add a redundant instructions message", () => {

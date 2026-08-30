@@ -14,9 +14,34 @@ from tools.credential_files import (
     iter_cache_files,
     iter_skills_files,
     map_cache_path_to_container,
+    map_cache_path_to_projection,
+    map_projected_cache_path_to_host,
     register_credential_file,
     register_credential_files,
+    rewrite_cache_paths_for_projection,
 )
+
+
+def test_narrow_cache_projection_round_trip_and_prompt_rewrite(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    image = home / "cache" / "images" / "discord" / "pixel.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"image")
+
+    projected = map_cache_path_to_projection(str(image), "/opt/hermes-cache")
+    assert projected == "/opt/hermes-cache/images/discord/pixel.png"
+    assert (
+        map_projected_cache_path_to_host(projected, "/opt/hermes-cache")
+        == str(image)
+    )
+    assert rewrite_cache_paths_for_projection(
+        f"Inspect {image} and report.", "/opt/hermes-cache"
+    ) == "Inspect /opt/hermes-cache/images/discord/pixel.png and report."
+    adjacent = f"{home}/cache/images-private/pixel.png"
+    assert rewrite_cache_paths_for_projection(
+        adjacent, "/opt/hermes-cache"
+    ) == adjacent
 
 
 @pytest.fixture(autouse=True)
