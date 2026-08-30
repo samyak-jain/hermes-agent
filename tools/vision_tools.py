@@ -907,11 +907,25 @@ def _build_native_vision_tool_result(
         ],
         "text_summary": summary,
         "meta": {
-            "image_url": image_url[:200],
+            "image_url": _safe_image_source_label(image_url),
             "size_bytes": image_size_bytes,
             "native_vision": True,
         },
     }
+
+
+def _safe_image_source_label(image_url: str, limit: int = 200) -> str:
+    """Describe an image source without ever copying embedded image bytes.
+
+    Debug records and ordinary agent transcripts may retain this value for a
+    long time.  Keep paths and remote URLs useful while ensuring a data URL's
+    base64 payload never enters those logs as a side effect of native vision.
+    """
+    value = str(image_url or "")
+    if value.lower().startswith("data:"):
+        header = value.partition(",")[0]
+        return f"{header},[redacted]"
+    return value[:limit]
 
 
 @contextlib.asynccontextmanager
@@ -1102,7 +1116,7 @@ async def vision_analyze_tool(
         user_prompt = str(user_prompt) if user_prompt is not None else ""
     debug_call_data = {
         "parameters": {
-            "image_url": image_url,
+            "image_url": _safe_image_source_label(image_url),
             "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
             "model": model
         },
@@ -1124,7 +1138,7 @@ async def vision_analyze_tool(
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        logger.info("Analyzing image: %s", image_url[:60])
+        logger.info("Analyzing image: %s", _safe_image_source_label(image_url, 60))
         logger.info("User prompt: %s", user_prompt[:100])
 
         # Resolve the source to raw bytes through the single resolver (unifies
@@ -1367,6 +1381,13 @@ def check_vision_requirements() -> bool:
     tool list whenever the explicit provider name was unresolvable, even
     when the auto chain would have served the request (issue #31179).
     """
+    # Native vision is a complete route in its own right. Do this before any
+    # auxiliary-client credential probing so a Codex/Claude child cannot lose
+    # vision_analyze merely because unrelated OpenRouter/Nous/Anthropic API
+    # credentials are absent.
+    if _should_use_native_vision_fast_path():
+        return True
+
     try:
         from agent.auxiliary_client import resolve_vision_provider_client
     except ImportError:

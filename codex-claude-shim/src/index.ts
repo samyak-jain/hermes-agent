@@ -5,7 +5,11 @@ import { ensureRuntimeSkillsVisible } from "./skills.js";
 import { subscriptionLogin } from "./login.js";
 import { subscriptionStatus } from "./subscription.js";
 import { ThreadStore } from "./threads.js";
-import { runTurn } from "./turn.js";
+import {
+  claudeContentForTurn,
+  extractTurnInput,
+  runTurn,
+} from "./turn.js";
 
 if (process.argv.includes("--version")) {
   process.stdout.write("codex-cli 0.130.0\n");
@@ -75,18 +79,6 @@ rpc.onRequest("thread/loaded/list", () => {
   return { threads: threads.list().map((thread) => ({ id: thread.threadId })) };
 });
 
-function extractUserText(input: any): string {
-  if (!input) return "";
-  if (typeof input === "string") return input;
-  if (typeof input.message === "string") return input.message;
-  const items = Array.isArray(input.items) ? input.items : input;
-  if (!Array.isArray(items)) return "";
-  return items
-    .filter((item: any) => item?.type === "text" && typeof item.text === "string")
-    .map((item: any) => item.text)
-    .join("\n");
-}
-
 function launchTurn(options: Parameters<typeof runTurn>[0]): void {
   void runTurn(options).catch((error: any) => {
     options.thread.activeTurn = undefined;
@@ -107,10 +99,19 @@ rpc.onRequest("turn/start", (params: any) => {
   if (thread.activeTurn) {
     throw new RpcMethodError(-32000, "A turn is already running on this thread");
   }
-  const userText = extractUserText(params?.input);
-  if (!userText) throw new RpcMethodError(-32602, "input with user text required");
+  const userInput = extractTurnInput(params?.input);
+  if (userInput.length === 0) {
+    throw new RpcMethodError(-32602, "input with text or image required");
+  }
+  try {
+    // Validate image data before accepting the asynchronous turn. Invalid or
+    // oversized images must fail closed, never degrade to textual markers.
+    claudeContentForTurn(userInput);
+  } catch (error: any) {
+    throw new RpcMethodError(-32602, error?.message ?? String(error));
+  }
   const turnId = `turn_${randomUUID()}`;
-  launchTurn({ rpc, threads, thread, turnId, userText });
+  launchTurn({ rpc, threads, thread, turnId, userInput });
   return { turn: { id: turnId } };
 });
 
@@ -121,7 +122,14 @@ rpc.onRequest("thread/compact/start", (params: any) => {
     throw new RpcMethodError(-32000, "A turn is already running on this thread");
   }
   const turnId = `turn_${randomUUID()}`;
-  launchTurn({ rpc, threads, thread, turnId, userText: "/compact", compaction: true });
+  launchTurn({
+    rpc,
+    threads,
+    thread,
+    turnId,
+    userInput: [{ type: "text", text: "/compact" }],
+    compaction: true,
+  });
   return { turn: { id: turnId } };
 });
 

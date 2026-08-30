@@ -122,6 +122,66 @@ class TestNonLocalBackendConfinement:
         assert res.origin == "file"
 
     @pytest.mark.asyncio
+    async def test_child_projection_path_reads_only_the_gateway_cache(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        cached = home / "cache" / "images" / "inbound.png"
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(PNG)
+
+        from tools import terminal_tool
+
+        terminal_tool.register_task_env_overrides(
+            "child-image",
+            {
+                "env_type": "ssh",
+                "agent_visible_cache_base": "/opt/hermes-cache",
+            },
+        )
+        try:
+            res = await isrc.resolve_image_source(
+                "/opt/hermes-cache/images/inbound.png",
+                isrc.ResolveContext(task_id="child-image"),
+            )
+        finally:
+            terminal_tool.clear_task_env_overrides("child-image")
+
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_child_projection_does_not_authorize_paths_outside_cache(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(PNG)
+
+        from tools import terminal_tool
+
+        terminal_tool.register_task_env_overrides(
+            "child-confined",
+            {
+                "env_type": "ssh",
+                "agent_visible_cache_base": "/opt/hermes-cache",
+            },
+        )
+        try:
+            with patch("tools.image_source._get_active_env", return_value=None):
+                with pytest.raises(isrc.SourceNotFound):
+                    await isrc.resolve_image_source(
+                        str(outside),
+                        isrc.ResolveContext(task_id="child-confined"),
+                    )
+        finally:
+            terminal_tool.clear_task_env_overrides("child-confined")
+
+    @pytest.mark.asyncio
     async def test_host_secret_outside_cache_routes_to_sandbox_not_host(self, tmp_path, monkeypatch):
         """A non-cache host path (e.g. /etc/passwd) must NOT be host-read — it
         routes to the in-sandbox exec-read, which reads the CONTAINER's file."""

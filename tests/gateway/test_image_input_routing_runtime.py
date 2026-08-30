@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -25,6 +27,16 @@ def _source() -> SessionSource:
         chat_type="dm",
         user_id="42",
         user_name="Maxim",
+    )
+
+
+def _discord_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123456789",
+        chat_type="dm",
+        user_id="42",
+        user_name="Samyak",
     )
 
 
@@ -188,3 +200,59 @@ async def test_prepare_image_routing_runs_off_the_event_loop(monkeypatch):
         "the blocking image-routing decision must be offloaded off the gateway "
         "event loop, not run inline on it"
     )
+
+
+@pytest.mark.asyncio
+async def test_discord_image_reaches_app_server_as_pixels(tmp_path, monkeypatch):
+    """Exercise the native handoff across the gateway and app-server seams.
+
+    The historical failure preserved only text plus an attachment marker at
+    the final seam.  This test starts with a Discord photo event and proves
+    the resulting turn contains a real data-URL image item.
+    """
+    from agent.image_routing import build_native_content_parts
+    from agent.transports.codex_app_server_session import _coerce_turn_input_items
+
+    png = tmp_path / "deterministic-red-pixel.png"
+    png.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGP4DwQACfsD/QG2J3sAAAAASUVORK5CYII="
+        )
+    )
+    source = _discord_source()
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="fake")}
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=[str(png)],
+        media_types=["image/png"],
+    )
+    cfg = _auto_config()
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_session_agent_runtime",
+        lambda **_: ("claude-fable-5", {"provider": "anthropic"}),
+    )
+    monkeypatch.setattr(
+        "agent.image_routing._lookup_supports_vision", lambda *_args: True
+    )
+
+    text = await runner._prepare_inbound_message_text(
+        event=event, source=source, history=[]
+    )
+    paths = runner._consume_pending_native_image_paths(
+        runner._session_key_for_source(source)
+    )
+    rich_parts, skipped = build_native_content_parts(text, paths)
+    turn_items = _coerce_turn_input_items(rich_parts)
+
+    assert skipped == []
+    assert [item["type"] for item in turn_items] == ["text", "image"]
+    assert turn_items[1]["url"].startswith("data:image/png;base64,")
+    assert "[image attached]" not in turn_items[0]["text"].lower()

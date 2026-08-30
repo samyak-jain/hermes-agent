@@ -92,6 +92,16 @@ class TestBuildNativeVisionToolResult:
         assert "Question:" not in text
         assert "Image loaded" in text
 
+    def test_embedded_image_bytes_are_redacted_from_metadata(self):
+        env = _build_native_vision_tool_result(
+            image_url="data:image/png;base64,SECRETPIXELS",
+            question="color?",
+            image_data_url="data:image/png;base64,SECRETPIXELS",
+            image_size_bytes=12,
+        )
+        assert env["meta"]["image_url"] == "data:image/png;base64,[redacted]"
+        assert "SECRETPIXELS" not in json.dumps(env["meta"])
+
 
 # ─── _vision_analyze_native ──────────────────────────────────────────────────
 

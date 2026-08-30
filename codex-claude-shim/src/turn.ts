@@ -7,6 +7,7 @@ import {
   type Options,
   type PermissionMode,
   type SDKMessage,
+  type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { sdkEnvironment } from "./environment.js";
 import { jsonSchemaShape } from "./schema.js";
@@ -49,6 +50,169 @@ export interface PartialStreamState {
 }
 
 const CLAUDE_CODE_TOOL_USE_ID_META = "claudecode/toolUseId";
+const SUPPORTED_IMAGE_MIMES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+export type TurnInputItem =
+  | { type: "text"; text: string }
+  | { type: "image"; url: string };
+
+type ClaudeTurnContent =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source:
+        | {
+            type: "base64";
+            media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+            data: string;
+          }
+        | { type: "url"; url: string };
+    };
+
+function imageUrlFromWireItem(item: any): string {
+  const nested = item?.image_url;
+  if (typeof nested === "string") return nested.trim();
+  if (nested && typeof nested.url === "string") return nested.url.trim();
+  if (typeof item?.url === "string") return item.url.trim();
+  if (typeof item?.imageUrl === "string") return item.imageUrl.trim();
+  const source = item?.source;
+  if (source?.type === "url" && typeof source.url === "string") {
+    return source.url.trim();
+  }
+  if (
+    source?.type === "base64" &&
+    typeof source.media_type === "string" &&
+    typeof source.data === "string"
+  ) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  return "";
+}
+
+export function extractTurnInput(input: any): TurnInputItem[] {
+  if (!input) return [];
+  if (typeof input === "string") {
+    return input.length > 0 ? [{ type: "text", text: input }] : [];
+  }
+  if (typeof input.message === "string") {
+    return input.message.length > 0
+      ? [{ type: "text", text: input.message }]
+      : [];
+  }
+  const items = Array.isArray(input.items) ? input.items : input;
+  if (!Array.isArray(items)) return [];
+  const result: TurnInputItem[] = [];
+  for (const item of items) {
+    if (typeof item === "string") {
+      if (item.length > 0) result.push({ type: "text", text: item });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    if (
+      (item.type === "text" || item.type === "input_text") &&
+      typeof item.text === "string" &&
+      item.text.length > 0
+    ) {
+      result.push({ type: "text", text: item.text });
+      continue;
+    }
+    if (["image", "image_url", "input_image"].includes(item.type)) {
+      const url = imageUrlFromWireItem(item);
+      if (url) result.push({ type: "image", url });
+    }
+  }
+  return result;
+}
+
+function parseDataImageUrl(url: string): {
+  mime: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+  data: string;
+} {
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
+  if (!match) throw new Error("image data URL must contain valid base64");
+  const mime = match[1].toLowerCase();
+  if (!SUPPORTED_IMAGE_MIMES.has(mime)) {
+    throw new Error(`unsupported image MIME type: ${mime}`);
+  }
+  const data = match[2];
+  const decoded = Buffer.from(data, "base64");
+  if (decoded.length === 0) throw new Error("image data URL is empty");
+  if (decoded.length > MAX_IMAGE_BYTES) {
+    throw new Error("image exceeds Claude's 5 MB per-image limit");
+  }
+  const canonicalInput = data.replace(/=+$/, "");
+  const canonicalDecoded = decoded.toString("base64").replace(/=+$/, "");
+  if (canonicalInput !== canonicalDecoded) {
+    throw new Error("image data URL contains malformed base64");
+  }
+  const detected = decoded.subarray(0, 12);
+  const mimeMatches =
+    (mime === "image/png" && detected.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) ||
+    (mime === "image/jpeg" && detected.subarray(0, 3).equals(Buffer.from("ffd8ff", "hex"))) ||
+    (mime === "image/gif" && ["GIF87a", "GIF89a"].includes(detected.subarray(0, 6).toString("ascii"))) ||
+    (mime === "image/webp" &&
+      detected.subarray(0, 4).toString("ascii") === "RIFF" &&
+      detected.subarray(8, 12).toString("ascii") === "WEBP");
+  if (!mimeMatches) throw new Error(`image bytes do not match declared MIME type: ${mime}`);
+  const structurallyComplete =
+    (mime === "image/png" &&
+      decoded.length >= 20 &&
+      decoded.subarray(-12).equals(Buffer.from("0000000049454e44ae426082", "hex"))) ||
+    (mime === "image/jpeg" &&
+      decoded.length >= 4 &&
+      decoded.subarray(-2).equals(Buffer.from("ffd9", "hex"))) ||
+    (mime === "image/gif" && decoded.length >= 14 && decoded.at(-1) === 0x3b) ||
+    (mime === "image/webp" &&
+      decoded.length >= 12 &&
+      decoded.readUInt32LE(4) + 8 === decoded.length);
+  if (!structurallyComplete) {
+    throw new Error(`image data is truncated or malformed: ${mime}`);
+  }
+  return { mime: mime as any, data };
+}
+
+export function claudeContentForTurn(items: TurnInputItem[]): ClaudeTurnContent[] {
+  return items.map((item) => {
+    if (item.type === "text") return { type: "text", text: item.text };
+    if (item.url.startsWith("data:")) {
+      const parsed = parseDataImageUrl(item.url);
+      return {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: parsed.mime,
+          data: parsed.data,
+        },
+      };
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(item.url);
+    } catch {
+      throw new Error("image URL must use http(s) or a supported data URL");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("image URL must use http(s) or a supported data URL");
+    }
+    return { type: "image", source: { type: "url", url: item.url } };
+  });
+}
+
+async function* richPrompt(
+  content: ClaudeTurnContent[],
+): AsyncGenerator<SDKUserMessage> {
+  yield {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  };
+}
 
 export function toolCallIdFromMcpExtra(extra: unknown): string | undefined {
   if (typeof extra !== "object" || extra === null) return undefined;
@@ -101,11 +265,64 @@ export function handleSystemMessage(
   return false;
 }
 
-export function promptForTurn(thread: ThreadState, userText: string): {
-  prompt: string;
+export function promptForTurn(
+  thread: ThreadState,
+  userInput: TurnInputItem[] | string,
+): {
+  prompt: string | AsyncIterable<SDKUserMessage>;
   includesHostContext: boolean;
 } {
-  return { prompt: userText, includesHostContext: false };
+  const normalized =
+    typeof userInput === "string"
+      ? ([{ type: "text", text: userInput }] as TurnInputItem[])
+      : userInput;
+  const content = claudeContentForTurn(normalized);
+  if (content.every((item) => item.type === "text")) {
+    return {
+      prompt: content.map((item: any) => item.text).join("\n"),
+      includesHostContext: false,
+    };
+  }
+  return { prompt: richPrompt(content), includesHostContext: false };
+}
+
+export function mcpContentFromHost(content: unknown): any[] {
+  const values = Array.isArray(content) ? content : [content];
+  const result: any[] = [];
+  for (const entry of values) {
+    if (typeof entry === "string") {
+      result.push({ type: "text", text: entry });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") {
+      result.push({ type: "text", text: JSON.stringify(entry ?? null) });
+      continue;
+    }
+    const item: any = entry;
+    if (item.type === "text") {
+      result.push({ type: "text", text: String(item.text ?? "") });
+      continue;
+    }
+    if (item.type === "image" && typeof item.data === "string") {
+      result.push({
+        type: "image",
+        data: item.data,
+        mimeType: String(item.mimeType ?? item.mime_type ?? "image/png"),
+      });
+      continue;
+    }
+    if (["image", "image_url", "input_image"].includes(item.type)) {
+      const url = imageUrlFromWireItem(item);
+      if (!url.startsWith("data:")) {
+        throw new Error("host tool image content must be an embedded data URL");
+      }
+      const parsed = parseDataImageUrl(url);
+      result.push({ type: "image", data: parsed.data, mimeType: parsed.mime });
+      continue;
+    }
+    result.push({ type: "text", text: JSON.stringify(item) });
+  }
+  return result;
 }
 
 function hostToolDefinition(
@@ -128,7 +345,7 @@ function hostToolDefinition(
           `Host tool ${definition.name} is missing the provider tool_use ID`,
         );
       }
-      const response = await rpc.request<{ content?: string; isError?: boolean }>(
+      const response = await rpc.request<{ content?: unknown; isError?: boolean }>(
         "agent/tool/call",
         {
           threadId: thread.threadId,
@@ -139,7 +356,7 @@ function hostToolDefinition(
         },
       );
       return {
-        content: [{ type: "text", text: response.content ?? "" }],
+        content: mcpContentFromHost(response.content ?? ""),
         isError: Boolean(response.isError),
       };
     },
@@ -353,7 +570,13 @@ function renderToolResult(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((entry: any) => (entry?.type === "text" ? String(entry.text ?? "") : ""))
+      .map((entry: any) => {
+        if (entry?.type === "text") return String(entry.text ?? "");
+        if (entry?.type === "image") {
+          return `[image result: ${String(entry.source?.media_type ?? entry.mimeType ?? "image")}]`;
+        }
+        return "";
+      })
       .join("");
   }
   return content == null ? "" : JSON.stringify(content);
@@ -388,12 +611,12 @@ export async function runTurn(options: {
   threads: ThreadStore;
   thread: ThreadState;
   turnId: string;
-  userText: string;
+  userInput: TurnInputItem[];
   compaction?: boolean;
 }): Promise<TurnResult> {
-  const { rpc, threads, thread, turnId, userText, compaction = false } = options;
+  const { rpc, threads, thread, turnId, userInput, compaction = false } = options;
   const threadId = thread.threadId;
-  const turnPrompt = promptForTurn(thread, userText);
+  const turnPrompt = promptForTurn(thread, userInput);
   const abort = new AbortController();
   const toolItems = new Map<string, ToolItem>();
   const partialStream = createPartialStreamState();

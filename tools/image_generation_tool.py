@@ -20,6 +20,7 @@ Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
 """
 
+import base64
 import json
 import logging
 import os
@@ -731,6 +732,33 @@ def _looks_like_absolute_file_path(value: str) -> bool:
     return len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
 
 
+def _prepare_fal_reference_source(source: str, task_id: str | None) -> str:
+    """Turn a local/sandbox reference into bytes FAL can actually consume.
+
+    FAL endpoints cannot dereference gateway or sandbox filesystem paths.
+    Resolve them through the same confined image resolver as vision_analyze,
+    then embed a validated data URL. Network and existing data URLs remain
+    provider-addressable and are left unchanged.
+    """
+    source = str(source or "").strip()
+    if not source or source.startswith(("http://", "https://", "data:")):
+        return source
+
+    from model_tools import _run_async
+    from tools.image_source import ResolveContext, resolve_image_source
+
+    resolved = _run_async(
+        resolve_image_source(source, ResolveContext(task_id=task_id))
+    )
+    if len(resolved.data) > 15 * 1024 * 1024:
+        raise ValueError(
+            "Reference image exceeds the 15 MB embedded upload limit; "
+            "resize or compress it before image generation."
+        )
+    encoded = base64.b64encode(resolved.data).decode("ascii")
+    return f"data:{resolved.mime};base64,{encoded}"
+
+
 def _active_terminal_env(task_id: str | None):
     try:
         from tools.terminal_tool import get_active_env
@@ -845,6 +873,7 @@ def image_generate_tool(
     seed: Optional[int] = None,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """Generate an image from a text prompt, or edit a source image, via FAL.
 
@@ -937,6 +966,10 @@ def image_generate_tool(
             # Clamp reference count to the model's declared cap.
             max_refs = int(meta.get("max_reference_images") or 1)
             clamped_sources = source_images[:max_refs] if max_refs > 0 else source_images
+            clamped_sources = [
+                _prepare_fal_reference_source(source, task_id)
+                for source in clamped_sources
+            ]
             arguments = _build_fal_edit_payload(
                 model_id, prompt, clamped_sources, aspect_lc,
                 seed=seed, overrides=overrides,
@@ -1536,6 +1569,7 @@ def _handle_image_generate(args, **kw):
         aspect_ratio=aspect_ratio,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
+        task_id=task_id,
     )
     return _postprocess_image_generate_result(raw, task_id=task_id)
 

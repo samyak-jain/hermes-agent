@@ -317,6 +317,12 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        try:
+            from agent.auxiliary_client import runtime_main_fingerprint
+
+            runtime_fp = runtime_main_fingerprint()
+        except Exception:
+            runtime_fp = ()
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
@@ -325,6 +331,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             getattr(tool_policy, "fingerprint", "legacy"),
+            runtime_fp,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:

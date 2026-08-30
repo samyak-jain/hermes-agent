@@ -2444,6 +2444,43 @@ def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
         _RUNTIME_MAIN_CONTEXT.reset(token)
 
 
+def runtime_main_from_agent(agent: Any) -> Dict[str, Any]:
+    """Return the runtime identity that availability probes must use.
+
+    Tool construction and refresh can happen outside ``run_conversation``.
+    Building this explicit snapshot prevents those probes from inheriting a
+    parent agent's ambient ContextVar (most visibly during delegation).
+    """
+    return _normalize_main_runtime({
+        "provider": getattr(agent, "provider", "") or "",
+        "model": getattr(agent, "model", "") or "",
+        "base_url": getattr(agent, "base_url", "") or "",
+        "api_key": getattr(agent, "api_key", "") or "",
+        "api_mode": getattr(agent, "api_mode", "") or "",
+        "auth_mode": getattr(agent, "auth_mode", "") or "",
+    })
+
+
+def runtime_main_fingerprint() -> Tuple[Any, ...]:
+    """Cache-safe identity for the currently scoped main runtime.
+
+    The credential value is never retained. Availability can depend on whether
+    one exists, so the key includes only a boolean presence bit.
+    """
+    runtime = _RUNTIME_MAIN_CONTEXT.get()
+    if runtime is None:
+        runtime = _compat_runtime_main()
+    normalized = _normalize_main_runtime(runtime)
+    return (
+        normalized.get("provider") or "",
+        normalized.get("model") or "",
+        normalized.get("base_url") or "",
+        bool(normalized.get("api_key")),
+        normalized.get("api_mode") or "",
+        normalized.get("auth_mode") or "",
+    )
+
+
 def clear_runtime_main() -> None:
     """Clear the runtime override in the current context."""
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL

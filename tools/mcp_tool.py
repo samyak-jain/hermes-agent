@@ -5642,15 +5642,18 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
-        get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
-            tool_policy=getattr(agent, "tool_policy", None),
+    from agent.auxiliary_client import runtime_main_from_agent, scoped_runtime_main
+
+    with scoped_runtime_main(runtime_main_from_agent(agent)):
+        new_defs = list(
+            get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=quiet_mode,
+                tool_policy=getattr(agent, "tool_policy", None),
+            )
+            or []
         )
-        or []
-    )
     new_names = {t["function"]["name"] for t in new_defs}
 
     # Re-append the post-build injected families that get_tool_definitions does

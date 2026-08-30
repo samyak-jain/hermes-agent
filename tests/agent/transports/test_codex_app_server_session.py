@@ -19,7 +19,7 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _coerce_turn_input_items,
 )
 
 
@@ -129,12 +129,33 @@ class TestApprovalChoiceMapping:
 
 
 class TestTurnInputCoercion:
-    def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+    def test_list_content_keeps_typed_text_and_image(self):
+        items = _coerce_turn_input_items([
             {"type": "text", "text": "caption"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
         ])
-        assert text == "caption\n\n[image attached]"
+        assert items == [
+            {"type": "text", "text": "caption"},
+            {"type": "image", "url": "data:image/png;base64,abc"},
+        ]
+
+    def test_image_only_and_multiple_images_need_no_synthetic_text(self):
+        items = _coerce_turn_input_items([
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,image-{index}"},
+            }
+            for index in range(5)
+        ])
+        assert len(items) == 5
+        assert all(item["type"] == "image" for item in items)
+        assert not any("text" in item for item in items)
+
+
+def test_ordinary_list_tool_output_keeps_legacy_json_contract():
+    from agent.transports.codex_app_server_session import _coerce_host_tool_content
+
+    assert _coerce_host_tool_content([{"row": 1}]) == '[{"row": 1}]'
 
 
 # ---- lifecycle ----
@@ -302,6 +323,50 @@ class TestRunTurn:
             )
         ]
 
+    def test_host_tool_multimodal_content_is_not_json_stringified(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "agent/tool/call",
+            request_id="tool-request-image",
+            name="vision_analyze",
+            arguments={"image_url": "/cache/image.png", "question": "color?"},
+            toolCallId="toolu_image",
+        )
+        original_respond = client.respond
+
+        def respond_then_complete(request_id, response):
+            original_respond(request_id, response)
+            client.queue_notification(
+                "turn/completed",
+                threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
+
+        client.respond = respond_then_complete
+        content = [
+            {"type": "text", "text": "inspect this image"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            },
+        ]
+        result = make_session(
+            client,
+            tool_callback=lambda *_args: {
+                "_multimodal": True,
+                "content": content,
+                "text_summary": "image attached",
+            },
+        ).run_turn("inspect", turn_timeout=2.0)
+
+        assert result.error is None
+        assert client.responses == [
+            (
+                "tool-request-image",
+                {"content": content, "isError": False},
+            )
+        ]
+
     def test_host_tool_after_current_call_responds_before_interrupt(self):
         from agent.transports.codex_app_server_session import HostToolResult
 
@@ -463,7 +528,7 @@ class TestRunTurn:
         assert r.token_usage_total["totalTokens"] == 500
         assert r.model_context_window == 200000
 
-    def test_rich_content_turn_is_collapsed_to_text_payload(self):
+    def test_rich_content_turn_preserves_typed_image_payload(self):
         client = FakeClient()
         client.queue_notification(
             "turn/completed",
@@ -487,10 +552,51 @@ class TestRunTurn:
         assert r.error is None
         method, params = next(req for req in client.requests if req[0] == "turn/start")
         assert method == "turn/start"
-        text = params["input"][0]["text"]
-        assert isinstance(text, str)
-        assert "[Image attached at: /tmp/a.png]" in text
-        assert "[image attached]" in text
+        assert params["input"] == [
+            {
+                "type": "text",
+                "text": "look at this\n\n[Image attached at: /tmp/a.png]",
+            },
+            {"type": "image", "url": "data:image/png;base64,abc"},
+        ]
+
+    def test_image_only_turn_is_sent_without_text_fallback(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        result = make_session(client).run_turn(
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}],
+            turn_timeout=2.0,
+        )
+        assert result.error is None
+        _, params = next(req for req in client.requests if req[0] == "turn/start")
+        assert params["input"] == [
+            {"type": "image", "url": "data:image/png;base64,abc"}
+        ]
+
+    def test_five_image_turn_preserves_order(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        sources = [f"https://cdn.example/{index}.png" for index in range(5)]
+        result = make_session(client).run_turn(
+            [
+                {"type": "image_url", "image_url": {"url": source}}
+                for source in sources
+            ],
+            turn_timeout=2.0,
+        )
+        assert result.error is None
+        _, params = next(req for req in client.requests if req[0] == "turn/start")
+        assert params["input"] == [
+            {"type": "image", "url": source} for source in sources
+        ]
 
     def test_tool_iteration_counter_ticks(self):
         client = FakeClient()

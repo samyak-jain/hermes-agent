@@ -135,7 +135,7 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s)
-    if _is_local_terminal_backend():
+    if _is_local_terminal_backend(ctx):
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
         raise SourceNotFound(f"image file not found: '{p}'", src=s, origin="file")
@@ -198,12 +198,23 @@ async def _download_to_bytes(url: str) -> bytes:
         tmp.unlink(missing_ok=True)
 
 
-def _is_local_terminal_backend() -> bool:
+def _is_local_terminal_backend(ctx: Optional[ResolveContext] = None) -> bool:
     """True when the terminal backend runs directly on the host.
 
     Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
     dispatch, which key off ``TERMINAL_ENV``.
     """
+    if ctx is not None and ctx.task_id:
+        try:
+            from tools.terminal_tool import resolve_task_overrides
+
+            task_backend = str(
+                resolve_task_overrides(ctx.task_id).get("env_type") or ""
+            ).strip().lower()
+            if task_backend:
+                return task_backend == "local"
+        except Exception:
+            pass
     return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
 
 
@@ -237,15 +248,35 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
       is not under a cache returns ``None`` so the caller routes it to the
       in-sandbox exec-read instead of reading the host filesystem.
     """
-    if _is_local_terminal_backend():
+    if _is_local_terminal_backend(ctx):
         try:
             return p.resolve()
         except Exception:  # noqa: BLE001 — unresolved path: let is_file() fail downstream
             return p
 
-    from tools.credential_files import from_agent_visible_cache_path
+    from tools.credential_files import (
+        from_agent_visible_cache_path,
+        map_projected_cache_path_to_host,
+    )
 
-    host_candidate = Path(from_agent_visible_cache_path(str(p)))
+    projected_host = None
+    if ctx.task_id:
+        try:
+            from tools.terminal_tool import resolve_task_overrides
+
+            projection = resolve_task_overrides(ctx.task_id).get(
+                "agent_visible_cache_base"
+            )
+            if isinstance(projection, str) and projection:
+                projected_host = map_projected_cache_path_to_host(
+                    str(p), projection
+                )
+        except Exception:
+            projected_host = None
+
+    host_candidate = Path(
+        projected_host or from_agent_visible_cache_path(str(p))
+    )
     try:
         real = host_candidate.resolve()
     except Exception:  # noqa: BLE001 — cannot resolve -> not a safe host read

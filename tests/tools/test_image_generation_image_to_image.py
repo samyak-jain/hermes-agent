@@ -177,6 +177,29 @@ class TestFalRouting:
         assert out["success"] is True
         assert capture["arguments"]["image_urls"] == ["https://in/a.png", "https://in/b.png"]
 
+    def test_local_reference_is_embedded_before_fal_submission(
+        self, cfg_home, monkeypatch
+    ):
+        import tools.image_generation_tool as image_tool
+
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/nano-banana-pro"}})
+        source = cfg_home / "cache" / "images" / "source.png"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        capture: dict = {}
+        self._patch_submit(monkeypatch, image_tool, capture)
+
+        raw = image_tool.image_generate_tool(
+            prompt="make it night",
+            image_url=str(source),
+        )
+
+        out = json.loads(raw)
+        assert out["success"] is True
+        sent = capture["arguments"]["image_urls"][0]
+        assert sent.startswith("data:image/png;base64,")
+        assert str(source) not in sent
+
     def test_text_only_model_rejects_image_url(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
 
