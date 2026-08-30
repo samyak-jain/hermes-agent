@@ -86,6 +86,43 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_steer_during_app_server_turn_is_returned_for_replay(self, monkeypatch):
+        """A message steered while the subprocess owns the turn must survive.
+
+        The app-server runtime cannot inject it into its already-running inner
+        tool loop, so it must return the standard ``pending_steer`` contract
+        consumed by the gateway's next-turn replay path.
+        """
+        agent = _make_codex_agent()
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            assert agent.steer("also investigate the credit spike") is True
+            return TurnResult(
+                final_text="original turn complete",
+                projected_messages=[
+                    {"role": "assistant", "content": "original turn complete"}
+                ],
+                tool_iterations=0,
+                interrupted=False,
+                error=None,
+                turn_id="turn-steer-1",
+                thread_id="thread-steer-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-steer-1",
+        )
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("finish the original task")
+
+        assert result["final_response"] == "original turn complete"
+        assert result["pending_steer"] == "also investigate the credit spike"
+        assert agent._pending_steer is None
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -687,6 +724,27 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert "subprocess died" in result["error"]
         assert "codex-runtime auto" in result["final_response"]
+
+    def test_session_exception_preserves_steer_for_replay(self, monkeypatch):
+        agent = _make_codex_agent()
+
+        def boom_run_turn(self, user_input, **kwargs):
+            assert agent.steer("do not lose this follow-up") is True
+            raise RuntimeError("subprocess died")
+
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-steer-error",
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", boom_run_turn)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("original request")
+
+        assert result["partial"] is True
+        assert result["pending_steer"] == "do not lose this follow-up"
+        assert agent._pending_steer is None
 
     def test_interrupted_turn_marked_partial(self, monkeypatch):
         def interrupted_turn(self, user_input, **kwargs):
