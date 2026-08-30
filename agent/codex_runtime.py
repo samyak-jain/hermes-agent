@@ -881,6 +881,24 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    def _with_pending_steer(result: dict[str, Any]) -> dict[str, Any]:
+        """Return late app-server steering to the caller for replay.
+
+        The app-server subprocess owns its complete inner tool loop, so Hermes
+        cannot splice ``AIAgent.steer()`` text into a tool result while
+        ``run_turn()`` is blocked.  Drain as late as possible and expose the
+        same ``pending_steer`` contract as the standard runtime's turn
+        finalizer.  The gateway will then deliver it as the next user turn
+        instead of leaving it stranded on the cached agent.
+        """
+        drain_pending_steer = getattr(agent, "_drain_pending_steer", None)
+        if not callable(drain_pending_steer):
+            return result
+        pending_steer = drain_pending_steer()
+        if pending_steer:
+            result["pending_steer"] = pending_steer
+        return result
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -1020,7 +1038,7 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
-        return {
+        return _with_pending_steer({
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
@@ -1030,7 +1048,7 @@ def run_codex_app_server_turn(
             "completed": False,
             "partial": True,
             "error": str(exc),
-        }
+        })
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -1131,7 +1149,7 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
-    return {
+    return _with_pending_steer({
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
@@ -1153,7 +1171,7 @@ def run_codex_app_server_turn(
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
         **usage_result,
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
